@@ -1,0 +1,19 @@
+# Python virtual environments
+venv/
+.venv312/
+__pycache__/
+*.pyc
+
+# Data and models (too large for GitHub)
+training/data/
+training/models/
+training/plots/
+*.tflite
+*.keras
+
+# Cloud server
+cloud_server/temp_audio/
+
+# ESP32 build directory
+esp32_firmware/build/
+esp32_firmware/sdkconfig

@@ -1,0 +1,10 @@
+tensorflow>=2.12.0
+numpy>=1.23.0
+scipy>=1.10.0
+librosa>=0.10.0
+sounddevice>=0.4.6
+soundfile>=0.12.0
+audiomentations>=0.33.0
+matplotlib>=3.7.0
+scikit-learn>=1.2.0
+tqdm>=4.65.0

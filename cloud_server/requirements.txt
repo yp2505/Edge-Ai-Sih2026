@@ -1,0 +1,9 @@
+# ── Cloud ASR Server (asr_server.py) ─────────────────────
+vosk>=0.3.45              # Open-source DNN-HMM ASR (NOT a transformer) ✅
+numpy>=1.23.0
+soundfile>=0.12.0
+
+# ── Edge Inference (edge_inference.py on RPi 5) ───────────
+sounddevice>=0.4.6        # Microphone capture
+tflite-runtime>=2.14.0    # Lightweight TFLite (no full TensorFlow needed)
+# OR: tensorflow>=2.13.0  # Full TensorFlow (if tflite-runtime unavailable)
