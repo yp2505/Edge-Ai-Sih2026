@@ -31,6 +31,7 @@ import wave
 import argparse
 import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
 
@@ -60,7 +61,8 @@ except ImportError:
 
 
 # ─── Configuration ─────────────────────────────────────────────────────────
-DEFAULT_PORT    = 5000
+DEFAULT_PORT        = 5000
+DASHBOARD_API_PORT  = 8080   # HTTP port for /api/events and /api/health
 SAMPLE_RATE     = 16000
 CHANNELS        = 1
 SAMPLE_WIDTH    = 2   # 16-bit PCM
@@ -92,21 +94,91 @@ MAX_AUDIO_BYTES = 320_000
 VALID_SAMPLE_RATES = {8000, 16000, 22050, 44100, 48000}
 
 
+# ─── Dashboard HTTP API ───────────────────────────────────────────────────────
+class _DashboardHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler that exposes /api/events and /api/health.
+    The parent ASRServer instance is attached as self.server.asr_server."""
+
+    def log_message(self, format, *args):  # silence default access log
+        pass
+
+    def _send_json(self, data: dict | list, status: int = 200):
+        body = json.dumps(data, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        # CORS — allow the Vite dev server (any localhost origin) to fetch
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):  # pre-flight for CORS
+        self._send_json({})
+
+    def do_GET(self):
+        asr: ASRServer = self.server.asr_server
+        path = self.path.split("?")[0]  # strip query string
+
+        if path == "/api/health":
+            uptime = int(time.time() - asr.start_time)
+            with asr._lock:
+                count = len(asr.log_entries)
+            self._send_json({
+                "status": "running",
+                "uptime_seconds": uptime,
+                "session_count": count,
+            })
+
+        elif path == "/api/events":
+            with asr._lock:
+                entries = list(asr.log_entries)  # snapshot — don't hold lock during send
+            self._send_json(entries)
+
+        else:
+            self._send_json({"error": "not found"}, status=404)
+
+
+class DashboardHTTPServer:
+    """Thin wrapper that wires _DashboardHandler to an HTTPServer instance
+    and exposes the parent ASRServer via server.asr_server."""
+
+    def __init__(self, asr_server: "ASRServer", port: int = DASHBOARD_API_PORT):
+        self.asr_server = asr_server
+        self.port = port
+
+    def start_in_thread(self):
+        """Start the HTTP server in a daemon thread — stops when main process exits."""
+        httpd = HTTPServer(("0.0.0.0", self.port), _DashboardHandler)
+        httpd.asr_server = self.asr_server  # attach reference for handler access
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        print(f"  🌐 Dashboard API:    http://localhost:{self.port}/api/health")
+        print(f"                       http://localhost:{self.port}/api/events")
+
+
 class ASRServer:
     """TCP server that receives HVP1 audio streams from ESP32 and transcribes."""
 
-    def __init__(self, port: int = DEFAULT_PORT, whisper_model: str = "tiny"):
+    def __init__(self, port: int = DEFAULT_PORT, whisper_model: str = "tiny",
+                 dashboard_port: int = DASHBOARD_API_PORT):
         self.port           = port
+        self.dashboard_port = dashboard_port
         self.whisper_model  = whisper_model
         self.transcriber    = None
         self.session_count  = 0
+        self.start_time     = time.time()   # used by /api/health uptime
         self._lock          = threading.Lock()
         self.log_entries: list = []
 
     def start(self):
-        """Load Whisper, open TCP socket, serve forever."""
+        """Load Whisper, start HTTP dashboard API thread, open TCP socket, serve forever."""
         self._load_whisper()
         os.makedirs(AUDIO_DIR, exist_ok=True)
+
+        # ── Start Dashboard HTTP API (non-blocking daemon thread) ──────────
+        DashboardHTTPServer(self, port=self.dashboard_port).start_in_thread()
 
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -414,7 +486,8 @@ Default changed to 'tiny'. Use --whisper-model base only if you see bad accuracy
     if args.test:
         test_with_file(args.test, args.port, args.whisper_model)
     else:
-        server = ASRServer(port=args.port, whisper_model=args.whisper_model)
+        server = ASRServer(port=args.port, whisper_model=args.whisper_model,
+                           dashboard_port=DASHBOARD_API_PORT)
         server.start()
 
 

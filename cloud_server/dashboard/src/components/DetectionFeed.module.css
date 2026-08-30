@@ -1,0 +1,168 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  height: 100%;
+  min-height: 500px;
+}
+
+/* Panel header */
+.panelHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--card-border);
+  flex-shrink: 0;
+}
+.panelTitle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-bright);
+}
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan);
+  animation: blink 1.5s infinite;
+  flex-shrink: 0;
+}
+
+/* Scrollable area */
+.feedScroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 18px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-height: 680px;
+}
+
+/* Card */
+.card {
+  background: rgba(255,255,255,0.025);
+  border: 1px solid var(--card-border);
+  border-left: 4px solid var(--cyan);
+  border-radius: 14px;
+  padding: 18px 20px 14px;
+  transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+.card:hover {
+  transform: translateX(4px);
+  background: rgba(255,255,255,0.04);
+  border-left-color: var(--blue);
+}
+/* Newest card gets a subtle highlight + slide-in */
+.cardNew {
+  animation: slideInTop 0.4s ease;
+  border-left-color: var(--cyan);
+  box-shadow: 0 0 18px rgba(0,242,254,0.08);
+}
+
+/* Header row */
+.cardHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.timestamp {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  margin-left: auto;
+}
+.ipBadge {
+  font-size: 10px;
+}
+
+/* Transcript */
+.transcript {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-bright);
+  line-height: 1.4;
+  margin-bottom: 14px;
+  word-break: break-word;
+}
+
+/* Metrics row */
+.metricsRow {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  border-top: 1px solid rgba(255,255,255,0.05);
+  padding-top: 12px;
+  flex-wrap: wrap;
+  gap: 0 4px;
+}
+.metricBox {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 4px 12px;
+  flex: 1;
+  min-width: 80px;
+}
+.metricLabel {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+}
+.metricValue {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+.metricDivider {
+  width: 1px;
+  height: 30px;
+  background: rgba(255,255,255,0.06);
+  flex-shrink: 0;
+}
+.metricTotal {
+  background: rgba(0,242,254,0.04);
+  border-radius: 8px;
+  border: 1px solid rgba(0,242,254,0.1);
+}
+.metricValueLg {
+  font-size: 20px;
+  font-weight: 700;
+}
+
+/* Card footer */
+.cardFooter {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255,255,255,0.04);
+}
+
+/* Empty state */
+.emptyState {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  text-align: center;
+  gap: 10px;
+}
+.emptyIcon {
+  font-size: 52px;
+  opacity: 0.6;
+  animation: pulse-glow 3s infinite alternate;
+  filter: grayscale(0.3);
+}
+.emptyTitle {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-muted);
+}

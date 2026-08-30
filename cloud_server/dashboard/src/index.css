@@ -1,0 +1,136 @@
+/* ─── CSS Design System: Hey Vaani Dashboard ─────────────────────────── */
+:root {
+  --bg-dark:         #080c14;
+  --bg-panel:        rgba(14, 20, 36, 0.75);
+  --card-border:     rgba(255, 255, 255, 0.07);
+  --card-border-glow:rgba(0, 242, 254, 0.35);
+
+  --cyan:            #00f2fe;
+  --blue:            #4facfe;
+  --purple:          #7f00ff;
+  --pink:            #e100ff;
+  --green:           #10b981;
+  --green-soft:      #34d399;
+  --yellow:          #f59e0b;
+  --red:             #ef4444;
+
+  --text-bright:     #f9fafb;
+  --text-main:       #e5e7eb;
+  --text-muted:      #6b7280;
+  --text-dim:        #374151;
+
+  --glow-cyan:       rgba(0, 242, 254, 0.12);
+  --glow-purple:     rgba(127, 0, 255, 0.12);
+
+  --font-sans:       'Outfit', sans-serif;
+  --font-mono:       'JetBrains Mono', monospace;
+
+  --radius-lg:       18px;
+  --radius-md:       12px;
+  --radius-sm:       8px;
+
+  --transition:      all 0.25s ease;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--bg-dark);
+  color: var(--text-main);
+  min-height: 100vh;
+  background-image:
+    radial-gradient(ellipse at 10% 10%,  rgba(79, 172, 254, 0.10) 0%, transparent 45%),
+    radial-gradient(ellipse at 90% 90%,  rgba(127, 0, 255, 0.10) 0%, transparent 45%),
+    radial-gradient(ellipse at 50% 100%, rgba(0, 242, 254, 0.06) 0%, transparent 55%);
+  background-attachment: fixed;
+  overflow-x: hidden;
+}
+
+/* ─── Scrollbar ──────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: rgba(0,0,0,0.15); }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,242,254,0.4); }
+
+/* ─── Glass Panel ────────────────────────────────────────────────────── */
+.glass {
+  background: var(--bg-panel);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  transition: var(--transition);
+}
+.glass:hover {
+  border-color: rgba(0, 242, 254, 0.2);
+  box-shadow: 0 8px 32px var(--glow-cyan);
+}
+
+/* ─── Typography helpers ─────────────────────────────────────────────── */
+.mono { font-family: var(--font-mono); }
+.text-cyan   { color: var(--cyan); }
+.text-green  { color: var(--green-soft); }
+.text-muted  { color: var(--text-muted); }
+.text-bright { color: var(--text-bright); }
+
+/* ─── Gradient text ──────────────────────────────────────────────────── */
+.gradient-text {
+  background: linear-gradient(90deg, #fff 0%, #a5f3fc 60%, var(--cyan) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ─── Pill badges ────────────────────────────────────────────────────── */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+.pill-green  { background: rgba(16,185,129,0.15); color: var(--green-soft); }
+.pill-cyan   { background: rgba(0,242,254,0.12);  color: var(--cyan); }
+.pill-blue   { background: rgba(79,172,254,0.15); color: #60a5fa; }
+.pill-yellow { background: rgba(245,158,11,0.15); color: var(--yellow); }
+.pill-red    { background: rgba(239,68,68,0.15);  color: #f87171; }
+
+/* ─── Animations ─────────────────────────────────────────────────────── */
+@keyframes pulse-glow {
+  0%   { box-shadow: 0 0 15px rgba(0,242,254,0.3); }
+  100% { box-shadow: 0 0 30px rgba(127,0,255,0.5); }
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.35; transform: scale(0.8); }
+}
+@keyframes slideInTop {
+  from { opacity: 0; transform: translateY(-14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes wave {
+  0%   { height: 8px; }
+  100% { height: 44px; }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ─── Layout ─────────────────────────────────────────────────────────── */
+#root {
+  padding: 20px 24px 32px;
+  max-width: 1700px;
+  margin: 0 auto;
+}

@@ -1,0 +1,56 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.panelHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--card-border);
+  flex-shrink: 0;
+}
+.panelTitle {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-bright);
+}
+.chartWrap {
+  padding: 16px;
+  height: 320px;
+  position: relative;
+}
+.noData {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+.summaryStrip {
+  display: flex;
+  justify-content: space-around;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--card-border);
+  gap: 8px;
+}
+.stripItem {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+.stripLabel {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+}
+.stripValue {
+  font-size: 18px;
+  font-weight: 700;
+}

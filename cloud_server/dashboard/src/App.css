@@ -1,0 +1,37 @@
+/* App-level layout */
+.app-root {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.dashboard-layout {
+  display: grid;
+  grid-template-columns: 300px 1fr 380px;
+  grid-template-areas: "sidebar feed chart";
+  gap: 20px;
+  align-items: start;
+}
+
+.sidebar   { grid-area: sidebar; display: flex; flex-direction: column; gap: 18px; }
+.feed-col  { grid-area: feed; }
+.chart-col { grid-area: chart; }
+
+@media (max-width: 1280px) {
+  .dashboard-layout {
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "feed   feed"
+      "sidebar chart";
+  }
+}
+
+@media (max-width: 768px) {
+  .dashboard-layout {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "feed"
+      "chart"
+      "sidebar";
+  }
+}
