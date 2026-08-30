@@ -1,0 +1,187 @@
+.hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 32px 24px 28px;
+  position: relative;
+  z-index: 1;
+  gap: 20px;
+}
+
+/* ── Orb ──────────────────────────────────────────────────────────── */
+.orbWrap {
+  position: relative;
+  width: 160px;
+  height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+/* Siri-style conic gradient ring */
+.siriRing {
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    #ff375f 0%,
+    #ff9f0a 15%,
+    #ffd60a 30%,
+    #30d158 45%,
+    #32ade6 60%,
+    #0a84ff 72%,
+    #bf5af2 85%,
+    #ff375f 100%
+  );
+  animation: siri-rotate 3s linear infinite;
+  opacity: 0.85;
+  transition: opacity 0.4s ease;
+}
+.ringPulse {
+  opacity: 1;
+  animation: siri-rotate 0.8s linear infinite;
+}
+
+/* Subtle pulse ring for detection event */
+.pulseRing {
+  position: absolute;
+  inset: -12px;
+  border-radius: 50%;
+  border: 2px solid rgba(50,173,230,0.4);
+  opacity: 0;
+  transform: scale(0.9);
+  transition: all 0.3s ease;
+}
+.pulseActive {
+  opacity: 1;
+  animation: pulse-ring 1s ease-out forwards;
+}
+
+/* Core orb */
+.orb {
+  position: relative;
+  z-index: 2;
+  width: 148px;
+  height: 148px;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at 35% 30%,
+    rgba(10,132,255,0.6) 0%,
+    rgba(50,173,230,0.4) 25%,
+    rgba(13,19,34,0.95) 65%
+  );
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  box-shadow:
+    inset 0 0 40px rgba(10,132,255,0.2),
+    0 20px 60px rgba(0,0,0,0.6);
+}
+
+/* Waveform bars inside orb */
+.waveform {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 60px;
+}
+.bar {
+  width: 3px;
+  height: 6px;
+  border-radius: 2px;
+  background: rgba(50,173,230,0.5);
+  transform-origin: center;
+  animation: wave-bar 1.2s ease-in-out infinite alternate;
+  transition: background 0.3s ease;
+}
+.barActive {
+  background: linear-gradient(180deg, #32ade6, #0a84ff);
+  box-shadow: 0 0 6px rgba(50,173,230,0.6);
+}
+
+/* ── Transcript pill ──────────────────────────────────────────────── */
+.transcriptWrap { width: 100%; max-width: 700px; }
+
+.transcriptPill {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 28px;
+  background: rgba(13,19,34,0.8);
+  border: 1px solid rgba(255,255,255,0.08);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--text-primary);
+  letter-spacing: -0.2px;
+  transition: all 0.4s ease;
+  width: 100%;
+  justify-content: center;
+}
+.pillNew {
+  border-color: rgba(48,209,88,0.3);
+  box-shadow: 0 0 30px rgba(48,209,88,0.1);
+  animation: slide-up 0.4s var(--ease-spring);
+}
+.pillOffline {
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+.pillWaiting {
+  color: var(--text-secondary);
+  font-size: 15px;
+  font-weight: 400;
+}
+.pillDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.transcriptText {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.3px;
+}
+
+/* ── Latency strip ────────────────────────────────────────────────── */
+.latencyStrip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.latPill {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 20px;
+  gap: 2px;
+}
+.latLabel {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-tertiary);
+}
+.latValue {
+  font-size: 15px;
+  font-weight: 700;
+}
+.latPillTotal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 24px;
+  gap: 2px;
+  border-color: rgba(255,255,255,0.1) !important;
+  background: rgba(255,255,255,0.04) !important;
+}
+.latValueXl {
+  font-size: 22px;
+  font-weight: 800;
+}

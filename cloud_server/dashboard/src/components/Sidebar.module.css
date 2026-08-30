@@ -1,0 +1,102 @@
+.sidebar {
+  width: 232px;
+  min-width: 232px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  position: sticky;
+  top: 0;
+  overflow: hidden;
+}
+
+/* Logo */
+.logoRow {
+  display: flex; align-items: center; gap: 11px;
+  padding: 18px 16px 14px;
+}
+.logoName {
+  font-size: 15px; font-weight: 700; color: var(--t1);
+  letter-spacing: -0.3px; line-height: 1.1;
+}
+.logoSub { font-size: 10px; color: var(--t3); margin-top: 2px; letter-spacing: 0.2px; }
+
+/* Status */
+.statusWrap { padding: 0 12px 12px; }
+.statusPill {
+  display: flex; align-items: center; gap: 7px;
+  padding: 7px 11px; border-radius: 8px;
+  font-size: 12px; font-weight: 600;
+}
+.up   { background: var(--green-dim);  color: var(--green); }
+.down { background: var(--red-dim);    color: var(--red); }
+.dot  { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.dotLive {
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  animation: pulse-dot 1.5s infinite;
+}
+
+/* Divider */
+.divider { border: none; border-top: 1px solid var(--border); margin: 0 12px; }
+
+/* Nav */
+.nav { display: flex; flex-direction: column; gap: 2px; padding: 8px 8px 4px; }
+
+.navItem {
+  display: flex; align-items: center; gap: 9px;
+  padding: 9px 10px;
+  border-radius: var(--r-md); border: none;
+  background: transparent; color: var(--t2);
+  font-family: var(--font); font-size: 13px; font-weight: 500;
+  cursor: pointer; text-align: left; width: 100%;
+  transition: background 0.14s, color 0.14s;
+  position: relative;
+}
+.navItem:hover:not(.active) {
+  background: rgba(255,255,255,0.04);
+  color: var(--t1);
+}
+.active {
+  background: rgba(0,200,255,0.1) !important;
+  color: var(--accent) !important;
+  font-weight: 600;
+}
+.navIcon {
+  width: 20px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.navLabel { flex: 1; }
+
+.liveBadge {
+  font-size: 9px; font-weight: 800; letter-spacing: 0.8px;
+  background: var(--green); color: #000;
+  padding: 1px 5px; border-radius: 4px;
+}
+
+/* Section label */
+.sectionLabel {
+  font-size: 9px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 1px; color: var(--t3);
+  padding: 12px 18px 4px;
+}
+
+/* Device card */
+.deviceCard {
+  margin-top: auto;
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 16px 18px;
+  border-top: 1px solid var(--border);
+}
+.deviceAvatar {
+  width: 34px; height: 34px; border-radius: 8px;
+  background: var(--accent-dim);
+  border: 1px solid rgba(0,200,255,0.2);
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.deviceInfo { flex: 1; min-width: 0; }
+.deviceName { font-size: 12px; font-weight: 600; color: var(--t1); }
+.deviceSub  { font-size: 10px; color: var(--t3); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.deviceDot  { width: 7px; height: 7px; border-radius: 50%; background: var(--t3); flex-shrink: 0; }
+.deviceOnline { background: var(--green); box-shadow: 0 0 6px var(--green); }

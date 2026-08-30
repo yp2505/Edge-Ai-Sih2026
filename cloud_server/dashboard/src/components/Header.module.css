@@ -1,0 +1,114 @@
+.header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  padding: 0 24px;
+  background: rgba(4, 6, 13, 0.75);
+  backdrop-filter: blur(28px) saturate(200%);
+  -webkit-backdrop-filter: blur(28px) saturate(200%);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.inner {
+  max-width: 1700px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 68px;
+  gap: 24px;
+}
+
+/* ── Brand ─────────────────────────────────────────────────────────── */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-shrink: 0;
+}
+.logoRing {
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  padding: 2px;
+  background: conic-gradient(from 0deg, #ff375f, #ff9f0a, #ffd60a, #30d158, #32ade6, #0a84ff, #bf5af2, #ff375f);
+  animation: siri-rotate 4s linear infinite;
+  flex-shrink: 0;
+}
+.logoCore {
+  width: 100%; height: 100%;
+  border-radius: 50%;
+  background: var(--surface-0);
+  display: flex; align-items: center; justify-content: center;
+}
+.logoEmoji { font-size: 20px; }
+
+.brandName {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+  background: linear-gradient(90deg, #fff 0%, #a8d8ff 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  display: block;
+  line-height: 1.1;
+}
+.brandSub {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  display: block;
+  letter-spacing: 0.5px;
+  margin-top: 1px;
+}
+
+/* ── Nav ────────────────────────────────────────────────────────────── */
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 100px;
+  padding: 4px;
+}
+.navItem {
+  padding: 6px 18px;
+  border-radius: 100px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: default;
+  transition: all 0.2s ease;
+  letter-spacing: 0.1px;
+}
+.navItem:first-child {
+  background: rgba(50,173,230,0.15);
+  color: var(--cyan);
+  border: 1px solid rgba(50,173,230,0.2);
+}
+.navItem:hover { color: var(--text-primary); }
+
+/* ── Status cluster ─────────────────────────────────────────────────── */
+.statusRow {
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+}
+.chip {
+  display: flex; flex-direction: column; align-items: center;
+  padding: 5px 14px;
+  gap: 1px;
+}
+.chipLabel { font-size: 9px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-tertiary); }
+.chipVal   { font-size: 13px; font-weight: 600; }
+
+.statusPill {
+  display: flex; align-items: center; gap: 7px;
+  padding: 8px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.up   { background: rgba(48,209,88,0.12);  color: var(--green);  border: 1px solid rgba(48,209,88,0.25); }
+.down { background: rgba(255,69,58,0.12);  color: var(--red);    border: 1px solid rgba(255,69,58,0.25); }
+
+.dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.dotUp   { background: var(--green); box-shadow: 0 0 8px var(--green); animation: blink-dot 1.5s infinite; }
+.dotDown { background: var(--red);   box-shadow: 0 0 8px var(--red); }

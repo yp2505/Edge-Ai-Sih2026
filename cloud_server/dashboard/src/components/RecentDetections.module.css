@@ -1,0 +1,59 @@
+.wrap { padding: 0; display: flex; flex-direction: column; flex: 1; height: 100%; min-height: 0; }
+
+.tableHeader {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  padding: 20px 22px 16px; border-bottom: 1px solid var(--border);
+  flex-wrap: wrap; gap: 10px; flex-shrink: 0;
+}
+.title { font-size: 16px; font-weight: 700; color: var(--t1); }
+.sub   { font-size: 11px; color: var(--t3); margin-top: 3px; }
+.viewAll {
+  font-size: 12px; font-weight: 600;
+  cursor: pointer; border: none;
+  padding: 7px 16px !important;
+}
+
+.empty {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 40px; text-align: center; font-size: 13px; color: var(--t3); min-height: 200px;
+}
+
+/* Table */
+.tableWrap { overflow-y: auto; flex: 1; min-height: 0; }
+.table {
+  width: 100%; border-collapse: collapse;
+  font-size: 13px;
+}
+.table thead tr {
+  border-bottom: 1px solid var(--border);
+}
+.table th {
+  padding: 10px 16px;
+  text-align: left;
+  font-size: 10px; font-weight: 700;
+  letter-spacing: 0.8px; text-transform: uppercase;
+  color: var(--t3); white-space: nowrap;
+}
+.row {
+  border-bottom: 1px solid var(--border);
+  transition: background 0.15s;
+}
+.row:last-child { border-bottom: none; }
+.row:hover { background: rgba(255,255,255,0.025); }
+.rowNew { animation: slide-up 0.4s ease; }
+
+.table td { padding: 14px 16px; vertical-align: middle; }
+
+/* Session cell */
+.sessionCell { display: flex; flex-direction: column; gap: 3px; }
+.sessionAvatar {
+  font-family: var(--mono); font-size: 12px; font-weight: 700;
+  color: var(--accent);
+}
+
+/* Transcript cell */
+.transcriptCell {
+  max-width: 240px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: var(--t1); font-weight: 500;
+}
