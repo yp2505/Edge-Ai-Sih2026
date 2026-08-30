@@ -22,6 +22,7 @@ export default function CinematicBlob({ latestEvent }) {
         <div className={styles.core}></div>
         <div className={styles.ring1}></div>
         <div className={styles.ring2}></div>
+        <div className={styles.ring3}></div>
       </div>
 
       {/* Typography */}

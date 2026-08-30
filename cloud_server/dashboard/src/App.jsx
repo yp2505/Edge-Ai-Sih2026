@@ -12,6 +12,7 @@ export default function App() {
   const [events, setEvents] = useState([])
   const [health, setHealth] = useState(null)
   const [serverUp, setServerUp] = useState(false)
+  const [activeTab, setActiveTab] = useState('live') // 'live', 'config', 'diag'
 
   const fetchHealth = useCallback(async () => {
     try {
@@ -42,28 +43,57 @@ export default function App() {
     <div className="hud-layout">
       {/* Top Header */}
       <div className="hud-panel header-area">
-        <HudHeader health={health} serverUp={serverUp} totalEvents={events.length} />
+        <HudHeader 
+          health={health} 
+          serverUp={serverUp} 
+          totalEvents={events.length} 
+          activeTab={activeTab} 
+          setActiveTab={setActiveTab} 
+        />
       </div>
 
-      {/* Left Panel: Digital Twin Hardware representation */}
-      <div className="hud-panel hardware-area">
-        <HardwareTwin latestEvent={latestEvent} />
-      </div>
+      {activeTab === 'live' && (
+        <>
+          {/* Left Panel: Digital Twin Hardware representation */}
+          <div className="hud-panel hardware-area">
+            <HardwareTwin latestEvent={latestEvent} />
+          </div>
 
-      {/* Center: The Magic Blob & Transcription Typography */}
-      <div className="hud-panel center-area">
-        <CinematicBlob latestEvent={latestEvent} />
-      </div>
+          {/* Center: The Magic Blob & Transcription Typography */}
+          <div className="hud-panel center-area">
+            <CinematicBlob latestEvent={latestEvent} />
+          </div>
 
-      {/* Right Panel: Hacker-style rolling log feed */}
-      <div className="hud-panel terminal-area">
-        <CyberTerminal events={events} />
-      </div>
+          {/* Right Panel: Hacker-style rolling log feed */}
+          <div className="hud-panel terminal-area">
+            <CyberTerminal events={events} />
+          </div>
 
-      {/* Bottom Panel: Latency Area Chart Radar */}
-      <div className="hud-panel radar-area">
-        <LatencyRadar events={events} />
-      </div>
+          {/* Bottom Panel: Latency Area Chart Radar */}
+          <div className="hud-panel radar-area">
+            <LatencyRadar events={events} />
+          </div>
+        </>
+      )}
+
+      {activeTab === 'config' && (
+        <div className="hud-panel full-area" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+          <h1 className="hero-text glow-purple" style={{ fontSize: 60, marginBottom: 40 }}>NODE CONFIG</h1>
+          <div style={{ width: 600, height: 600 }}>
+             <HardwareTwin latestEvent={latestEvent} />
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'diag' && (
+        <div className="hud-panel full-area" style={{ padding: 40, display: 'flex', flexDirection: 'column' }}>
+          <h1 className="hero-text glow-cyan" style={{ fontSize: 40, marginBottom: 20 }}>SYS.DIAGNOSTICS</h1>
+          <div style={{ flex: 1 }}>
+            <LatencyRadar events={events} />
+          </div>
+        </div>
+      )}
+
     </div>
   )
 }

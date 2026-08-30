@@ -1,6 +1,6 @@
 import styles from './HudHeader.module.css'
 
-export default function HudHeader({ health, serverUp, totalEvents }) {
+export default function HudHeader({ health, serverUp, totalEvents, activeTab, setActiveTab }) {
   const uptime = health?.uptime_seconds
   const fmt = s => {
     if (s == null) return '00:00:00'
@@ -22,9 +22,24 @@ export default function HudHeader({ health, serverUp, totalEvents }) {
 
       <div className={styles.center}>
         <div className={styles.navLinks}>
-          <span className={styles.navItemActive}>LIVE TRACKING</span>
-          <span className={styles.navItem}>NODE CONFIG</span>
-          <span className={styles.navItem}>DIAGNOSTICS</span>
+          <span 
+            className={activeTab === 'live' ? styles.navItemActive : styles.navItem}
+            onClick={() => setActiveTab('live')}
+          >
+            LIVE TRACKING
+          </span>
+          <span 
+            className={activeTab === 'config' ? styles.navItemActive : styles.navItem}
+            onClick={() => setActiveTab('config')}
+          >
+            NODE CONFIG
+          </span>
+          <span 
+            className={activeTab === 'diag' ? styles.navItemActive : styles.navItem}
+            onClick={() => setActiveTab('diag')}
+          >
+            DIAGNOSTICS
+          </span>
         </div>
       </div>
 
