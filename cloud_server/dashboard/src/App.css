@@ -1,25 +1,22 @@
-@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;700;900&family=JetBrains+Mono:wght@400;700;800&display=swap');
 
 :root {
-  /* Cyberpunk / HUD Theme */
-  --bg: #010204;
-  --bg-glow: radial-gradient(circle at 50% 50%, #060b17 0%, #010204 100%);
+  /* High-Contrast Spatial Theme */
+  --bg: #000000;
   
-  --panel-bg: rgba(4, 9, 18, 0.7);
-  --panel-border: rgba(0, 240, 255, 0.25);
-  --panel-border-glow: rgba(0, 240, 255, 0.6);
+  /* Glassmorphism */
+  --glass-bg: rgba(255, 255, 255, 0.03);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-highlight: rgba(255, 255, 255, 0.2);
   
-  --text-main: #e0fbfc;
-  --text-muted: #3a5370;
+  --text-main: #ffffff;
+  --text-muted: #888888;
   
-  --neon-cyan: #00f0ff;
-  --neon-purple: #b5179e;
-  --neon-green: #00ff41;
-  --neon-red: #ff003c;
+  --accent-orange: #ff3b00;
+  --accent-blue: #007aff;
   
   /* Fonts */
-  --font-hud: 'Rajdhani', sans-serif;
-  --font-hero: 'Orbitron', sans-serif;
+  --font-base: 'Inter', -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
 }
 
@@ -27,105 +24,82 @@
 
 body {
   background: var(--bg);
-  background-image: 
-    linear-gradient(rgba(0, 240, 255, 0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(0, 240, 255, 0.03) 1px, transparent 1px);
-  background-size: 50px 50px;
-  background-position: center center;
   color: var(--text-main);
-  font-family: var(--font-hud);
+  font-family: var(--font-base);
   overflow: hidden;
   height: 100vh;
   width: 100vw;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Master Grid Layout */
-.hud-layout {
-  display: grid;
-  grid-template-columns: 300px 1fr 340px;
-  grid-template-rows: 70px 1fr 240px;
-  gap: 24px;
+/* Master Layout */
+.spatial-layout {
+  position: relative;
   height: 100vh;
   width: 100vw;
-  padding: 24px;
-  background: var(--bg-glow);
-  position: relative;
-  z-index: 1;
-}
-
-/* Moving scanline overlay */
-.hud-layout::after {
-  content: "";
-  position: absolute;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%);
-  background-size: 100% 4px;
-  z-index: 999;
-  pointer-events: none;
-  animation: scanlines 10s linear infinite;
-}
-
-@keyframes scanlines {
-  0% { background-position: 0 0; }
-  100% { background-position: 0 100vh; }
-}
-
-/* Shared HUD Panel Style */
-.hud-panel {
-  background: var(--panel-bg);
-  border: 1px solid var(--panel-border);
-  backdrop-filter: blur(20px);
-  position: relative;
+  z-index: 10;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 0 30px rgba(0, 240, 255, 0.05), inset 0 0 20px rgba(0, 240, 255, 0.05);
 }
 
-/* Cool HUD corner brackets (animated) */
-.hud-panel::before, .hud-panel::after {
-  content: ''; position: absolute; width: 12px; height: 12px; border-color: var(--neon-cyan); border-style: solid;
-  transition: 0.3s;
+/* Background Canvas Layer */
+.neural-canvas-container {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 0;
+  background: radial-gradient(circle at 50% 50%, #111 0%, #000 100%);
+  overflow: hidden;
 }
-.hud-panel::before { top: -2px; left: -2px; border-width: 2px 0 0 2px; }
-.hud-panel::after { bottom: -2px; right: -2px; border-width: 0 2px 2px 0; }
-.hud-panel:hover::before { width: 20px; height: 20px; border-color: var(--neon-purple); }
-.hud-panel:hover::after { width: 20px; height: 20px; border-color: var(--neon-purple); }
 
-/* Grid Areas */
-.header-area { grid-column: 1 / 4; grid-row: 1 / 2; }
-.hardware-area { grid-column: 1 / 2; grid-row: 2 / 3; }
-.center-area { grid-column: 2 / 3; grid-row: 2 / 3; background: transparent !important; border: none !important; backdrop-filter: none !important; box-shadow: none !important; }
-.center-area::before, .center-area::after { display: none; }
-.terminal-area { grid-column: 3 / 4; grid-row: 2 / 4; }
-.radar-area { grid-column: 1 / 3; grid-row: 3 / 4; }
+/* Header Area */
+.spatial-header {
+  height: 80px;
+  padding: 0 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--glass-border);
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(40px);
+  -webkit-backdrop-filter: blur(40px);
+  z-index: 20;
+}
 
-/* Fullscreen overlays for alternative tabs */
-.full-area { grid-column: 1 / 4; grid-row: 2 / 4; z-index: 10; animation: fade-in 0.4s ease; }
-@keyframes fade-in { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+/* Main Content Area */
+.spatial-content {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 360px 1fr 360px;
+  gap: 30px;
+  padding: 30px 40px 40px;
+  z-index: 20;
+}
+
+/* Glass Panels */
+.glass-panel {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 24px;
+  backdrop-filter: blur(40px) saturate(150%);
+  -webkit-backdrop-filter: blur(40px) saturate(150%);
+  box-shadow: 0 30px 60px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.1);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.glass-panel:hover {
+  transform: scale(1.02);
+  border-color: var(--glass-highlight);
+}
 
 /* Typography Helpers */
 .mono { font-family: var(--font-mono); }
-.hero-text { font-family: var(--font-hero); }
-.glow-cyan { color: var(--neon-cyan); text-shadow: 0 0 10px var(--neon-cyan), 0 0 20px var(--neon-cyan); }
-.glow-purple { color: var(--neon-purple); text-shadow: 0 0 10px var(--neon-purple), 0 0 20px var(--neon-purple); }
-.glow-green { color: var(--neon-green); text-shadow: 0 0 10px var(--neon-green), 0 0 20px var(--neon-green); }
-.glow-red { color: var(--neon-red); text-shadow: 0 0 10px var(--neon-red), 0 0 20px var(--neon-red); }
+.brutal-title { font-weight: 900; letter-spacing: -1px; text-transform: uppercase; }
 
-/* Glitch Effect on Hover */
-.glitch-hover:hover {
-  animation: glitch-anim 0.2s cubic-bezier(.25, .46, .45, .94) both infinite;
-}
-@keyframes glitch-anim {
-  0% { transform: translate(0) }
-  20% { transform: translate(-2px, 2px) }
-  40% { transform: translate(-2px, -2px) }
-  60% { transform: translate(2px, 2px) }
-  80% { transform: translate(2px, -2px) }
-  100% { transform: translate(0) }
-}
-
-/* Custom Scrollbar for HUD */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: rgba(0,240,255,0.02); }
-::-webkit-scrollbar-thumb { background: var(--neon-cyan); box-shadow: 0 0 10px var(--neon-cyan); }
-::-webkit-scrollbar-thumb:hover { background: var(--neon-purple); }
+/* Custom Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.4); }

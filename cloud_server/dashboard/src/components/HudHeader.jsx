@@ -1,6 +1,6 @@
 import styles from './HudHeader.module.css'
 
-export default function HudHeader({ health, serverUp, totalEvents, activeTab, setActiveTab }) {
+export default function HudHeader({ health, serverUp, totalEvents }) {
   const uptime = health?.uptime_seconds
   const fmt = s => {
     if (s == null) return '00:00:00'
@@ -11,52 +11,26 @@ export default function HudHeader({ health, serverUp, totalEvents, activeTab, se
   return (
     <div className={styles.header}>
       <div className={styles.left}>
-        <div className={styles.logoGroup}>
-          <div className={styles.logoMark}>HV</div>
-          <div className={styles.titleBox}>
-            <h1 className="hero-text">HEY VAANI</h1>
-            <span className={styles.version}>SYS.VER 2.0.26</span>
-          </div>
-        </div>
-      </div>
-
-      <div className={styles.center}>
-        <div className={styles.navLinks}>
-          <span 
-            className={activeTab === 'live' ? styles.navItemActive : styles.navItem}
-            onClick={() => setActiveTab('live')}
-          >
-            LIVE TRACKING
-          </span>
-          <span 
-            className={activeTab === 'config' ? styles.navItemActive : styles.navItem}
-            onClick={() => setActiveTab('config')}
-          >
-            NODE CONFIG
-          </span>
-          <span 
-            className={activeTab === 'diag' ? styles.navItemActive : styles.navItem}
-            onClick={() => setActiveTab('diag')}
-          >
-            DIAGNOSTICS
-          </span>
-        </div>
+        <div className={styles.logoMark}>HV</div>
+        <h1 className={styles.brandTitle}>HEY VAANI <span className={styles.version}>SPATIAL 3.0</span></h1>
       </div>
 
       <div className={styles.right}>
-        <div className={styles.statBox}>
-          <span className={styles.statLabel}>DETECTS</span>
-          <span className="mono glow-cyan">{totalEvents.toString().padStart(4, '0')}</span>
+        <div className={styles.statGroup}>
+          <div className={styles.stat}>
+            <span className={styles.sLabel}>EVENTS</span>
+            <span className="mono">{totalEvents}</span>
+          </div>
+          <div className={styles.stat}>
+            <span className={styles.sLabel}>UPTIME</span>
+            <span className="mono">{fmt(uptime)}</span>
+          </div>
         </div>
-        <div className={styles.statBox}>
-          <span className={styles.statLabel}>UPTIME</span>
-          <span className="mono glow-purple">{fmt(uptime)}</span>
-        </div>
-        <div className={styles.statusBox}>
+        <div className={styles.connection}>
           {serverUp ? (
-            <span className={styles.online}><span className={styles.pulseGreen}></span> UPLINK STABLE</span>
+            <span className={styles.online}><div className={styles.dotGreen}></div> SYSTEM ONLINE</span>
           ) : (
-            <span className={styles.offline}><span className={styles.pulseRed}></span> NO SIGNAL</span>
+            <span className={styles.offline}><div className={styles.dotRed}></div> OFFLINE</span>
           )}
         </div>
       </div>

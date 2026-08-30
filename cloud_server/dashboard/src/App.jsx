@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
+import NeuralBackground from './components/NeuralBackground.jsx'
 import HudHeader from './components/HudHeader.jsx'
-import HardwareTwin from './components/HardwareTwin.jsx'
 import CinematicBlob from './components/CinematicBlob.jsx'
 import CyberTerminal from './components/CyberTerminal.jsx'
 import LatencyRadar from './components/LatencyRadar.jsx'
@@ -12,7 +12,6 @@ export default function App() {
   const [events, setEvents] = useState([])
   const [health, setHealth] = useState(null)
   const [serverUp, setServerUp] = useState(false)
-  const [activeTab, setActiveTab] = useState('live') // 'live', 'config', 'diag'
 
   const fetchHealth = useCallback(async () => {
     try {
@@ -32,68 +31,61 @@ export default function App() {
   useEffect(() => {
     fetchHealth(); fetchEvents()
     const h = setInterval(fetchHealth, 3000)
-    const e = setInterval(fetchEvents, 800) // Fast poll for the HUD feel
+    const e = setInterval(fetchEvents, 800)
     return () => { clearInterval(h); clearInterval(e) }
   }, [fetchHealth, fetchEvents])
 
-  // Get the most recent event to trigger the Cinematic Blob
   const latestEvent = events.length > 0 ? events[events.length - 1] : null
+  const isProcessing = latestEvent && (Date.now() - new Date(latestEvent.timestamp).getTime() < 3000)
 
   return (
-    <div className="hud-layout">
-      {/* Top Header */}
-      <div className="hud-panel header-area">
-        <HudHeader 
-          health={health} 
-          serverUp={serverUp} 
-          totalEvents={events.length} 
-          activeTab={activeTab} 
-          setActiveTab={setActiveTab} 
-        />
+    <div className="spatial-layout">
+      {/* 3D Neural Background */}
+      <div className="neural-canvas-container">
+        <NeuralBackground isActive={isProcessing} />
       </div>
 
-      {activeTab === 'live' && (
-        <>
-          {/* Left Panel: Digital Twin Hardware representation */}
-          <div className="hud-panel hardware-area">
-            <HardwareTwin latestEvent={latestEvent} />
-          </div>
+      {/* Glass Header */}
+      <div className="spatial-header">
+        <HudHeader health={health} serverUp={serverUp} totalEvents={events.length} />
+      </div>
 
-          {/* Center: The Magic Blob & Transcription Typography */}
-          <div className="hud-panel center-area">
-            <CinematicBlob latestEvent={latestEvent} />
-          </div>
-
-          {/* Right Panel: Hacker-style rolling log feed */}
-          <div className="hud-panel terminal-area">
-            <CyberTerminal events={events} />
-          </div>
-
-          {/* Bottom Panel: Latency Area Chart Radar */}
-          <div className="hud-panel radar-area">
-            <LatencyRadar events={events} />
-          </div>
-        </>
-      )}
-
-      {activeTab === 'config' && (
-        <div className="hud-panel full-area" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
-          <h1 className="hero-text glow-purple" style={{ fontSize: 60, marginBottom: 40 }}>NODE CONFIG</h1>
-          <div style={{ width: 600, height: 600 }}>
-             <HardwareTwin latestEvent={latestEvent} />
+      {/* Main Glass Grid */}
+      <div className="spatial-content">
+        
+        {/* Left: Giant Brutalist Latency */}
+        <div className="glass-panel" style={{ padding: 40, justifyContent: 'center' }}>
+          <h2 className="brutal-title" style={{ fontSize: 16, color: 'var(--text-muted)', marginBottom: 20 }}>END-TO-END LATENCY</h2>
+          {latestEvent ? (
+            <div>
+              <div className="mono" style={{ fontSize: 80, fontWeight: 900, color: 'var(--accent-orange)', lineHeight: 0.9, letterSpacing: -4 }}>
+                {(latestEvent.kw_to_connect_ms||0)+(latestEvent.receive_gap_ms||0)+(latestEvent.transcribe_ms||0)}
+              </div>
+              <div className="mono" style={{ fontSize: 20, color: 'var(--text-main)', marginTop: 10 }}>MILLISECONDS</div>
+            </div>
+          ) : (
+            <div className="mono" style={{ fontSize: 60, color: 'var(--text-muted)' }}>--</div>
+          )}
+          
+          <div style={{ marginTop: 60 }}>
+            <h2 className="brutal-title" style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 10 }}>NETWORK RADAR</h2>
+            <div style={{ height: 180, margin: '0 -20px' }}>
+              <LatencyRadar events={events} isMinimal={true} />
+            </div>
           </div>
         </div>
-      )}
 
-      {activeTab === 'diag' && (
-        <div className="hud-panel full-area" style={{ padding: 40, display: 'flex', flexDirection: 'column' }}>
-          <h1 className="hero-text glow-cyan" style={{ fontSize: 40, marginBottom: 20 }}>SYS.DIAGNOSTICS</h1>
-          <div style={{ flex: 1 }}>
-            <LatencyRadar events={events} />
-          </div>
+        {/* Center: Apple Vision Pro style Orb */}
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+          <CinematicBlob latestEvent={latestEvent} />
         </div>
-      )}
 
+        {/* Right: Glass Terminal */}
+        <div className="glass-panel">
+          <CyberTerminal events={events} isGlass={true} />
+        </div>
+
+      </div>
     </div>
   )
 }

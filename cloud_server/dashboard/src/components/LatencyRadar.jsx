@@ -7,7 +7,7 @@ import styles from './LatencyRadar.module.css'
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler)
 
-export default function LatencyRadar({ events }) {
+export default function LatencyRadar({ events, isMinimal }) {
   const vis = events.slice(-40)
   
   const labels = vis.map(e => `#${e.session_id}`)
@@ -17,19 +17,19 @@ export default function LatencyRadar({ events }) {
     labels,
     datasets: [{
       data: e2e,
-      borderColor: '#00f0ff',
+      borderColor: '#ff3b00',
       backgroundColor: (context) => {
         const ctx = context.chart.ctx
         const gradient = ctx.createLinearGradient(0, 0, 0, 200)
-        gradient.addColorStop(0, 'rgba(0,240,255,0.4)')
-        gradient.addColorStop(1, 'rgba(0,240,255,0.0)')
+        gradient.addColorStop(0, 'rgba(255, 59, 0, 0.4)')
+        gradient.addColorStop(1, 'rgba(255, 59, 0, 0.0)')
         return gradient
       },
       borderWidth: 2,
-      tension: 0.3,
+      tension: 0.4,
       fill: true,
       pointRadius: 0,
-      pointHoverRadius: 5,
+      pointHoverRadius: 4,
       pointBackgroundColor: '#fff',
     }]
   }
@@ -37,16 +37,17 @@ export default function LatencyRadar({ events }) {
   const options = {
     responsive: true,
     maintainAspectRatio: false,
-    animation: { duration: 0 }, // Instant update for HUD feel
+    animation: { duration: 0 },
     interaction: { mode: 'index', intersect: false },
     plugins: {
       legend: { display: false },
       tooltip: {
-        backgroundColor: 'rgba(3,5,8,0.9)',
-        borderColor: '#00f0ff', borderWidth: 1,
+        backgroundColor: 'rgba(255,255,255,0.9)',
+        borderColor: 'rgba(0,0,0,0.1)', borderWidth: 1,
         titleFont: { family: "'JetBrains Mono'", size: 10 },
+        titleColor: '#888',
         bodyFont:  { family: "'JetBrains Mono'", size: 14, weight: 'bold' },
-        bodyColor: '#00f0ff',
+        bodyColor: '#ff3b00',
         displayColors: false,
         callbacks: { label: ctx => `${ctx.parsed.y} MS` }
       }
@@ -54,8 +55,9 @@ export default function LatencyRadar({ events }) {
     scales: {
       x: { display: false },
       y: {
-        grid: { color: 'rgba(0,240,255,0.05)', drawBorder: false },
-        ticks: { color: '#4b6584', font: { family: "'JetBrains Mono'", size: 9 }, maxTicksLimit: 5 },
+        display: !isMinimal,
+        grid: { color: 'rgba(255,255,255,0.05)', drawBorder: false },
+        ticks: { color: '#888', font: { family: "'JetBrains Mono'", size: 9 }, maxTicksLimit: 5 },
         beginAtZero: true,
         position: 'right'
       }
@@ -63,15 +65,13 @@ export default function LatencyRadar({ events }) {
   }
 
   return (
-    <div className={styles.radar}>
-      <div className={styles.header}>
-        <span className={styles.title}>RADAR // E2E LATENCY SIGNATURE</span>
-        <div className={styles.stats}>
-          <span>AVG: {e2e.length ? Math.round(e2e.reduce((a,b)=>a+b,0)/e2e.length) : 0}ms</span>
-          <span>MAX: {e2e.length ? Math.max(...e2e) : 0}ms</span>
+    <div className={styles.radar} style={isMinimal ? { padding: 0, background: 'transparent', border: 'none' } : {}}>
+      {!isMinimal && (
+        <div className={styles.header}>
+          <span className={styles.title}>RADAR // E2E LATENCY</span>
         </div>
-      </div>
-      <div className={styles.chartWrap}>
+      )}
+      <div className={styles.chartWrap} style={isMinimal ? { padding: 0 } : {}}>
         {events.length === 0 ? (
           <div className={styles.empty}>NO DATA</div>
         ) : (
