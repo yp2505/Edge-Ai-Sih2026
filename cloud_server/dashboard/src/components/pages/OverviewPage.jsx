@@ -16,7 +16,7 @@ export default function OverviewPage({ stats, events, serverUp }) {
           <BreakdownDonut events={events} />
         </div>
       </div>
-      <div className="card">
+      <div className="card" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
         <RecentDetections events={[...events].reverse()} />
       </div>
     </div>

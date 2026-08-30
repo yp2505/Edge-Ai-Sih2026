@@ -1,20 +1,63 @@
-/* ── Shell: sidebar + main ──────────────────────────────────────── */
-.shell {
-  display: flex;
-  min-height: 100vh;
-  background: var(--bg);
+/* App.css - Global resets & layout shell */
+
+:root {
+  /* Colors */
+  --bg: #0b0f19;
+  --surface: #111827;
+  --surface-2: #1f2937;
+  --surface-3: #374151;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-hover: rgba(255, 255, 255, 0.15);
+  
+  --t1: #f1f5f9;
+  --t2: #cbd5e1;
+  --t3: #64748b;
+  
+  --accent: #00c8ff;
+  --accent-dim: rgba(0, 200, 255, 0.1);
+  --green: #22c55e;
+  --green-dim: rgba(34, 197, 94, 0.1);
+  --red: #ef4444;
+  --red-dim: rgba(239, 68, 68, 0.1);
+  --yellow: #eab308;
+  --yellow-dim: rgba(234, 179, 8, 0.1);
+  --purple: #a855f7;
+
+  /* Typography */
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --mono: 'JetBrains Mono', 'Fira Code', monospace;
+  
+  /* Radii */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
 }
 
-/* ── Main area (right of sidebar) ───────────────────────────────── */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg);
+  color: var(--t1);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden; /* App shell handles scroll */
+}
+
+/* Shell Layout */
+.shell {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
 .main {
   flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
-  overflow: hidden;
+  position: relative;
 }
 
-/* ── Scrollable content ─────────────────────────────────────────── */
 .content {
   flex: 1;
   padding: 24px 28px 40px;
@@ -22,18 +65,53 @@
   flex-direction: column;
   gap: 20px;
   overflow-y: auto;
+  min-height: 0;
 }
 
-/* ── Charts row ─────────────────────────────────────────────────── */
-.charts-row {
-  display: grid;
-  grid-template-columns: 1fr 340px;
-  gap: 20px;
+/* Global utility classes */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: 0 4px 24px rgba(0,0,0,0.2);
 }
 
-@media (max-width: 1200px) {
-  .charts-row { grid-template-columns: 1fr; }
+.mono { font-family: var(--mono); }
+.t1 { color: var(--t1); }
+.t2 { color: var(--t2); }
+.t3 { color: var(--t3); }
+
+/* Badges */
+.badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 4px 8px; border-radius: var(--r-sm);
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px;
 }
-@media (max-width: 900px) {
-  .content { padding: 16px; }
+.badge-green  { background: var(--green-dim); color: var(--green); }
+.badge-red    { background: var(--red-dim);   color: var(--red); }
+.badge-yellow { background: var(--yellow-dim);color: var(--yellow); }
+.badge-accent { background: var(--accent-dim);color: var(--accent); border: 1px solid rgba(0,200,255,0.2); }
+.badge-muted  { background: var(--surface-2); color: var(--t3); }
+
+/* Animations */
+@keyframes pulse-dot {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+  70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
 }
+
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--t3); }

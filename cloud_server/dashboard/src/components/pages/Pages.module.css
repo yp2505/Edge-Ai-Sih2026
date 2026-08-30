@@ -1,17 +1,18 @@
 /* Shared page wrapper */
-.page { display: flex; flex-direction: column; gap: 18px; }
+.page { display: flex; flex-direction: column; gap: 18px; flex: 1; min-height: 0; }
 
 /* Charts row */
-.chartsRow { display: grid; grid-template-columns: 1fr 320px; gap: 16px; align-items: start; }
-.chartMain { min-height: 360px; }
-.chartSide { }
+.chartsRow { display: grid; grid-template-columns: 1fr 320px; gap: 16px; align-items: stretch; }
+.chartMain { display: flex; flex-direction: column; min-height: 360px; }
+.chartSide { display: flex; flex-direction: column; }
 @media (max-width: 1100px) { .chartsRow { grid-template-columns: 1fr; } }
 
 /* ── Live Feed ─────────────────────────────────────────────────── */
-.liveFeedPanel { overflow: hidden; }
+.liveFeedPanel { display: flex; flex-direction: column; flex: 1; overflow: hidden; min-height: 400px; }
 .feedHeader {
   display: flex; align-items: center; justify-content: space-between;
   padding: 16px 20px; border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
 }
 .feedHeaderLeft { display: flex; align-items: center; gap: 10px; }
 .liveDot {
@@ -20,8 +21,8 @@
   animation: pulse-dot 1.5s infinite;
 }
 .feedTitle { font-size: 15px; font-weight: 700; color: var(--t1); }
-.feedScroll { overflow-y: auto; max-height: calc(100vh - 200px); padding: 12px; display: flex; flex-direction: column; gap: 8px; }
-.emptyFeed { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 20px; gap: 12px; text-align: center; }
+.feedScroll { overflow-y: auto; flex: 1; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.emptyFeed { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 20px; gap: 12px; text-align: center; }
 .emptyIcon { opacity: 0.4; }
 .emptyTitle { font-size: 16px; font-weight: 600; color: var(--t2); }
 .emptySub   { font-size: 13px; color: var(--t3); max-width: 280px; line-height: 1.5; }
@@ -32,6 +33,7 @@
   background: var(--surface-2); border: 1px solid var(--border);
   border-radius: var(--r-lg);
   transition: background 0.15s, border-color 0.15s;
+  flex-shrink: 0;
 }
 .feedCard:hover { background: var(--surface-3); border-color: var(--border-hover); }
 .feedCardNew { animation: slide-up 0.4s ease; border-left: 3px solid var(--green); }
@@ -47,7 +49,7 @@
 .cardRight { flex-shrink: 0; }
 
 /* ── Latency page ───────────────────────────────────────────────── */
-.latencyStats { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; }
+.latencyStats { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; flex-shrink: 0; }
 .latStat { padding: 18px 20px; }
 .latStatLabel { font-size: 11px; color: var(--t3); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 8px; }
 .latStatVal   { font-size: 26px; font-weight: 800; }
@@ -65,14 +67,14 @@
 @media (max-width: 1000px) { .specsGrid { grid-template-columns: repeat(2,1fr); } }
 
 /* ── Reports ─────────────────────────────────────────────────────── */
-.reportRow { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; }
+.reportRow { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; flex-shrink: 0; }
 .reportStat { padding: 18px 20px; }
 .reportLabel { font-size: 11px; color: var(--t3); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 8px; }
 .reportVal   { font-size: 24px; font-weight: 800; }
 
 .downloadCard {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 20px 24px; gap: 16px; flex-wrap: wrap;
+  padding: 20px 24px; gap: 16px; flex-wrap: wrap; flex-shrink: 0;
 }
 .dlTitle { font-size: 15px; font-weight: 700; color: var(--t1); margin-bottom: 4px; }
 .dlSub   { font-size: 12px; color: var(--t3); }
@@ -86,7 +88,7 @@
 .dlBtn:hover:not(:disabled) { opacity: 0.85; }
 .dlBtn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-.apiCard { padding: 20px 24px; display: flex; flex-direction: column; gap: 10px; }
+.apiCard { padding: 20px 24px; display: flex; flex-direction: column; gap: 10px; flex-shrink: 0; }
 .apiRow  { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 .apiRow:last-child { border-bottom: none; }
 .apiPath { font-size: 12px; color: var(--accent); flex: 1; }

@@ -69,7 +69,7 @@ export default function BreakdownDonut({ events }) {
         <div className={styles.donutChart}>
           {total === 0 ? (
             <div className={styles.empty}>
-              <span style={{ fontSize: 22 }}>🍩</span>
+              <span style={{ fontSize: 48, opacity: 0.15, filter: 'grayscale(100%)' }}>🍩</span>
             </div>
           ) : <Doughnut data={data} options={options} />}
         </div>
@@ -81,7 +81,7 @@ export default function BreakdownDonut({ events }) {
         )}
       </div>
 
-      {/* Legend rows — like the reference's bullet list */}
+      {/* Legend rows */}
       <div className={styles.legend}>
         {segments.map(s => (
           <div key={s.label} className={styles.legendRow}>
