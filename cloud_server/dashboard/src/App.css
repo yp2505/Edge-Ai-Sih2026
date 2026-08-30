@@ -1,37 +1,64 @@
-/* App-level layout */
-.app-root {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
+/* ── Shell ────────────────────────────────────────────────────────── */
+.app-shell {
+  min-height: 100vh;
+  padding: 0 0 48px;
+  position: relative;
+  z-index: 0;
 }
 
-.dashboard-layout {
+/* ── Ambient background orbs ──────────────────────────────────────── */
+.ambient { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
+.ambient-orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+  animation: float 8s ease-in-out infinite;
+}
+.orb-1 {
+  width: 600px; height: 600px;
+  top: -200px; left: -150px;
+  background: radial-gradient(circle, rgba(10,132,255,0.18) 0%, transparent 70%);
+  animation-delay: 0s;
+}
+.orb-2 {
+  width: 500px; height: 500px;
+  bottom: -150px; right: -100px;
+  background: radial-gradient(circle, rgba(191,90,242,0.14) 0%, transparent 70%);
+  animation-delay: -3s;
+}
+.orb-3 {
+  width: 400px; height: 400px;
+  top: 50%; left: 50%; transform: translate(-50%,-50%);
+  background: radial-gradient(circle, rgba(50,173,230,0.08) 0%, transparent 70%);
+  animation-delay: -6s;
+}
+
+/* ── Main 3-col grid ──────────────────────────────────────────────── */
+.main-grid {
   display: grid;
-  grid-template-columns: 300px 1fr 380px;
-  grid-template-areas: "sidebar feed chart";
-  gap: 20px;
-  align-items: start;
+  grid-template-columns: 280px 1fr 360px;
+  grid-template-areas: "left center right";
+  gap: 16px;
+  padding: 0 24px 24px;
+  position: relative;
+  z-index: 1;
 }
 
-.sidebar   { grid-area: sidebar; display: flex; flex-direction: column; gap: 18px; }
-.feed-col  { grid-area: feed; }
-.chart-col { grid-area: chart; }
+.col-left   { grid-area: left;   display: flex; flex-direction: column; gap: 14px; }
+.col-center { grid-area: center; }
+.col-right  { grid-area: right;  }
 
-@media (max-width: 1280px) {
-  .dashboard-layout {
+@media (max-width: 1300px) {
+  .main-grid {
     grid-template-columns: 1fr 1fr;
     grid-template-areas:
-      "feed   feed"
-      "sidebar chart";
+      "center center"
+      "left   right";
   }
 }
-
 @media (max-width: 768px) {
-  .dashboard-layout {
+  .main-grid {
     grid-template-columns: 1fr;
-    grid-template-areas:
-      "feed"
-      "chart"
-      "sidebar";
+    grid-template-areas: "center" "right" "left";
   }
 }

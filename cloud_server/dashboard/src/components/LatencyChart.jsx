@@ -1,153 +1,109 @@
 import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  BarElement,
-  PointElement,
-  LineElement,
-  Tooltip,
-  Legend,
-  Filler,
+  Chart as ChartJS, CategoryScale, LinearScale,
+  BarElement, Tooltip, Legend,
 } from 'chart.js'
 import { Bar } from 'react-chartjs-2'
 import styles from './LatencyChart.module.css'
 
-ChartJS.register(
-  CategoryScale, LinearScale, BarElement,
-  PointElement, LineElement, Tooltip, Legend, Filler
-)
+ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend)
 
-const MAX_VISIBLE = 20   // show last N sessions on chart
+const MAX = 15
 
 export default function LatencyChart({ events }) {
-  // Use last MAX_VISIBLE events
-  const visible = events.slice(-MAX_VISIBLE)
+  const vis    = events.slice(-MAX)
+  const labels = vis.map(e => `#${e.session_id}`)
+  const kw     = vis.map(e => e.kw_to_connect_ms  ?? 0)
+  const rcv    = vis.map(e => e.receive_gap_ms     ?? 0)
+  const txc    = vis.map(e => e.transcribe_ms      ?? 0)
+  const totals = vis.map((_, i) => kw[i] + rcv[i] + txc[i])
 
-  const labels = visible.map(e => `#${e.session_id}`)
-  const kwData  = visible.map(e => e.kw_to_connect_ms  ?? 0)
-  const rcvData = visible.map(e => e.receive_gap_ms     ?? 0)
-  const txcData = visible.map(e => e.transcribe_ms      ?? 0)
-
-  const chartData = {
+  const data = {
     labels,
     datasets: [
-      {
-        label: 'kw→connect (ESP32)',
-        data: kwData,
-        backgroundColor: 'rgba(127, 0, 255, 0.75)',
-        borderRadius: { topLeft: 0, topRight: 0 },
-        stack: 'latency',
-      },
-      {
-        label: 'rcv gap (server)',
-        data: rcvData,
-        backgroundColor: 'rgba(79, 172, 254, 0.80)',
-        stack: 'latency',
-      },
-      {
-        label: 'transcribe (Whisper)',
-        data: txcData,
-        backgroundColor: 'rgba(0, 242, 254, 0.80)',
-        borderRadius: { topLeft: 6, topRight: 6, bottomLeft: 0, bottomRight: 0 },
-        stack: 'latency',
-      },
+      { label: 'kw→connect', data: kw,  backgroundColor: 'rgba(191,90,242,0.75)', stack: 'l', borderRadius: { topLeft:0,topRight:0,bottomLeft:4,bottomRight:4 } },
+      { label: 'rcv gap',    data: rcv, backgroundColor: 'rgba(50,173,230,0.8)',  stack: 'l' },
+      { label: 'transcribe', data: txc, backgroundColor: 'rgba(10,132,255,0.85)', stack: 'l', borderRadius: { topLeft:5,topRight:5,bottomLeft:0,bottomRight:0 } },
     ],
   }
 
   const options = {
     responsive: true,
     maintainAspectRatio: false,
-    animation: { duration: 400, easing: 'easeOutQuart' },
+    animation: { duration: 500, easing: 'easeOutQuart' },
     plugins: {
       legend: {
         position: 'top',
         labels: {
-          color: '#9ca3af',
-          font: { family: "'JetBrains Mono', monospace", size: 11 },
-          boxWidth: 12,
-          padding: 14,
+          color: '#6b7280',
+          font: { family: "'JetBrains Mono', monospace", size: 10 },
+          boxWidth: 10, padding: 12, usePointStyle: true, pointStyle: 'circle',
         },
       },
       tooltip: {
-        backgroundColor: 'rgba(14,20,36,0.95)',
-        borderColor: 'rgba(0,242,254,0.3)',
+        backgroundColor: 'rgba(8,12,22,0.95)',
+        borderColor: 'rgba(50,173,230,0.3)',
         borderWidth: 1,
-        titleColor: '#f9fafb',
-        bodyColor: '#9ca3af',
-        titleFont: { family: "'JetBrains Mono', monospace", size: 13, weight: 'bold' },
-        bodyFont:  { family: "'JetBrains Mono', monospace", size: 12 },
-        padding: 12,
+        titleColor: '#f5f5f7',
+        bodyColor: '#98989f',
+        titleFont: { family: "'JetBrains Mono'", size: 12, weight: 'bold' },
+        bodyFont:  { family: "'JetBrains Mono'", size: 11 },
+        padding: 12, cornerRadius: 12,
         callbacks: {
           afterBody: (items) => {
-            const idx   = items[0].dataIndex
-            const total = (kwData[idx] ?? 0) + (rcvData[idx] ?? 0) + (txcData[idx] ?? 0)
-            return [`─────────────`, `Total E2E: ${total} ms`]
+            const i = items[0].dataIndex
+            return [`──────────────`, `Total: ${totals[i]} ms`]
           },
-          label: (ctx) => `  ${ctx.dataset.label}: ${ctx.parsed.y} ms`,
+          label: ctx => `  ${ctx.dataset.label}: ${ctx.parsed.y} ms`,
         }
       }
     },
     scales: {
       x: {
         stacked: true,
-        grid: { color: 'rgba(255,255,255,0.04)' },
-        ticks: { color: '#6b7280', font: { family: "'JetBrains Mono', monospace", size: 10 } },
+        grid: { color: 'rgba(255,255,255,0.03)' },
+        ticks: { color: '#48484a', font: { family: "'JetBrains Mono'", size: 9 } },
+        border: { color: 'rgba(255,255,255,0.04)' },
       },
       y: {
         stacked: true,
         grid: { color: 'rgba(255,255,255,0.04)' },
-        ticks: {
-          color: '#6b7280',
-          font: { family: "'JetBrains Mono', monospace", size: 10 },
-          callback: v => `${v} ms`,
-        },
-        title: {
-          display: true,
-          text: 'Latency (ms)',
-          color: '#6b7280',
-          font: { family: "'Outfit', sans-serif", size: 12 },
-        }
+        ticks: { color: '#48484a', font: { family: "'JetBrains Mono'", size: 9 }, callback: v => `${v}ms` },
+        border: { color: 'rgba(255,255,255,0.04)' },
       },
     },
   }
 
-  // Totals for the sparkline summary below chart
-  const totals  = visible.map((e, i) => (kwData[i] + rcvData[i] + txcData[i]))
-  const avgTotal = totals.length ? Math.round(totals.reduce((a,b)=>a+b,0)/totals.length) : 0
-  const maxTotal = totals.length ? Math.max(...totals) : 0
-  const minTotal = totals.length ? Math.min(...totals) : 0
+  const avg = totals.length ? Math.round(totals.reduce((a,b) => a+b,0) / totals.length) : 0
+  const mn  = totals.length ? Math.min(...totals) : 0
+  const mx  = totals.length ? Math.max(...totals) : 0
 
   return (
-    <div className={`glass ${styles.panel}`}>
-      <div className={styles.panelHeader}>
-        <h2 className={styles.panelTitle}>📊 Latency Chart</h2>
-        <span className="text-muted" style={{ fontSize: 12 }}>
-          Last {Math.min(events.length, MAX_VISIBLE)} sessions · stacked breakdown
-        </span>
+    <div className={styles.panel}>
+      <div className={styles.header}>
+        <h2 className={styles.title}>📊 Latency Chart</h2>
+        <span className="pill-sm pill-ghost">last {Math.min(events.length, MAX)}</span>
       </div>
 
-      <div className={styles.chartWrap}>
+      <div className={styles.chartBox}>
         {events.length === 0 ? (
-          <div className={styles.noData}>
-            <span style={{ fontSize: 36 }}>📈</span>
-            <p>Chart will populate as detections come in</p>
+          <div className={styles.empty}>
+            <span style={{ fontSize: 32 }}>📈</span>
+            <span>Chart appears as sessions come in</span>
           </div>
-        ) : (
-          <Bar data={chartData} options={options} />
-        )}
+        ) : <Bar data={data} options={options} />}
       </div>
 
-      {/* Mini summary strip below chart */}
+      {/* Bottom pill strip */}
       {events.length > 0 && (
-        <div className={styles.summaryStrip}>
+        <div className={styles.strip}>
           {[
-            { label: 'Avg E2E', value: `${avgTotal} ms`, color: 'var(--cyan)' },
-            { label: 'Min E2E', value: `${minTotal} ms`, color: 'var(--green-soft)' },
-            { label: 'Max E2E', value: `${maxTotal} ms`, color: maxTotal > 800 ? '#f87171' : 'var(--yellow)' },
-          ].map(({ label, value, color }) => (
-            <div key={label} className={styles.stripItem}>
+            { label: 'avg', val: `${avg} ms`, color: 'var(--cyan)' },
+            { label: 'min', val: `${mn} ms`,  color: 'var(--green)' },
+            { label: 'max', val: `${mx} ms`,  color: mx > 800 ? 'var(--red)' : 'var(--yellow)' },
+          ].map(({ label, val, color }) => (
+            <div key={label} className={`${styles.stripPill} glass pill`}>
               <span className={styles.stripLabel}>{label}</span>
-              <span className={`mono ${styles.stripValue}`} style={{ color }}>{value}</span>
+              <span className={`${styles.stripVal} mono`} style={{ color }}>{val}</span>
             </div>
           ))}
         </div>

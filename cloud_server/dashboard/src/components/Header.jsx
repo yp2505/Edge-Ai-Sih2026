@@ -1,60 +1,57 @@
 import styles from './Header.module.css'
 
-function formatUptime(seconds) {
-  if (!seconds && seconds !== 0) return '—'
-  const h = Math.floor(seconds / 3600)
-  const m = Math.floor((seconds % 3600) / 60)
-  const s = seconds % 60
-  if (h > 0) return `${h}h ${m}m ${s}s`
-  if (m > 0) return `${m}m ${s}s`
-  return `${s}s`
+function formatUptime(s) {
+  if (!s && s !== 0) return '—'
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60
+  return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${sec}s` : `${sec}s`
 }
 
-export default function Header({ serverUp, health, lastFetch }) {
+export default function Header({ serverUp, health }) {
   return (
-    <header className={`glass ${styles.header}`}>
-      {/* Logo */}
-      <div className={styles.logo}>
-        <div className={styles.logoIcon}>🎙️</div>
-        <div className={styles.logoText}>
-          <h1 className={`gradient-text ${styles.title}`}>Hey Vaani</h1>
-          <p className={styles.subtitle}>Edge AI · ESP32 · DS-CNN INT8 · SIH 2026</p>
-        </div>
-      </div>
+    <header className={styles.header}>
+      <div className={styles.inner}>
 
-      {/* Centre — wave visualiser (decorative) */}
-      <div className={styles.wave} aria-hidden="true">
-        {[0.1,0.3,0.5,0.2,0.4,0.6,0.15,0.35,0.55].map((delay, i) => (
-          <div key={i} className={styles.waveBar} style={{ animationDelay: `${delay}s` }} />
-        ))}
-      </div>
-
-      {/* Right — status cluster */}
-      <div className={styles.statusCluster}>
-        {health && (
-          <>
-            <div className={styles.metaChip}>
-              <span className="text-muted">Uptime</span>
-              <span className="mono text-cyan">{formatUptime(health.uptime_seconds)}</span>
+        {/* Left — branding */}
+        <div className={styles.brand}>
+          <div className={styles.logoRing}>
+            <div className={styles.logoCore}>
+              <span className={styles.logoEmoji}>🎙</span>
             </div>
-            <div className={styles.metaChip}>
-              <span className="text-muted">Sessions</span>
-              <span className="mono text-bright">{health.session_count}</span>
-            </div>
-          </>
-        )}
-        {lastFetch && (
-          <div className={styles.metaChip}>
-            <span className="text-muted">Updated</span>
-            <span className="mono text-muted">{lastFetch.toLocaleTimeString()}</span>
           </div>
-        )}
-
-        {/* Status badge */}
-        <div className={`${styles.statusBadge} ${serverUp ? styles.badgeUp : styles.badgeDown}`}>
-          <span className={`${styles.statusDot} ${serverUp ? styles.dotUp : styles.dotDown}`} />
-          {serverUp ? '🟢 Server Running' : '🔴 Server Stopped'}
+          <div className={styles.brandText}>
+            <span className={styles.brandName}>Hey Vaani</span>
+            <span className={styles.brandSub}>Edge AI  ·  SIH 2026</span>
+          </div>
         </div>
+
+        {/* Centre — nav pills */}
+        <nav className={styles.nav}>
+          {['Live Feed', 'Latency', 'Specs'].map(label => (
+            <span key={label} className={styles.navItem}>{label}</span>
+          ))}
+        </nav>
+
+        {/* Right — status cluster */}
+        <div className={styles.statusRow}>
+          {health && (
+            <>
+              <div className={`${styles.chip} glass pill`}>
+                <span className={styles.chipLabel}>Uptime</span>
+                <span className={`${styles.chipVal} mono text-cyan`}>{formatUptime(health.uptime_seconds)}</span>
+              </div>
+              <div className={`${styles.chip} glass pill`}>
+                <span className={styles.chipLabel}>Sessions</span>
+                <span className={`${styles.chipVal} mono`}>{health.session_count}</span>
+              </div>
+            </>
+          )}
+
+          <div className={`${styles.statusPill} pill ${serverUp ? styles.up : styles.down}`}>
+            <span className={`${styles.dot} ${serverUp ? styles.dotUp : styles.dotDown}`} />
+            <span>{serverUp ? 'Server Running' : 'Server Offline'}</span>
+          </div>
+        </div>
+
       </div>
     </header>
   )

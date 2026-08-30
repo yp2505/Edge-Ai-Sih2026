@@ -1,23 +1,22 @@
 import styles from './StatsPanel.module.css'
 
-// ─── CONFIG — edit these when you have real measured values ───────────────────
-const MODEL_SPECS = {
-  modelSize:   '46.9 KB',
-  tensorArena: '~54 KB',
-  idleCpuPct:  '< 10%',    // ← replace with real measured value from benchmark_cpu.h
-  protocol:    'HVP1 v1',
-  asr:         'Whisper tiny INT8',
-  tprTarget:   '≥ 90%',
-  tprActual:   '99.0%',
-  farTarget:   '≤ 5%',
-  farActual:   '0.4%',
+// ── CONFIG — edit idle CPU % when you have real measured value ────────────────
+const MODEL = {
+  size:      '46.9 KB',
+  arena:     '~54 KB',
+  idleCpu:   '< 10%',      // ← replace with real value from benchmark_cpu.h serial log
+  protocol:  'HVP1 v1',
+  tpr:       '99.0%',
+  far:       '0.4%',
+  engine:    'faster-whisper tiny INT8',
 }
 
-function StatBox({ label, value, sub, accent }) {
+function StatCard({ label, value, sub, color, icon }) {
   return (
-    <div className={styles.statBox}>
+    <div className={styles.statCard}>
+      {icon && <span className={styles.statIcon}>{icon}</span>}
       <div className={styles.statLabel}>{label}</div>
-      <div className={styles.statValue} style={accent ? { color: accent } : {}}>
+      <div className={styles.statValue} style={{ color: color || 'var(--text-primary)' }}>
         {value}
       </div>
       {sub && <div className={styles.statSub}>{sub}</div>}
@@ -25,101 +24,97 @@ function StatBox({ label, value, sub, accent }) {
   )
 }
 
-function SectionTitle({ children }) {
-  return <h3 className={styles.sectionTitle}>{children}</h3>
+function Section({ title, children }) {
+  return (
+    <div className={styles.section}>
+      <div className={styles.sectionTitle}>{title}</div>
+      {children}
+    </div>
+  )
 }
 
-export default function StatsPanel({ stats }) {
+function SpecRow({ label, value, color }) {
+  return (
+    <div className={styles.specRow}>
+      <span className={styles.specLabel}>{label}</span>
+      <span className={`mono ${styles.specValue}`} style={{ color }}>{value}</span>
+    </div>
+  )
+}
+
+export default function StatsPanel({ stats, serverUp }) {
   const { count, avg, min, max } = stats
+  const health = avg < 400 ? { text: 'On target', color: 'var(--green)', pill: 'pill-green' }
+               : avg < 800 ? { text: 'Moderate',  color: 'var(--yellow)', pill: 'pill-yellow' }
+               : count === 0 ? { text: 'No data', color: 'var(--text-tertiary)', pill: 'pill-ghost' }
+               :               { text: 'High',    color: 'var(--red)', pill: 'pill-red' }
 
   return (
     <>
-      {/* ── Live Session Stats ────────────────────────────────────────── */}
-      <div className={`glass ${styles.panel}`}>
+      {/* ── Live Session ─────────────────────────────────────────────── */}
+      <div className={styles.panel}>
         <div className={styles.panelHeader}>
-          <h2 className={styles.panelTitle}>⚡ Session Stats</h2>
-          <span className="pill pill-green">{count} detections</span>
+          <h2 className={styles.panelTitle}>⚡ Session</h2>
+          <span className={`pill-sm ${health.pill}`}>{health.text}</span>
         </div>
+
         <div className={styles.body}>
-          <div className={styles.grid}>
-            <StatBox label="Avg Latency"   value={`${avg} ms`}  sub="end-to-end"  accent="var(--cyan)" />
-            <StatBox label="Min Latency"   value={`${min} ms`}  sub="best"        accent="var(--green-soft)" />
-            <StatBox label="Max Latency"   value={`${max} ms`}  sub="worst"       accent={max > 800 ? '#f87171' : 'var(--yellow)'} />
-            <StatBox label="Total Events"  value={count}         sub="this session" />
+          <div className={styles.statsGrid}>
+            <StatCard label="Avg E2E"     value={`${avg} ms`} color="var(--cyan)"  sub="latency" />
+            <StatCard label="Detections"  value={count}        sub="this session" />
+          </div>
+          <div className={styles.statsGrid}>
+            <StatCard label="Best"  value={`${min} ms`} color="var(--green)" sub="min latency" />
+            <StatCard label="Worst" value={`${max} ms`} color={max > 800 ? 'var(--red)' : 'var(--yellow)'} sub="max latency" />
           </div>
 
-          {/* Latency health bar */}
+          {/* Health bar */}
           {count > 0 && (
-            <div className={styles.healthWrap}>
-              <div className={styles.healthLabel}>
-                <span className="text-muted">Avg vs target (&lt; 400ms)</span>
-                <span className="mono" style={{ color: avg < 400 ? 'var(--green-soft)' : avg < 800 ? 'var(--yellow)' : '#f87171' }}>
-                  {avg < 400 ? '✅ On target' : avg < 800 ? '⚠️ Moderate' : '🔴 High'}
-                </span>
-              </div>
-              <div className={styles.healthTrack}>
-                <div
-                  className={styles.healthFill}
-                  style={{
-                    width: `${Math.min((avg / 1200) * 100, 100)}%`,
-                    background: avg < 400
-                      ? 'linear-gradient(90deg, #10b981, #34d399)'
-                      : avg < 800
-                      ? 'linear-gradient(90deg, #f59e0b, #fcd34d)'
-                      : 'linear-gradient(90deg, #ef4444, #f87171)',
-                  }}
-                />
-              </div>
+            <div className={styles.healthBar}>
+              <div className={styles.healthFill} style={{
+                width: `${Math.min((avg / 1200) * 100, 100)}%`,
+                background: avg < 400 ? 'linear-gradient(90deg,#30d158,#34d399)'
+                          : avg < 800 ? 'linear-gradient(90deg,#ffd60a,#ff9f0a)'
+                          :             'linear-gradient(90deg,#ff453a,#ff6b6b)',
+              }} />
             </div>
           )}
         </div>
       </div>
 
-      {/* ── ESP32 Model Specs ──────────────────────────────────────────── */}
-      <div className={`glass ${styles.panel}`}>
+      {/* ── ESP32 Hardware ───────────────────────────────────────────── */}
+      <div className={styles.panel}>
         <div className={styles.panelHeader}>
-          <h2 className={styles.panelTitle}>🔬 Model Efficiency</h2>
-          <span className="pill pill-blue">DS-CNN INT8</span>
+          <h2 className={styles.panelTitle}>🔬 ESP32 Hardware</h2>
+          <span className={`pill-sm ${serverUp ? 'pill-green' : 'pill-ghost'}`}>
+            {serverUp ? 'Connected' : 'Offline'}
+          </span>
         </div>
         <div className={styles.body}>
-          <SectionTitle>Memory Footprint</SectionTitle>
-          <div className={styles.grid}>
-            <StatBox label="Model Size"   value={MODEL_SPECS.modelSize}   sub="Flash memory" />
-            <StatBox label="Tensor Arena" value={MODEL_SPECS.tensorArena}  sub="RAM usage" />
-          </div>
-          <SectionTitle>CPU Utilisation</SectionTitle>
-          <div className={styles.grid}>
-            <StatBox label="Idle CPU"     value={MODEL_SPECS.idleCpuPct}  sub="Low-power mode" accent="var(--green-soft)" />
-            <StatBox label="Protocol"     value={MODEL_SPECS.protocol}     sub="TCP 20B header" />
-          </div>
+          <Section title="Memory">
+            <SpecRow label="Model Size"    value={MODEL.size}    color="var(--cyan)" />
+            <SpecRow label="Tensor Arena"  value={MODEL.arena}   color="var(--blue)" />
+          </Section>
+          <Section title="CPU  (edit in StatsPanel.jsx)">
+            <SpecRow label="Idle CPU %"    value={MODEL.idleCpu} color="var(--green)" />
+            <SpecRow label="Protocol"      value={MODEL.protocol} />
+          </Section>
+          <Section title="ASR Engine">
+            <SpecRow label="Model" value={MODEL.engine} color="var(--purple)" />
+          </Section>
         </div>
       </div>
 
-      {/* ── Benchmark Results ──────────────────────────────────────────── */}
-      <div className={`glass ${styles.panel}`}>
+      {/* ── Benchmark ────────────────────────────────────────────────── */}
+      <div className={styles.panel}>
         <div className={styles.panelHeader}>
-          <h2 className={styles.panelTitle}>📈 Evaluated Metrics</h2>
-          <span className="pill pill-green">PASSED PS</span>
+          <h2 className={styles.panelTitle}>📈 Benchmark</h2>
+          <span className="pill-sm pill-green">PASSED</span>
         </div>
         <div className={styles.body}>
-          <div className={styles.grid}>
-            <StatBox
-              label="True-Positive Rate"
-              value={MODEL_SPECS.tprActual}
-              sub={`Target ${MODEL_SPECS.tprTarget} ✅`}
-              accent="var(--green-soft)"
-            />
-            <StatBox
-              label="False Activation"
-              value={MODEL_SPECS.farActual}
-              sub={`Target ${MODEL_SPECS.farTarget} ✅`}
-              accent="#60a5fa"
-            />
-          </div>
-          <SectionTitle>ASR Engine</SectionTitle>
-          <div className={styles.specRow}>
-            <span className="text-muted" style={{ fontSize: 12 }}>Engine</span>
-            <span className="mono" style={{ fontSize: 13, color: 'var(--cyan)' }}>{MODEL_SPECS.asr}</span>
+          <div className={styles.statsGrid}>
+            <StatCard label="TPR"  value={MODEL.tpr} color="var(--green)" sub="target ≥ 90%" icon="✅" />
+            <StatCard label="FAR"  value={MODEL.far} color="var(--cyan)"  sub="target ≤ 5%"  icon="✅" />
           </div>
         </div>
       </div>

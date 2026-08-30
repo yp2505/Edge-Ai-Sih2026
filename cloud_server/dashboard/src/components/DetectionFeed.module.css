@@ -1,168 +1,123 @@
 .panel {
   display: flex;
   flex-direction: column;
+  background: rgba(13,19,34,0.5);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-xl);
   overflow: hidden;
-  height: 100%;
-  min-height: 500px;
 }
 
-/* Panel header */
+/* Header */
 .panelHeader {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 18px 22px;
-  border-bottom: 1px solid var(--card-border);
-  flex-shrink: 0;
+  padding: 20px 22px 14px;
+  border-bottom: 1px solid var(--border-subtle);
 }
-.panelTitle {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 16px;
-  font-weight: 700;
-  color: var(--text-bright);
+.titleRow {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 4px;
 }
-.dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
+.titleDot {
+  width: 8px; height: 8px; border-radius: 50%;
   background: var(--cyan);
-  box-shadow: 0 0 8px var(--cyan);
-  animation: blink 1.5s infinite;
+  box-shadow: 0 0 10px var(--cyan);
+  animation: blink-dot 1.5s infinite;
   flex-shrink: 0;
 }
+.title {
+  font-size: 15px; font-weight: 700; color: var(--text-primary);
+  flex: 1;
+}
+.subtitle { font-size: 11px; color: var(--text-tertiary); letter-spacing: 0.2px; }
 
-/* Scrollable area */
-.feedScroll {
+/* Feed scroll */
+.feed {
   flex: 1;
   overflow-y: auto;
-  padding: 18px 18px 12px;
+  padding: 14px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  max-height: 680px;
+  gap: 10px;
+  max-height: 620px;
 }
 
 /* Card */
 .card {
-  background: rgba(255,255,255,0.025);
-  border: 1px solid var(--card-border);
-  border-left: 4px solid var(--cyan);
-  border-radius: 14px;
-  padding: 18px 20px 14px;
-  transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+  border-radius: var(--r-lg) !important;
+  padding: 16px 18px;
+  position: relative;
+  transition: transform var(--dur-fast) var(--ease-smooth),
+              box-shadow var(--dur-fast) var(--ease-smooth),
+              border-color var(--dur-fast) var(--ease-smooth);
+  overflow: hidden;
+}
+.card::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--grad-cyan);
+  border-radius: 3px 0 0 3px;
 }
 .card:hover {
-  transform: translateX(4px);
-  background: rgba(255,255,255,0.04);
-  border-left-color: var(--blue);
+  transform: translateY(-2px);
+  border-color: rgba(50,173,230,0.2) !important;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3), 0 0 0 1px rgba(50,173,230,0.1);
 }
-/* Newest card gets a subtle highlight + slide-in */
 .cardNew {
-  animation: slideInTop 0.4s ease;
-  border-left-color: var(--cyan);
-  box-shadow: 0 0 18px rgba(0,242,254,0.08);
+  animation: slide-up 0.45s var(--ease-spring);
+  border-color: rgba(48,209,88,0.2) !important;
+  box-shadow: 0 0 20px rgba(48,209,88,0.08);
 }
+.cardNew::before { background: var(--grad-green); }
 
-/* Header row */
-.cardHeader {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 12px;
-  flex-wrap: wrap;
+/* Top row */
+.topRow {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px; gap: 8px; flex-wrap: wrap;
 }
-.timestamp {
-  font-size: 12px;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  margin-left: auto;
+.sessionTag {
+  display: flex; align-items: center; gap: 7px;
+  color: var(--text-secondary);
 }
-.ipBadge {
-  font-size: 10px;
+.sessionDot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--cyan);
 }
+.topRight { display: flex; align-items: center; gap: 8px; }
+.timeStamp { font-size: 11px; color: var(--text-tertiary); font-family: var(--font-mono); }
 
 /* Transcript */
 .transcript {
-  font-size: 20px;
-  font-weight: 600;
-  color: var(--text-bright);
-  line-height: 1.4;
-  margin-bottom: 14px;
+  font-size: 17px; font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.45;
+  margin-bottom: 12px;
   word-break: break-word;
+  letter-spacing: -0.2px;
 }
 
-/* Metrics row */
-.metricsRow {
-  display: flex;
-  align-items: center;
-  gap: 0;
-  border-top: 1px solid rgba(255,255,255,0.05);
-  padding-top: 12px;
-  flex-wrap: wrap;
-  gap: 0 4px;
+/* Pill row */
+.pillRow {
+  display: flex; gap: 6px; flex-wrap: wrap;
 }
-.metricBox {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding: 4px 12px;
-  flex: 1;
-  min-width: 80px;
+.metricPill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 12px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.06);
+  font-size: 11px;
 }
-.metricLabel {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.6px;
-  color: var(--text-muted);
-}
-.metricValue {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-main);
-}
-.metricDivider {
-  width: 1px;
-  height: 30px;
-  background: rgba(255,255,255,0.06);
-  flex-shrink: 0;
-}
-.metricTotal {
-  background: rgba(0,242,254,0.04);
-  border-radius: 8px;
-  border: 1px solid rgba(0,242,254,0.1);
-}
-.metricValueLg {
-  font-size: 20px;
-  font-weight: 700;
-}
-
-/* Card footer */
-.cardFooter {
-  margin-top: 10px;
-  padding-top: 8px;
-  border-top: 1px solid rgba(255,255,255,0.04);
-}
+.mDot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
+.mLabel { color: var(--text-tertiary); }
+.mVal   { font-weight: 700; color: var(--text-primary); font-size: 12px; }
+.ipPill { margin-left: auto; }
 
 /* Empty state */
-.emptyState {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 60px 20px;
-  text-align: center;
-  gap: 10px;
+.empty {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; padding: 60px 20px; gap: 12px; text-align: center;
 }
-.emptyIcon {
-  font-size: 52px;
-  opacity: 0.6;
-  animation: pulse-glow 3s infinite alternate;
-  filter: grayscale(0.3);
-}
-.emptyTitle {
-  font-size: 18px;
-  font-weight: 600;
-  color: var(--text-muted);
-}
+.emptyOrb { font-size: 48px; animation: float 4s ease-in-out infinite; }
+.emptyTitle { font-size: 17px; font-weight: 600; color: var(--text-secondary); }
+.emptySub { font-size: 13px; color: var(--text-tertiary); max-width: 260px; line-height: 1.5; }
