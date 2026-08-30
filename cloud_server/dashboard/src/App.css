@@ -1,117 +1,104 @@
-/* App.css - Global resets & layout shell */
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700;800&display=swap');
 
 :root {
-  /* Colors */
-  --bg: #0b0f19;
-  --surface: #111827;
-  --surface-2: #1f2937;
-  --surface-3: #374151;
-  --border: rgba(255, 255, 255, 0.08);
-  --border-hover: rgba(255, 255, 255, 0.15);
+  /* Cyberpunk / HUD Theme */
+  --bg: #030508;
+  --bg-glow: radial-gradient(circle at 50% 50%, #0a1128 0%, #030508 100%);
   
-  --t1: #f1f5f9;
-  --t2: #cbd5e1;
-  --t3: #64748b;
+  --panel-bg: rgba(10, 15, 25, 0.6);
+  --panel-border: rgba(0, 240, 255, 0.15);
+  --panel-border-glow: rgba(0, 240, 255, 0.4);
   
-  --accent: #00c8ff;
-  --accent-dim: rgba(0, 200, 255, 0.1);
-  --green: #22c55e;
-  --green-dim: rgba(34, 197, 94, 0.1);
-  --red: #ef4444;
-  --red-dim: rgba(239, 68, 68, 0.1);
-  --yellow: #eab308;
-  --yellow-dim: rgba(234, 179, 8, 0.1);
-  --purple: #a855f7;
-
-  /* Typography */
-  --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-  --mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --text-main: #e0fbfc;
+  --text-muted: #4b6584;
   
-  /* Radii */
-  --r-sm: 6px;
-  --r-md: 10px;
-  --r-lg: 14px;
+  --neon-cyan: #00f0ff;
+  --neon-purple: #b5179e;
+  --neon-green: #00ff41;
+  --neon-red: #ff003c;
+  
+  /* Fonts */
+  --font-hud: 'Rajdhani', sans-serif;
+  --font-hero: 'Orbitron', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  background-color: var(--bg);
-  color: var(--t1);
-  font-family: var(--font);
-  -webkit-font-smoothing: antialiased;
-  overflow: hidden; /* App shell handles scroll */
-}
 
-/* Shell Layout */
-.shell {
-  display: flex;
+body {
+  background: var(--bg);
+  background-image: 
+    linear-gradient(var(--panel-border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--panel-border) 1px, transparent 1px);
+  background-size: 40px 40px;
+  background-position: center center;
+  color: var(--text-main);
+  font-family: var(--font-hud);
+  overflow: hidden;
   height: 100vh;
   width: 100vw;
-  overflow: hidden;
 }
 
-.main {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  position: relative;
-}
-
-.content {
-  flex: 1;
-  padding: 24px 28px 40px;
-  display: flex;
-  flex-direction: column;
+/* Master Grid Layout */
+.hud-layout {
+  display: grid;
+  grid-template-columns: 280px 1fr 320px;
+  grid-template-rows: 60px 1fr 220px;
   gap: 20px;
-  overflow-y: auto;
-  min-height: 0;
+  height: 100vh;
+  width: 100vw;
+  padding: 20px;
+  background: var(--bg-glow);
+  position: relative;
+  z-index: 1;
 }
 
-/* Global utility classes */
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  box-shadow: 0 4px 24px rgba(0,0,0,0.2);
+/* Add a subtle scanline overlay */
+.hud-layout::after {
+  content: "";
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%);
+  background-size: 100% 4px;
+  z-index: 999;
+  pointer-events: none;
+  opacity: 0.3;
 }
 
-.mono { font-family: var(--mono); }
-.t1 { color: var(--t1); }
-.t2 { color: var(--t2); }
-.t3 { color: var(--t3); }
-
-/* Badges */
-.badge {
-  display: inline-flex; align-items: center; justify-content: center;
-  padding: 4px 8px; border-radius: var(--r-sm);
-  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px;
-}
-.badge-green  { background: var(--green-dim); color: var(--green); }
-.badge-red    { background: var(--red-dim);   color: var(--red); }
-.badge-yellow { background: var(--yellow-dim);color: var(--yellow); }
-.badge-accent { background: var(--accent-dim);color: var(--accent); border: 1px solid rgba(0,200,255,0.2); }
-.badge-muted  { background: var(--surface-2); color: var(--t3); }
-
-/* Animations */
-@keyframes pulse-dot {
-  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
-  70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
-  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+/* Shared HUD Panel Style */
+.hud-panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  backdrop-filter: blur(12px);
+  position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
-@keyframes slide-up {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
+/* Cool HUD corner brackets */
+.hud-panel::before, .hud-panel::after {
+  content: ''; position: absolute; width: 10px; height: 10px; border-color: var(--neon-cyan); border-style: solid;
 }
+.hud-panel::before { top: -1px; left: -1px; border-width: 2px 0 0 2px; }
+.hud-panel::after { bottom: -1px; right: -1px; border-width: 0 2px 2px 0; }
 
-@keyframes fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
+/* Grid Areas */
+.header-area { grid-column: 1 / 4; grid-row: 1 / 2; }
+.hardware-area { grid-column: 1 / 2; grid-row: 2 / 3; }
+.center-area { grid-column: 2 / 3; grid-row: 2 / 3; background: transparent !important; border: none !important; backdrop-filter: none !important; }
+.center-area::before, .center-area::after { display: none; }
+.terminal-area { grid-column: 3 / 4; grid-row: 2 / 4; }
+.radar-area { grid-column: 1 / 3; grid-row: 3 / 4; }
 
-/* Custom scrollbar */
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: var(--t3); }
+/* Typography Helpers */
+.mono { font-family: var(--font-mono); }
+.hero-text { font-family: var(--font-hero); }
+.glow-cyan { color: var(--neon-cyan); text-shadow: 0 0 8px var(--neon-cyan); }
+.glow-purple { color: var(--neon-purple); text-shadow: 0 0 8px var(--neon-purple); }
+.glow-green { color: var(--neon-green); text-shadow: 0 0 8px var(--neon-green); }
+.glow-red { color: var(--neon-red); text-shadow: 0 0 8px var(--neon-red); }
+
+/* Custom Scrollbar for HUD */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: rgba(0,240,255,0.05); }
+::-webkit-scrollbar-thumb { background: var(--neon-cyan); }
