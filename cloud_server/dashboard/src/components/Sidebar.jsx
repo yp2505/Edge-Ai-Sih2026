@@ -1,82 +1,91 @@
+import { VaaniLogo, IconGrid, IconRadio, IconClock, IconCpu, IconReport, IconSettings, IconWifi } from './Icons.jsx'
 import styles from './Sidebar.module.css'
 
-const NAV = [
-  { id: 'overview',  icon: '⊞', label: 'Overview' },
-  { id: 'feed',      icon: '📡', label: 'Live Feed' },
-  { id: 'latency',   icon: '⏱',  label: 'Latency' },
-  { id: 'device',    icon: '🔬', label: 'Device Specs' },
-  { id: 'reports',   icon: '📋', label: 'Reports' },
+const NAV_ITEMS = [
+  { id: 'overview',  Icon: IconGrid,    label: 'Overview' },
+  { id: 'livefeed',  Icon: IconRadio,   label: 'Live Feed' },
+  { id: 'latency',   Icon: IconClock,   label: 'Latency' },
+  { id: 'device',    Icon: IconCpu,     label: 'Device Specs' },
+  { id: 'reports',   Icon: IconReport,  label: 'Reports' },
 ]
-const SYSTEM = [
-  { id: 'settings',  icon: '⚙', label: 'Settings' },
+const SYS_ITEMS = [
+  { id: 'settings',  Icon: IconSettings, label: 'Settings' },
 ]
 
 export default function Sidebar({ activeNav, onNav, serverUp }) {
   return (
     <aside className={styles.sidebar}>
-      {/* Logo */}
-      <div className={styles.logo}>
-        <div className={styles.logoIcon}>
-          <div className={styles.siriRing} />
-          <span className={styles.logoEmoji}>🎙</span>
-        </div>
+
+      {/* ── Logo ── */}
+      <div className={styles.logoRow}>
+        <VaaniLogo size={38} />
         <div>
           <div className={styles.logoName}>Hey Vaani</div>
-          <div className={styles.logoSub}>Edge AI Dashboard</div>
+          <div className={styles.logoSub}>Edge AI Platform</div>
         </div>
       </div>
 
-      {/* Status pill */}
-      <div className={`${styles.statusWrap}`}>
+      {/* ── Connection status ── */}
+      <div className={styles.statusWrap}>
         <div className={`${styles.statusPill} ${serverUp ? styles.up : styles.down}`}>
-          <span className={`${styles.dot} ${serverUp ? styles.dotUp : ''}`} />
-          {serverUp ? 'Server Online' : 'Server Offline'}
+          <span className={`${styles.dot} ${serverUp ? styles.dotLive : ''}`} />
+          <span>{serverUp ? 'Server Online' : 'Server Offline'}</span>
+          <IconWifi size={13} color={serverUp ? 'var(--green)' : 'var(--red)'} />
         </div>
       </div>
 
-      <hr className={`${styles.divider} divider`} />
+      <hr className={styles.divider} />
 
-      {/* Nav */}
+      {/* ── Main nav ── */}
       <nav className={styles.nav}>
-        {NAV.map(item => (
+        {NAV_ITEMS.map(({ id, Icon, label }) => (
           <button
-            key={item.id}
-            className={`${styles.navItem} ${activeNav === item.id ? styles.navActive : ''}`}
-            onClick={() => onNav(item.id)}
-            id={`nav-${item.id}`}
+            key={id}
+            id={`nav-${id}`}
+            onClick={() => onNav(id)}
+            className={`${styles.navItem} ${activeNav === id ? styles.active : ''}`}
           >
-            <span className={styles.navIcon}>{item.icon}</span>
-            <span className={styles.navLabel}>{item.label}</span>
+            <span className={styles.navIcon}>
+              <Icon size={15} color={activeNav === id ? 'var(--accent)' : 'var(--t3)'} />
+            </span>
+            <span className={styles.navLabel}>{label}</span>
+            {id === 'livefeed' && serverUp && (
+              <span className={styles.liveBadge}>LIVE</span>
+            )}
           </button>
         ))}
       </nav>
 
-      <div className={styles.section}>SYSTEM</div>
+      <div className={styles.sectionLabel}>SYSTEM</div>
+
       <nav className={styles.nav}>
-        {SYSTEM.map(item => (
+        {SYS_ITEMS.map(({ id, Icon, label }) => (
           <button
-            key={item.id}
-            className={`${styles.navItem} ${activeNav === item.id ? styles.navActive : ''}`}
-            onClick={() => onNav(item.id)}
-            id={`nav-${item.id}`}
+            key={id}
+            id={`nav-${id}`}
+            onClick={() => onNav(id)}
+            className={`${styles.navItem} ${activeNav === id ? styles.active : ''}`}
           >
-            <span className={styles.navIcon}>{item.icon}</span>
-            <span className={styles.navLabel}>{item.label}</span>
+            <span className={styles.navIcon}>
+              <Icon size={15} color={activeNav === id ? 'var(--accent)' : 'var(--t3)'} />
+            </span>
+            <span className={styles.navLabel}>{label}</span>
           </button>
         ))}
       </nav>
 
-      {/* Bottom — ESP32 device info */}
-      <div className={styles.bottom}>
-        <hr className={`${styles.divider} divider`} style={{ marginBottom: 14 }} />
-        <div className={styles.deviceCard}>
-          <div className={styles.deviceAvatar}>ESP</div>
-          <div className={styles.deviceInfo}>
-            <div className={styles.deviceName}>ESP32-S3</div>
-            <div className={styles.deviceSub}>DS-CNN INT8 · HVP1 v1</div>
-          </div>
+      {/* ── ESP32 device card ── */}
+      <div className={styles.deviceCard}>
+        <div className={styles.deviceAvatar}>
+          <IconCpu size={14} color="var(--accent)" />
         </div>
+        <div className={styles.deviceInfo}>
+          <div className={styles.deviceName}>ESP32-S3</div>
+          <div className={styles.deviceSub}>DS-CNN INT8 · HVP1 v1</div>
+        </div>
+        <div className={`${styles.deviceDot} ${serverUp ? styles.deviceOnline : ''}`} />
       </div>
+
     </aside>
   )
 }

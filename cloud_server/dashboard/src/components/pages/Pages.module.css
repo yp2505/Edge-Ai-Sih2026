@@ -1,0 +1,127 @@
+/* Shared page wrapper */
+.page { display: flex; flex-direction: column; gap: 18px; }
+
+/* Charts row */
+.chartsRow { display: grid; grid-template-columns: 1fr 320px; gap: 16px; align-items: start; }
+.chartMain { min-height: 360px; }
+.chartSide { }
+@media (max-width: 1100px) { .chartsRow { grid-template-columns: 1fr; } }
+
+/* ── Live Feed ─────────────────────────────────────────────────── */
+.liveFeedPanel { overflow: hidden; }
+.feedHeader {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid var(--border);
+}
+.feedHeaderLeft { display: flex; align-items: center; gap: 10px; }
+.liveDot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--green); box-shadow: 0 0 8px var(--green);
+  animation: pulse-dot 1.5s infinite;
+}
+.feedTitle { font-size: 15px; font-weight: 700; color: var(--t1); }
+.feedScroll { overflow-y: auto; max-height: calc(100vh - 200px); padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.emptyFeed { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 20px; gap: 12px; text-align: center; }
+.emptyIcon { opacity: 0.4; }
+.emptyTitle { font-size: 16px; font-weight: 600; color: var(--t2); }
+.emptySub   { font-size: 13px; color: var(--t3); max-width: 280px; line-height: 1.5; }
+
+.feedCard {
+  display: flex; align-items: center; gap: 16px;
+  padding: 14px 16px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  transition: background 0.15s, border-color 0.15s;
+}
+.feedCard:hover { background: var(--surface-3); border-color: var(--border-hover); }
+.feedCardNew { animation: slide-up 0.4s ease; border-left: 3px solid var(--green); }
+
+.cardLeft { display: flex; flex-direction: column; gap: 4px; min-width: 72px; flex-shrink: 0; }
+.sessionId { font-size: 13px; font-weight: 700; color: var(--accent); }
+.cardTime  { font-size: 10px; color: var(--t3); }
+
+.cardCenter { flex: 1; min-width: 0; }
+.cardTranscript { font-size: 15px; font-weight: 600; color: var(--t1); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cardMetrics { display: flex; gap: 14px; flex-wrap: wrap; }
+
+.cardRight { flex-shrink: 0; }
+
+/* ── Latency page ───────────────────────────────────────────────── */
+.latencyStats { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; }
+.latStat { padding: 18px 20px; }
+.latStatLabel { font-size: 11px; color: var(--t3); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 8px; }
+.latStatVal   { font-size: 26px; font-weight: 800; }
+@media (max-width: 900px) { .latencyStats { grid-template-columns: repeat(2,1fr); } }
+
+/* ── Device Specs ────────────────────────────────────────────────── */
+.specsGrid { display: grid; grid-template-columns: repeat(3,1fr); gap: 16px; }
+.specGroup { padding: 18px 20px; }
+.specTitle { font-size: 13px; font-weight: 700; color: var(--t1); margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+.specRows  { display: flex; flex-direction: column; gap: 2px; }
+.specRow   { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+.specRow:last-child { border-bottom: none; }
+.specLabel { font-size: 12px; color: var(--t2); }
+.specValue { font-size: 12px; font-weight: 700; color: var(--t1); text-align: right; max-width: 55%; word-break: break-all; }
+@media (max-width: 1000px) { .specsGrid { grid-template-columns: repeat(2,1fr); } }
+
+/* ── Reports ─────────────────────────────────────────────────────── */
+.reportRow { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; }
+.reportStat { padding: 18px 20px; }
+.reportLabel { font-size: 11px; color: var(--t3); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 8px; }
+.reportVal   { font-size: 24px; font-weight: 800; }
+
+.downloadCard {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 20px 24px; gap: 16px; flex-wrap: wrap;
+}
+.dlTitle { font-size: 15px; font-weight: 700; color: var(--t1); margin-bottom: 4px; }
+.dlSub   { font-size: 12px; color: var(--t3); }
+.dlBtn {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 22px; border-radius: var(--r-md);
+  background: var(--accent); color: #000; border: none;
+  font-family: var(--font); font-size: 13px; font-weight: 700;
+  cursor: pointer; transition: opacity 0.15s;
+}
+.dlBtn:hover:not(:disabled) { opacity: 0.85; }
+.dlBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.apiCard { padding: 20px 24px; display: flex; flex-direction: column; gap: 10px; }
+.apiRow  { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.apiRow:last-child { border-bottom: none; }
+.apiPath { font-size: 12px; color: var(--accent); flex: 1; }
+.apiDesc { font-size: 11px; color: var(--t3); }
+
+/* ── Settings ─────────────────────────────────────────────────────── */
+.settingsCard { padding: 20px 24px; display: flex; flex-direction: column; gap: 16px; }
+.settingsTitle { font-size: 14px; font-weight: 700; color: var(--t1); padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.settingNote { font-size: 11px; font-weight: 400; color: var(--t3); }
+.settingsGrid { display: grid; grid-template-columns: repeat(2,1fr); gap: 14px; }
+.settingField { display: flex; flex-direction: column; gap: 5px; }
+.settingLabel { font-size: 11px; color: var(--t2); font-weight: 600; letter-spacing: 0.2px; }
+.settingInput {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: 8px 12px;
+  color: var(--t1); font-family: var(--mono); font-size: 13px; outline: none;
+  transition: border-color 0.2s;
+}
+.settingInput:focus { border-color: rgba(0,200,255,0.4); }
+.settingHint { font-size: 10px; color: var(--t3); }
+
+.wifiInfo { display: flex; flex-direction: column; gap: 8px; }
+.wifiRow  { margin-bottom: 4px; }
+.wifiLabel{ font-size: 13px; font-weight: 600; color: var(--t1); }
+.wifiStep { display: flex; align-items: flex-start; gap: 12px; padding: 7px 0; }
+.wifiNum  { width: 22px; height: 22px; border-radius: 50%; background: var(--accent-dim); border: 1px solid rgba(0,200,255,0.2); color: var(--accent); font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.wifiText { font-size: 13px; color: var(--t2); line-height: 1.5; }
+.wifiNote { margin-top: 8px; padding: 12px 14px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); font-size: 12px; color: var(--t2); line-height: 1.6; }
+.wifiNote code { font-family: var(--mono); color: var(--accent); background: rgba(0,200,255,0.08); padding: 1px 5px; border-radius: 4px; }
+
+.saveBtn {
+  align-self: flex-start;
+  padding: 10px 28px; border-radius: var(--r-md);
+  background: var(--accent); color: #000; border: none;
+  font-family: var(--font); font-size: 13px; font-weight: 700;
+  cursor: pointer; transition: opacity 0.2s;
+}
+.saveBtn:hover { opacity: 0.85; }
