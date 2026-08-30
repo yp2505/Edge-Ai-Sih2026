@@ -102,8 +102,8 @@ def download_vosk_model(model_path: str = DEFAULT_MODEL):
 
 # Optional Vosk import (supports multiple venvs / static analysis)
 try:
-    import vosk
-    from vosk import Model, KaldiRecognizer, SetLogLevel
+    import vosk  # type: ignore
+    from vosk import Model, KaldiRecognizer, SetLogLevel  # type: ignore
     VOSK_AVAILABLE = True
 except ImportError:
     vosk = None
