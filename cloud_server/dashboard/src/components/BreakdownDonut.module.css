@@ -1,0 +1,34 @@
+.wrap { padding: 22px; display: flex; flex-direction: column; gap: 14px; height: 100%; }
+.header { display: flex; align-items: flex-start; justify-content: space-between; }
+.title { font-size: 16px; font-weight: 700; color: var(--t1); }
+.sub   { font-size: 11px; color: var(--t3); margin-top: 3px; }
+
+/* Donut */
+.donutWrap { position: relative; display: flex; align-items: center; justify-content: center; height: 180px; }
+.donutChart { width: 180px; height: 180px; position: relative; z-index: 1; }
+.empty { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: var(--t3); }
+
+/* Centre text */
+.centre {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  text-align: center; pointer-events: none; z-index: 2;
+}
+.centreVal   { font-size: 26px; font-weight: 800; color: var(--t1); font-family: var(--mono); line-height: 1; }
+.centreLabel { font-size: 9px; color: var(--t3); margin-top: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* Legend */
+.legend { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+.legendRow { display: flex; align-items: center; gap: 7px; }
+.legendDot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.legendLabel { font-size: 11px; color: var(--t2); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.legendPct   { font-size: 11px; font-weight: 700; color: var(--t1); }
+
+/* Total */
+.totalRow {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+.totalLabel { font-size: 12px; color: var(--t2); }
+.totalVal   { font-size: 16px; font-weight: 800; color: var(--accent); }

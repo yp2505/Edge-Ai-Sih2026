@@ -1,64 +1,39 @@
-/* ── Shell ────────────────────────────────────────────────────────── */
-.app-shell {
+/* ── Shell: sidebar + main ──────────────────────────────────────── */
+.shell {
+  display: flex;
   min-height: 100vh;
-  padding: 0 0 48px;
-  position: relative;
-  z-index: 0;
+  background: var(--bg);
 }
 
-/* ── Ambient background orbs ──────────────────────────────────────── */
-.ambient { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
-.ambient-orb {
-  position: absolute;
-  border-radius: 50%;
-  filter: blur(80px);
-  animation: float 8s ease-in-out infinite;
-}
-.orb-1 {
-  width: 600px; height: 600px;
-  top: -200px; left: -150px;
-  background: radial-gradient(circle, rgba(10,132,255,0.18) 0%, transparent 70%);
-  animation-delay: 0s;
-}
-.orb-2 {
-  width: 500px; height: 500px;
-  bottom: -150px; right: -100px;
-  background: radial-gradient(circle, rgba(191,90,242,0.14) 0%, transparent 70%);
-  animation-delay: -3s;
-}
-.orb-3 {
-  width: 400px; height: 400px;
-  top: 50%; left: 50%; transform: translate(-50%,-50%);
-  background: radial-gradient(circle, rgba(50,173,230,0.08) 0%, transparent 70%);
-  animation-delay: -6s;
+/* ── Main area (right of sidebar) ───────────────────────────────── */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
 }
 
-/* ── Main 3-col grid ──────────────────────────────────────────────── */
-.main-grid {
+/* ── Scrollable content ─────────────────────────────────────────── */
+.content {
+  flex: 1;
+  padding: 24px 28px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  overflow-y: auto;
+}
+
+/* ── Charts row ─────────────────────────────────────────────────── */
+.charts-row {
   display: grid;
-  grid-template-columns: 280px 1fr 360px;
-  grid-template-areas: "left center right";
-  gap: 16px;
-  padding: 0 24px 24px;
-  position: relative;
-  z-index: 1;
+  grid-template-columns: 1fr 340px;
+  gap: 20px;
 }
 
-.col-left   { grid-area: left;   display: flex; flex-direction: column; gap: 14px; }
-.col-center { grid-area: center; }
-.col-right  { grid-area: right;  }
-
-@media (max-width: 1300px) {
-  .main-grid {
-    grid-template-columns: 1fr 1fr;
-    grid-template-areas:
-      "center center"
-      "left   right";
-  }
+@media (max-width: 1200px) {
+  .charts-row { grid-template-columns: 1fr; }
 }
-@media (max-width: 768px) {
-  .main-grid {
-    grid-template-columns: 1fr;
-    grid-template-areas: "center" "right" "left";
-  }
+@media (max-width: 900px) {
+  .content { padding: 16px; }
 }

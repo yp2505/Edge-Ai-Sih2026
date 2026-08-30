@@ -1,0 +1,90 @@
+.topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 22px 28px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  flex-wrap: wrap;
+}
+
+.titleBlock { flex-shrink: 0; }
+.title {
+  font-size: 22px; font-weight: 700;
+  color: var(--t1); letter-spacing: -0.4px; line-height: 1.2;
+}
+.subtitle { font-size: 12px; color: var(--t3); margin-top: 3px; }
+
+.right {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+
+/* Search */
+.searchWrap {
+  position: relative; display: flex; align-items: center;
+}
+.searchIcon {
+  position: absolute; left: 11px; font-size: 13px; pointer-events: none;
+  opacity: 0.5;
+}
+.search {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 8px 32px 8px 32px;
+  color: var(--t1); font-family: var(--font); font-size: 13px;
+  width: 260px; outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.search::placeholder { color: var(--t3); }
+.search:focus {
+  border-color: rgba(0,200,255,0.4);
+  box-shadow: 0 0 0 3px rgba(0,200,255,0.08);
+}
+.clearBtn {
+  position: absolute; right: 10px;
+  background: none; border: none; color: var(--t3);
+  cursor: pointer; font-size: 11px; padding: 2px;
+}
+.clearBtn:hover { color: var(--t1); }
+
+/* Time filter pills */
+.timeFilters {
+  display: flex; gap: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 3px;
+}
+.timeBtn {
+  padding: 5px 13px;
+  border: none; border-radius: var(--r-sm);
+  background: transparent; color: var(--t2);
+  font-family: var(--font); font-size: 12px; font-weight: 500;
+  cursor: pointer; white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+.timeBtn:hover { color: var(--t1); background: rgba(255,255,255,0.04); }
+.timeBtnActive {
+  background: var(--accent) !important;
+  color: #000 !important;
+  font-weight: 700;
+}
+
+/* Uptime chip */
+.uptimeChip {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 12px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+.uptimeDot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--green); box-shadow: 0 0 6px var(--green);
+  animation: pulse-dot 1.5s infinite;
+}
+.uptimeVal { font-size: 12px; font-weight: 600; color: var(--t2); }
