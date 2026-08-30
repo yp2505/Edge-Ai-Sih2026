@@ -272,20 +272,30 @@ class ASRServer:
                       f"expected={expected_len}B, edge_session={edge_session_id}")
                 audio_data = b""
 
-            # ── Step 2: Receive audio stream ──────────────────────────────────
+            # ── Step 2: Receive audio stream (log timestamp of FIRST byte) ──────
+            # cloud_receive_timestamp_ms: the moment the first audio byte arrives.
+            # This is the latency anchor used by training/latency_analyzer.py to
+            # compute: latency = cloud_receive_timestamp_ms - keyword_end_timestamp_ms
+            cloud_receive_ts_ms: int | None = None
+
             if expected_len > 0:
                 # Known length — receive exactly that many bytes
                 remaining = expected_len - len(audio_data)
                 if remaining > 0:
                     chunk = self._recv_exact(client_socket, remaining)
                     if chunk:
+                        cloud_receive_ts_ms = int(time.time() * 1000)  # ← METRIC
                         audio_data += chunk
             else:
-                # Stream until connection closed
+                # Streaming mode — read until connection closed
+                first_chunk = True
                 while True:
                     chunk = client_socket.recv(8192)
                     if not chunk:
                         break
+                    if first_chunk:
+                        cloud_receive_ts_ms = int(time.time() * 1000)  # ← METRIC
+                        first_chunk = False
                     audio_data += chunk
 
             t_receive_end = time.time()
@@ -294,6 +304,8 @@ class ASRServer:
 
             print(f"  📊 [{session_id}] Received {len(audio_data):,}B "
                   f"({audio_duration:.2f}s audio, {receive_ms:.0f}ms)")
+            print(f"  📌 [{session_id}] cloud_receive_timestamp_ms={cloud_receive_ts_ms}  "
+                  f"← latency anchor for latency_analyzer.py")
 
             # ── Step 3: Save WAV ──────────────────────────────────────────────
             wav_path = self._save_wav(audio_data, session_id, sr, ch, bits)
@@ -331,15 +343,17 @@ class ASRServer:
 
             # ── Step 7: Save log entry ────────────────────────────────────────
             log_entry = {
-                "session_id":       session_id,
-                "timestamp":        datetime.now().isoformat(),
-                "client_ip":        client_addr[0],
-                "audio_bytes":      len(audio_data),
-                "audio_duration_s": round(audio_duration, 2),
-                "transcript":       transcript,
-                "receive_ms":       round(receive_ms),
-                "transcribe_ms":    round(transcribe_ms),
-                "total_ms":         round(total_ms),
+                "session_id":                   session_id,
+                "timestamp":                    datetime.now().isoformat(),
+                "client_ip":                    client_addr[0],
+                "audio_bytes":                  len(audio_data),
+                "audio_duration_s":             round(audio_duration, 2),
+                "transcript":                   transcript,
+                "receive_ms":                   round(receive_ms),
+                "transcribe_ms":                round(transcribe_ms),
+                "total_ms":                     round(total_ms),
+                # ← LATENCY METRIC: used by training/latency_analyzer.py
+                "cloud_receive_timestamp_ms":   cloud_receive_ts_ms,
             }
             with self._lock:
                 self.log_entries.append(log_entry)

@@ -1,0 +1,16 @@
+# Custom partition table for Hey Vaani ESP32 firmware
+#
+# Layout:
+#   nvs:     Non-volatile storage (WiFi credentials, settings)
+#   phy_init: PHY calibration data (required for WiFi)
+#   factory: Main application firmware (~1.5 MB needed for TFLite + model)
+#
+# Note: model_data.h (46.9 KB) is compiled INTO the firmware binary,
+# so "factory" partition must be large enough for full app.
+#
+# Run "idf.py size" after build to verify actual usage.
+
+# Name,   Type,  SubType,  Offset,   Size,   Flags
+nvs,      data,  nvs,      0x9000,   0x6000,
+phy_init, data,  phy,      0xf000,   0x1000,
+factory,  app,   factory,  0x10000,  2M,
