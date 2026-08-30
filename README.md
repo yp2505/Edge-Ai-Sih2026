@@ -2,7 +2,7 @@
 
 A highly optimized TinyML Keyword Spotting (KWS) pipeline designed to detect the wake word **"Hey Vaani"** on edge devices like the ESP32 or Raspberry Pi Pico. 
 
-Built for the SIH 2024 problem statement, this project achieves a massive **99.6% accuracy** with an ultra-tiny memory footprint of just **46.9 KB**.
+Built for the SIH 2026 problem statement, this project achieves a massive **99.6% accuracy** with an ultra-tiny memory footprint of just **46.9 KB**.
 
 ---
 
