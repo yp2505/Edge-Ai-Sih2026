@@ -100,6 +100,19 @@ def download_vosk_model(model_path: str = DEFAULT_MODEL):
         return False
 
 
+# Optional Vosk import (supports multiple venvs / static analysis)
+try:
+    import vosk
+    from vosk import Model, KaldiRecognizer, SetLogLevel
+    VOSK_AVAILABLE = True
+except ImportError:
+    vosk = None
+    Model = None
+    KaldiRecognizer = None
+    SetLogLevel = None
+    VOSK_AVAILABLE = False
+
+
 # ─── Vosk Transcriber ─────────────────────────────────────────────────────────
 
 class VoskTranscriber:
@@ -118,9 +131,15 @@ class VoskTranscriber:
 
     def _load_model(self):
         """Load Vosk model from disk."""
+        if not VOSK_AVAILABLE:
+            print("  ⚠️  Vosk package not installed in active environment.")
+            print("  Install: uv pip install vosk (or pip install vosk)")
+            self.model = None
+            return
+
         try:
-            from vosk import Model, KaldiRecognizer, SetLogLevel
-            SetLogLevel(-1)  # Suppress Vosk verbose logging
+            if SetLogLevel is not None:
+                SetLogLevel(-1)  # Suppress Vosk verbose logging
 
             if not os.path.exists(self.model_path):
                 print(f"  ⚠️  Vosk model not found at: {self.model_path}")
@@ -131,14 +150,11 @@ class VoskTranscriber:
 
             print(f"  📥 Loading Vosk model: {os.path.basename(self.model_path)}...")
             self.model = Model(self.model_path)
-            self._Model  = Model
-            self._KaldiR = KaldiRecognizer
             print(f"  ✅ Vosk DNN-HMM model loaded (open-source, no transformer)")
             print(f"  📊 Architecture: Kaldi TDNN-F (Time-Delay Neural Network)")
 
-        except ImportError:
-            print("  ⚠️  Vosk not installed.")
-            print("  Install: pip install vosk")
+        except Exception as e:
+            print(f"  ⚠️  Error loading Vosk model: {e}")
             self.model = None
 
     def transcribe(self, wav_path: str) -> str:
@@ -150,7 +166,8 @@ class VoskTranscriber:
             return "[Vosk not loaded — install vosk and download model]"
 
         try:
-            from vosk import KaldiRecognizer
+            if KaldiRecognizer is None:
+                return "[Vosk not loaded — KaldiRecognizer missing]"
 
             with wave.open(wav_path, 'rb') as wf:
                 # Resample check
