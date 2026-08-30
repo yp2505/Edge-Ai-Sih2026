@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hey Vaani — Edge AI Dashboard</title>
+    <!-- Modern Typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0b0f19;
+            --card-bg: rgba(18, 26, 43, 0.7);
+            --card-border: rgba(255, 255, 255, 0.08);
+            --accent-cyan: #00f2fe;
+            --accent-blue: #4facfe;
+            --accent-purple: #7f00ff;
+            --accent-pink: #e100ff;
+            --accent-green: #10b981;
+            --accent-yellow: #f59e0b;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --glass-bg: rgba(255, 255, 255, 0.03);
+            --glow-cyan: rgba(0, 242, 254, 0.15);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            min-height: 100vh;
+            background-image: 
+                radial-gradient(circle at 15% 15%, rgba(79, 172, 254, 0.12) 0%, transparent 40%),
+                radial-gradient(circle at 85% 85%, rgba(127, 0, 255, 0.12) 0%, transparent 40%),
+                radial-gradient(circle at 50% 50%, rgba(0, 242, 254, 0.05) 0%, transparent 60%);
+            background-attachment: fixed;
+            overflow-x: hidden;
+            padding: 24px;
+        }
+
+        /* Glassmorphism utility */
+        .glass-panel {
+            background: var(--card-bg);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+            transition: all 0.3s ease;
+        }
+
+        .glass-panel:hover {
+            border-color: rgba(0, 242, 254, 0.3);
+            box-shadow: 0 8px 32px 0 var(--glow-cyan);
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 28px;
+            margin-bottom: 24px;
+        }
+
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .logo-icon {
+            width: 46px;
+            height: 46px;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            box-shadow: 0 0 20px var(--glow-cyan);
+            animation: pulse-glow 3s infinite alternate;
+        }
+
+        @keyframes pulse-glow {
+            0% { box-shadow: 0 0 15px rgba(0, 242, 254, 0.3); }
+            100% { box-shadow: 0 0 30px rgba(127, 0, 255, 0.6); }
+        }
+
+        .logo-text h1 {
+            font-size: 24px;
+            font-weight: 700;
+            background: linear-gradient(90deg, #ffffff, #a5f3fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+
+        .logo-text p {
+            font-size: 13px;
+            color: var(--text-muted);
+            font-weight: 400;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 18px;
+            border-radius: 30px;
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: #34d399;
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: #10b981;
+            box-shadow: 0 0 10px #10b981;
+            animation: blink 1.5s infinite;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(0.85); }
+        }
+
+        /* Layout Grid */
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 360px 1fr;
+            gap: 24px;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        @media (max-width: 1024px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Sidebar Cards */
+        .sidebar-section {
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        .card-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--card-border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .card-header h2 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #e5e7eb;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card-body {
+            padding: 20px;
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .stat-box {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 14px;
+        }
+
+        .stat-box .label {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+        .stat-box .value {
+            font-size: 20px;
+            font-weight: 700;
+            color: #ffffff;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .stat-box .subtext {
+            font-size: 11px;
+            color: #34d399;
+            margin-top: 4px;
+        }
+
+        /* Audio Wave Visualizer Simulation */
+        .mic-visualizer {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            height: 60px;
+            margin: 16px 0;
+        }
+
+        .wave-bar {
+            width: 6px;
+            height: 15px;
+            background: linear-gradient(180deg, var(--accent-cyan), var(--accent-purple));
+            border-radius: 4px;
+            animation: wave 1.2s ease-in-out infinite alternate;
+        }
+
+        .wave-bar:nth-child(1) { animation-delay: 0.1s; }
+        .wave-bar:nth-child(2) { animation-delay: 0.3s; }
+        .wave-bar:nth-child(3) { animation-delay: 0.5s; }
+        .wave-bar:nth-child(4) { animation-delay: 0.2s; }
+        .wave-bar:nth-child(5) { animation-delay: 0.4s; }
+        .wave-bar:nth-child(6) { animation-delay: 0.6s; }
+        .wave-bar:nth-child(7) { animation-delay: 0.1s; }
+
+        @keyframes wave {
+            0% { height: 10px; }
+            100% { height: 50px; }
+        }
+
+        /* Main Content */
+        .main-section {
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        /* Live Activity Stream */
+        .transcript-feed {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            max-height: 520px;
+            overflow-y: auto;
+            padding-right: 6px;
+        }
+
+        .transcript-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-left: 4px solid var(--accent-cyan);
+            border-radius: 12px;
+            padding: 18px 22px;
+            transition: transform 0.2s ease, background 0.2s ease;
+        }
+
+        .transcript-card:hover {
+            transform: translateX(4px);
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .transcript-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-bottom: 10px;
+        }
+
+        .session-tag {
+            font-family: 'JetBrains Mono', monospace;
+            background: rgba(0, 242, 254, 0.1);
+            color: var(--accent-cyan);
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-weight: 500;
+        }
+
+        .transcript-text {
+            font-size: 18px;
+            font-weight: 600;
+            color: #f9fafb;
+            margin-bottom: 12px;
+        }
+
+        .metrics-row {
+            display: flex;
+            gap: 20px;
+            font-size: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            color: #9ca3af;
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+            padding-top: 10px;
+        }
+
+        .metric-item span {
+            color: #f3f4f6;
+            font-weight: 600;
+        }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.1);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(0, 242, 254, 0.4);
+        }
+
+        .pill {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .pill-success { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+        .pill-info { background: rgba(79, 172, 254, 0.15); color: #60a5fa; }
+    </style>
+</head>
+<body>
+
+    <!-- Top Header -->
+    <header class="glass-panel">
+        <div class="logo-container">
+            <div class="logo-icon">🎙️</div>
+            <div class="logo-text">
+                <h1>Hey Vaani</h1>
+                <p>Edge AI Keyword Spotting & ASR Pipeline (SIH 2026)</p>
+            </div>
+        </div>
+        <div class="status-badge">
+            <div class="status-dot"></div>
+            <span>LIVE SERVER ACTIVE</span>
+        </div>
+    </header>
+
+    <!-- Main Grid -->
+    <div class="dashboard-grid">
+        
+        <!-- Left Sidebar: Edge Device & Specs -->
+        <div class="sidebar-section">
+            
+            <!-- ESP32 Device Panel -->
+            <div class="glass-panel">
+                <div class="card-header">
+                    <h2>⚡ ESP32 Edge Device</h2>
+                    <span class="pill pill-success">ONLINE</span>
+                </div>
+                <div class="card-body">
+                    <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 14px;">
+                        INMP441 Microphone → DS-CNN INT8 Model
+                    </p>
+
+                    <div class="mic-visualizer">
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                        <div class="wave-bar"></div>
+                    </div>
+
+                    <div class="stats-grid">
+                        <div class="stat-box">
+                            <div class="label">Model Size</div>
+                            <div class="value">46.9 KB</div>
+                            <div class="subtext">Flash memory</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="label">Tensor Arena</div>
+                            <div class="value">54 KB</div>
+                            <div class="subtext">RAM usage</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="label">Idle CPU</div>
+                            <div class="value">&lt; 10%</div>
+                            <div class="subtext">Low-power mode</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="label">Protocol</div>
+                            <div class="value">HVP1</div>
+                            <div class="subtext">TCP 20B Header</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Model Benchmark Metrics -->
+            <div class="glass-panel">
+                <div class="card-header">
+                    <h2>📊 Evaluated Metrics</h2>
+                    <span class="pill pill-info">PASSED PS</span>
+                </div>
+                <div class="card-body">
+                    <div class="stats-grid">
+                        <div class="stat-box">
+                            <div class="label">True-Positive Rate</div>
+                            <div class="value" style="color: #34d399;">99.0%</div>
+                            <div class="subtext">Target ≥ 90% ✅</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="label">False Activation</div>
+                            <div class="value" style="color: #60a5fa;">0.4%</div>
+                            <div class="subtext">Target ≤ 5% ✅</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Right Main: Live Session Feed & Transcription -->
+        <div class="main-section">
+            
+            <div class="glass-panel">
+                <div class="card-header">
+                    <h2>💬 Live Transcriptions & Latency Stream</h2>
+                    <span style="font-size: 12px; color: var(--text-muted);">Auto-refreshing log</span>
+                </div>
+                <div class="card-body">
+                    <div class="transcript-feed" id="feed">
+                        
+                        <!-- Initial Sample Item -->
+                        <div class="transcript-card">
+                            <div class="transcript-header">
+                                <span class="session-tag">Session #1</span>
+                                <span>Just now</span>
+                            </div>
+                            <div class="transcript-text">
+                                "Turn on the lights in the main hall"
+                            </div>
+                            <div class="metrics-row">
+                                <div class="metric-item">kw→connect: <span>45 ms</span></div>
+                                <div class="metric-item">rcv_gap: <span>12 ms</span></div>
+                                <div class="metric-item">transcribe: <span>180 ms</span></div>
+                                <div class="metric-item" style="margin-left: auto; color: var(--accent-cyan);">
+                                    Total End-to-End: <span>237 ms</span>
+                                </div>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+    </div>
+
+    <script>
+        // Auto-fetch server_log.json if hosted alongside server.py
+        async function updateLog() {
+            try {
+                const response = await fetch('../server_log.json');
+                if (response.ok) {
+                    const logs = await response.json();
+                    const feed = document.getElementById('feed');
+                    feed.innerHTML = '';
+
+                    logs.reverse().forEach(log => {
+                        const card = document.createElement('div');
+                        card.className = 'transcript-card';
+                        card.innerHTML = `
+                            <div class="transcript-header">
+                                <span class="session-tag">Session #${log.session_id}</span>
+                                <span>${log.timestamp ? new Date(log.timestamp).toLocaleTimeString() : ''}</span>
+                            </div>
+                            <div class="transcript-text">"${log.transcript || 'Processing...'}"</div>
+                            <div class="metrics-row">
+                                <div class="metric-item">kw→connect: <span>${log.kw_to_connect_ms || 0} ms</span></div>
+                                <div class="metric-item">rcv_gap: <span>${log.receive_gap_ms || 0} ms</span></div>
+                                <div class="metric-item">transcribe: <span>${log.transcribe_ms || 0} ms</span></div>
+                                <div class="metric-item" style="margin-left: auto; color: var(--accent-cyan);">
+                                    Total End-to-End: <span>${log.end_to_end_ms || log.total_server_ms || 0} ms</span>
+                                </div>
+                            </div>
+                        `;
+                        feed.appendChild(card);
+                    });
+                }
+            } catch (e) {
+                console.log("Polling log update...");
+            }
+        }
+
+        setInterval(updateLog, 2000);
+        updateLog();
+    </script>
+</body>
+</html>
