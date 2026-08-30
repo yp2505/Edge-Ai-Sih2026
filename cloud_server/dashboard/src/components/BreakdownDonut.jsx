@@ -1,5 +1,6 @@
 import { Doughnut } from 'react-chartjs-2'
 import { Chart as ChartJS, ArcElement, Tooltip, Legend } from 'chart.js'
+import { IconDonut } from './Icons.jsx'
 import styles from './BreakdownDonut.module.css'
 
 ChartJS.register(ArcElement, Tooltip, Legend)
@@ -69,7 +70,7 @@ export default function BreakdownDonut({ events }) {
         <div className={styles.donutChart}>
           {total === 0 ? (
             <div className={styles.empty}>
-              <span style={{ fontSize: 48, opacity: 0.15, filter: 'grayscale(100%)' }}>🍩</span>
+              <span style={{ color: 'var(--t3)', opacity: 0.2 }}><IconDonut size={48} /></span>
             </div>
           ) : <Doughnut data={data} options={options} />}
         </div>

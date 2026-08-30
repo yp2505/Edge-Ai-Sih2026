@@ -1,3 +1,4 @@
+import { IconSatellite, IconClock, IconFlash, IconBarChart } from './Icons.jsx'
 import styles from './KpiCards.module.css'
 
 function KpiCard({ id, icon, label, value, sub, subColor, trend, trendDir }) {
@@ -33,7 +34,7 @@ export default function KpiCards({ stats, serverUp }) {
     <div className={styles.grid}>
       <KpiCard
         id="kpi-total-detections"
-        icon="📡"
+        icon={<IconSatellite size={16} />}
         label="Total Detections"
         value={count}
         sub={serverUp ? 'Live session' : 'Server offline'}
@@ -41,7 +42,7 @@ export default function KpiCards({ stats, serverUp }) {
       />
       <KpiCard
         id="kpi-avg-latency"
-        icon="⏱"
+        icon={<IconClock size={16} />}
         label="Avg End-to-End"
         value={avg ? `${avg} ms` : '—'}
         sub={latLabel}
@@ -49,7 +50,7 @@ export default function KpiCards({ stats, serverUp }) {
       />
       <KpiCard
         id="kpi-best-latency"
-        icon="⚡"
+        icon={<IconFlash size={16} />}
         label="Best Latency"
         value={min ? `${min} ms` : '—'}
         sub="Fastest session"
@@ -57,7 +58,7 @@ export default function KpiCards({ stats, serverUp }) {
       />
       <KpiCard
         id="kpi-worst-latency"
-        icon="📊"
+        icon={<IconBarChart size={16} />}
         label="Worst Latency"
         value={max ? `${max} ms` : '—'}
         sub={max > 800 ? 'Spike detected' : max > 0 ? 'Acceptable' : '—'}

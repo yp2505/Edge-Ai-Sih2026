@@ -3,6 +3,7 @@ import {
   Chart as ChartJS, CategoryScale, LinearScale,
   PointElement, LineElement, Tooltip, Filler, Legend,
 } from 'chart.js'
+import { IconTrendChart } from './Icons.jsx'
 import styles from './LatencyTrendChart.module.css'
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler, Legend)
@@ -99,7 +100,7 @@ export default function LatencyTrendChart({ events }) {
       <div className={styles.chart}>
         {events.length === 0 ? (
           <div className={styles.empty}>
-            <span style={{ fontSize: 28 }}>📈</span>
+            <span style={{ color: 'var(--t3)', opacity: 0.5 }}><IconTrendChart size={32} /></span>
             <span>Chart populates as detections arrive</span>
           </div>
         ) : <Line data={data} options={options} />}

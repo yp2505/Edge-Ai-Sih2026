@@ -1,4 +1,5 @@
 import { useRef, useEffect } from 'react'
+import { IconFlash, IconWarning } from '../Icons.jsx'
 import styles from './Pages.module.css'
 import feedStyles from '../RecentDetections.module.css'
 
@@ -11,11 +12,19 @@ function timeAgo(iso) {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
-function latBadge(t) {
-  if (!t) return { cls: 'badge-muted', label: '—' }
-  if (t < 400) return { cls: 'badge-green',  label: `${t} ms ⚡` }
-  if (t < 800) return { cls: 'badge-yellow', label: `${t} ms` }
-  return { cls: 'badge-red', label: `${t} ms ⚠` }
+function LatencyBadge({ total }) {
+  if (!total) return <span className="badge badge-muted">—</span>
+  if (total < 400) return (
+    <span className="badge badge-green" style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+      {total} ms <IconFlash size={10} color="currentColor" />
+    </span>
+  )
+  if (total < 800) return <span className="badge badge-yellow">{total} ms</span>
+  return (
+    <span className="badge badge-red" style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+      {total} ms <IconWarning size={10} color="currentColor" />
+    </span>
+  )
 }
 
 export default function LiveFeedPage({ events }) {
@@ -49,7 +58,6 @@ export default function LiveFeedPage({ events }) {
           ) : (
             events.map((e, i) => {
               const total = (e.kw_to_connect_ms??0)+(e.receive_gap_ms??0)+(e.transcribe_ms??0)
-              const { cls, label } = latBadge(total)
               return (
                 <div key={e.session_id} className={`${styles.feedCard} ${i===0 ? styles.feedCardNew : ''}`}>
                   <div className={styles.cardLeft}>
@@ -66,7 +74,7 @@ export default function LiveFeedPage({ events }) {
                     </div>
                   </div>
                   <div className={styles.cardRight}>
-                    <span className={`badge ${cls}`}>{label}</span>
+                    <LatencyBadge total={total} />
                   </div>
                 </div>
               )
