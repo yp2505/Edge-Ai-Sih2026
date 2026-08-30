@@ -83,7 +83,7 @@ def load_wav(path: str) -> np.ndarray:
     if audio.ndim > 1:
         audio = audio[:, 0]  # mono
     if sr != SAMPLE_RATE:
-        import librosa
+        import librosa  # type: ignore
         audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
     return audio
 
@@ -145,9 +145,9 @@ def evaluate(model_path: str, positives: list, negatives: list,
              threshold: float) -> dict:
     """Run full evaluation. Returns dict with TP, FP, TN, FN counts + rates."""
     try:
-        from tflite_runtime.interpreter import Interpreter
+        from tflite_runtime.interpreter import Interpreter  # type: ignore
     except ImportError:
-        from tensorflow.lite.python.interpreter import Interpreter
+        from tensorflow.lite.python.interpreter import Interpreter  # type: ignore
 
     print(f"\n  Loading model: {os.path.basename(model_path)}")
     interp = Interpreter(model_path=model_path)
