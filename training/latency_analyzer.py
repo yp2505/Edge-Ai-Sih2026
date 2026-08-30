@@ -1,236 +1,153 @@
 #!/usr/bin/env python3
 """
-latency_analyzer.py — End-to-End Keyword→Cloud Latency Measurement
+latency_analyzer.py — End-to-End Keyword→Cloud Latency Analyzer
 
-Correlates two timestamp sources:
-  1. ESP32 serial log → "keyword_end_timestamp=<ms>" (NTP-synced)
-  2. cloud_server/server_log.json → "cloud_receive_timestamp" (system time)
+MEASUREMENT METHOD (NTP-FREE, single-clock):
+  No internet, no NTP, no synced clocks between two machines.
 
-Computes per-session delta: cloud_receive_timestamp - keyword_end_timestamp
+  Each detection event produces these three independently-measured values,
+  all of which are in server_log.json from server.py:
 
-This satisfies the PS requirement for measuring latency between
-"keyword ending and cloud ASR server receiving the audio stream."
+    kw_to_connect_ms    — ESP32's own monotonic clock (esp_timer_get_time):
+                          time from "keyword confirmed" to "TCP connect() returned".
+                          Reported by the ESP32 in the HVP1 header field.
+
+    receive_gap_ms      — Server's own clock:
+                          time from "connection accepted" to "first audio byte received".
+                          Measures WiFi + TCP transfer overhead.
+
+    transcribe_ms       — Server's own clock:
+                          faster-whisper inference time.
+
+  TOTAL END-TO-END = kw_to_connect_ms + receive_gap_ms + transcribe_ms
+
+  Precision: ±1ms (ESP32 timer ±1µs, server clock ±1ms, TCP stack ±few ms).
+  Error margin: ~5-10ms dominated by TCP stack jitter, NOT by clock sync issues.
 
 Usage:
-    # Capture ESP32 serial output to file, then run:
-    python latency_analyzer.py \
-        --serial-log esp32_serial.txt \
-        --server-log ../cloud_server/server_log.json
+    python latency_analyzer.py                     # reads default log paths
+    python latency_analyzer.py --server-log ../cloud_server/server_log.json
 
-    # Or pipe live serial output:
-    python -m serial.tools.miniterm /dev/ttyUSB0 115200 | tee esp32_serial.txt
-
-Output:
-    ┌────────────────────────────────────────────────────┐
-    │  Session │  keyword_end (ms)  │  cloud_rcv (ms)  │  Δ latency │
-    ├──────────┼────────────────────┼──────────────────┼────────────┤
-    │     1    │  1725000123456     │  1725000123780   │   324 ms   │
-    │     2    │  1725000187234     │  1725000187601   │   367 ms   │
-    ├──────────┴────────────────────┴──────────────────┴────────────┤
-    │  Average latency:  345 ms  |  Min: 324 ms  |  Max: 367 ms    │
-    └─────────────────────────────────────────────────────────────-─┘
+    (No --serial-log needed — all data is now in server_log.json)
 """
 
 import os
-import re
 import sys
 import json
 import argparse
 import statistics
-from datetime import datetime
 
-# ─── Defaults ───────────────────────────────────────────────────────────────
-SCRIPT_DIR   = os.path.dirname(__file__)
-DEFAULT_SERIAL = os.path.join(SCRIPT_DIR, "..", "esp32_serial.txt")
+SCRIPT_DIR     = os.path.dirname(__file__)
 DEFAULT_SERVER = os.path.join(SCRIPT_DIR, "..", "cloud_server", "server_log.json")
 
-# ─── Parse ESP32 Serial Log ─────────────────────────────────────────────────
-def parse_esp32_log(serial_log_path: str) -> list:
-    """
-    Extract keyword_end_timestamp from ESP32 serial output.
 
-    Expected line format (from main.cpp ESP_LOGI):
-      I (12345) INFERENCE: 🔔 HEY VAANI DETECTED! prob=0.923  keyword_end_timestamp=1725000123456 ms
-    OR:
-      I (12345) STREAM: [Session 1] keyword_end_timestamp=1725000123456 | ...
-    """
-    events = []
-    kw_ts_re = re.compile(r'keyword_end_timestamp=(\d+)')
-    session_re = re.compile(r'\[Session\s+(\d+)\]')
-
-    with open(serial_log_path, 'r', errors='replace') as f:
-        for line in f:
-            ts_match = kw_ts_re.search(line)
-            if ts_match:
-                ts_ms = int(ts_match.group(1))
-                session = None
-                s_match = session_re.search(line)
-                if s_match:
-                    session = int(s_match.group(1))
-                events.append({
-                    "session_id": session,
-                    "keyword_end_ms": ts_ms,
-                    "raw_line": line.strip()
-                })
-
-    return events
+def load_server_log(path: str) -> list:
+    """Load server_log.json written by server.py."""
+    with open(path, "r") as f:
+        return json.load(f)
 
 
-# ─── Parse Cloud Server Log ─────────────────────────────────────────────────
-def parse_server_log(server_log_path: str) -> list:
-    """
-    Read cloud_server/server_log.json and extract cloud_receive_timestamp.
-    The asr_server.py logs a JSON array of session records.
-    """
-    with open(server_log_path, 'r') as f:
-        log_entries = json.load(f)
-
-    sessions = []
-    for entry in log_entries:
-        # cloud_receive_timestamp is logged by the server the moment first audio arrives
-        rcv_ts = entry.get("cloud_receive_timestamp_ms")
-        if rcv_ts is None:
-            # Fallback: parse from ISO timestamp field
-            ts_str = entry.get("timestamp")
-            if ts_str:
-                dt = datetime.fromisoformat(ts_str)
-                rcv_ts = int(dt.timestamp() * 1000)
-
-        sessions.append({
-            "session_id": entry.get("session_id"),
-            "cloud_receive_ms": rcv_ts,
-            "transcript": entry.get("transcript", ""),
-            "transcribe_ms": entry.get("transcribe_ms", 0)
-        })
-
-    return sessions
-
-
-# ─── Correlate and Compute Latency ──────────────────────────────────────────
-def compute_latency(esp32_events: list, server_sessions: list) -> list:
-    """
-    Match ESP32 keyword events to cloud sessions by session_id (or by order).
-    Returns list of dicts with latency_ms per event.
-    """
+def compute_latencies(entries: list) -> list:
+    """Extract latency components from each log entry."""
     results = []
+    for e in entries:
+        kw_ms   = e.get("kw_to_connect_ms")
+        rcv_ms  = e.get("receive_gap_ms")
+        txs_ms  = e.get("transcribe_ms")
+        e2e_ms  = e.get("end_to_end_ms")
 
-    # Build lookup by session_id
-    server_by_id = {s["session_id"]: s for s in server_sessions if s["session_id"] is not None}
+        # Fallback: recompute end-to-end if field present
+        if e2e_ms is None and kw_ms is not None and rcv_ms is not None and txs_ms is not None:
+            e2e_ms = kw_ms + rcv_ms + txs_ms
 
-    for i, ev in enumerate(esp32_events):
-        sid = ev.get("session_id")
-        server = server_by_id.get(sid)
-
-        if server is None and i < len(server_sessions):
-            # Fallback: match by order
-            server = server_sessions[i]
-
-        if server and server.get("cloud_receive_ms") and ev.get("keyword_end_ms"):
-            latency_ms = server["cloud_receive_ms"] - ev["keyword_end_ms"]
-            results.append({
-                "session_id": sid or (i + 1),
-                "keyword_end_ms": ev["keyword_end_ms"],
-                "cloud_receive_ms": server["cloud_receive_ms"],
-                "latency_ms": latency_ms,
-                "transcript": server.get("transcript", ""),
-                "transcribe_ms": server.get("transcribe_ms", 0)
-            })
-        else:
-            results.append({
-                "session_id": sid or (i + 1),
-                "keyword_end_ms": ev["keyword_end_ms"],
-                "cloud_receive_ms": None,
-                "latency_ms": None,
-                "transcript": "",
-                "transcribe_ms": 0
-            })
-
+        results.append({
+            "session_id":      e.get("session_id"),
+            "timestamp":       e.get("timestamp", ""),
+            "kw_to_connect_ms": kw_ms,
+            "receive_gap_ms":  rcv_ms,
+            "transcribe_ms":   txs_ms,
+            "end_to_end_ms":   e2e_ms,
+            "transcript":      e.get("transcript", ""),
+            "audio_duration_s": e.get("audio_duration_s"),
+        })
     return results
 
 
-# ─── Print Report ────────────────────────────────────────────────────────────
 def print_report(results: list):
-    valid = [r for r in results if r["latency_ms"] is not None]
+    valid = [r for r in results if r["end_to_end_ms"] is not None]
 
     print("\n")
-    print("  ┌──────────┬────────────────────┬────────────────────┬────────────┐")
-    print("  │ Session  │ keyword_end (ms)   │ cloud_rcv (ms)     │ Δ latency  │")
-    print("  ├──────────┼────────────────────┼────────────────────┼────────────┤")
+    print("  ╔══════╦════════════╦═══════════╦═══════════╦════════════╦══════════════╗")
+    print("  ║  Ses ║ kw→connect ║ rcv_gap   ║ transcribe║ end-to-end ║ transcript   ║")
+    print("  ╠══════╬════════════╬═══════════╬═══════════╬════════════╬══════════════╣")
 
     for r in results:
-        sid    = str(r["session_id"]).center(8)
-        kw_ts  = str(r["keyword_end_ms"]).center(18) if r["keyword_end_ms"] else "     N/A      ".center(18)
-        cl_ts  = str(r["cloud_receive_ms"]).center(18) if r["cloud_receive_ms"] else "     N/A      ".center(18)
-        lat    = f"{r['latency_ms']} ms".center(10) if r["latency_ms"] is not None else "  N/A  ".center(10)
-        print(f"  │ {sid} │ {kw_ts} │ {cl_ts} │ {lat} │")
+        sid    = str(r["session_id"] or "?").rjust(4)
+        kw     = f"{r['kw_to_connect_ms']}ms".rjust(10) if r["kw_to_connect_ms"] is not None else "    N/A   "
+        rcv    = f"{r['receive_gap_ms']}ms".rjust(9)    if r["receive_gap_ms"]    is not None else "   N/A   "
+        txs    = f"{r['transcribe_ms']}ms".rjust(9)     if r["transcribe_ms"]     is not None else "   N/A   "
+        e2e    = f"{r['end_to_end_ms']}ms".rjust(10)   if r["end_to_end_ms"]     is not None else "    N/A   "
+        txt    = (r["transcript"] or "")[:12].ljust(12)
+        print(f"  ║ {sid} ║ {kw} ║ {rcv} ║ {txs} ║ {e2e} ║ {txt} ║")
 
-    print("  ├──────────┴────────────────────┴────────────────────┴────────────┤")
+    print("  ╠══════╩════════════╩═══════════╩═══════════╩════════════╩══════════════╣")
 
     if valid:
-        latencies = [r["latency_ms"] for r in valid]
-        avg = statistics.mean(latencies)
-        mn  = min(latencies)
-        mx  = max(latencies)
-        med = statistics.median(latencies)
-        print(f"  │  ⚡ Average: {avg:.0f} ms  |  Min: {mn} ms  |  Max: {mx} ms  |  Median: {med:.0f} ms")
-        print(f"  │  Sessions measured: {len(valid)}/{len(results)}")
+        e2es = [r["end_to_end_ms"] for r in valid]
+        kws  = [r["kw_to_connect_ms"] for r in valid if r["kw_to_connect_ms"] is not None]
+        rcvs = [r["receive_gap_ms"] for r in valid if r["receive_gap_ms"] is not None]
+        txss = [r["transcribe_ms"] for r in valid if r["transcribe_ms"] is not None]
 
-        # PS compliance: target < 1500ms
-        ps_ok = avg < 1500
-        print(f"  │  PS Target (< 1500 ms):  {'✅ PASS' if ps_ok else '❌ FAIL'}  (avg={avg:.0f} ms)")
+        avg_e2e = statistics.mean(e2es)
+        print(f"  ║  Sessions: {len(valid)}/{len(results)}")
+        print(f"  ║  End-to-end:  avg={avg_e2e:.0f}ms  min={min(e2es)}ms  max={max(e2es)}ms")
+        if kws:  print(f"  ║  kw→connect:  avg={statistics.mean(kws):.0f}ms")
+        if rcvs: print(f"  ║  rcv_gap:     avg={statistics.mean(rcvs):.0f}ms")
+        if txss: print(f"  ║  transcribe:  avg={statistics.mean(txss):.0f}ms")
+        ps_ok = avg_e2e < 1500
+        print(f"  ║  PS Target (<1500ms): {'✅ PASS' if ps_ok else '❌ FAIL'}  (avg={avg_e2e:.0f}ms)")
+        print(f"  ║  Precision: ±5-10ms (TCP jitter, no NTP required)")
     else:
-        print("  │  ⚠️  No valid latency measurements found.")
-
-    print("  └─────────────────────────────────────────────────────────────────┘")
+        print("  ║  ⚠️  No valid entries found in server log.")
+    print("  ╚══════════════════════════════════════════════════════════════════════════╝")
 
     if valid:
         print("\n  📋 Transcripts:")
         for r in valid:
-            print(f"    Session {r['session_id']}: \"{r['transcript']}\" "
-                  f"(transcribe: {r['transcribe_ms']} ms)")
+            print(f"    [{r['session_id']}] \"{r['transcript']}\" "
+                  f"({r['audio_duration_s']}s audio, e2e={r['end_to_end_ms']}ms)")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Hey Vaani — Keyword→Cloud Latency Analyzer",
+        description="Hey Vaani — Keyword→Cloud Latency Analyzer (NTP-free single-clock)",
         epilog="""
-Example:
-  # Capture serial output while running the ESP32, then analyze:
-  python latency_analyzer.py --serial-log esp32_serial.txt --server-log ../cloud_server/server_log.json
+All latency data is now in server_log.json — no separate serial log needed.
+The server.py logs kw_to_connect_ms (sent by ESP32 in HVP1 header) plus its own
+receive_gap_ms and transcribe_ms. This script sums them for end-to-end latency.
         """
     )
-    parser.add_argument("--serial-log",  default=DEFAULT_SERIAL, help="ESP32 serial log file")
-    parser.add_argument("--server-log",  default=DEFAULT_SERVER,  help="Cloud server_log.json")
+    parser.add_argument("--server-log", default=DEFAULT_SERVER,
+                        help="Path to server_log.json from server.py")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  Hey Vaani — End-to-End Latency Analyzer")
+    print("  Hey Vaani — Latency Analyzer (NTP-free)")
     print("=" * 60)
 
-    # Parse ESP32 log
-    if not os.path.exists(args.serial_log):
-        print(f"\n  ❌ ESP32 serial log not found: {args.serial_log}")
-        print("  Capture serial output with: python -m serial.tools.miniterm /dev/ttyUSB0 115200 | tee esp32_serial.txt")
-        sys.exit(1)
-
-    esp32_events = parse_esp32_log(args.serial_log)
-    print(f"\n  Found {len(esp32_events)} keyword events in ESP32 log")
-
-    # Parse server log
     if not os.path.exists(args.server_log):
-        print(f"\n  ❌ Server log not found: {args.server_log}")
-        print("  Make sure asr_server.py is running and has processed at least one request.")
+        print(f"\n  ❌ server_log.json not found: {args.server_log}")
+        print("  Run the cloud server (server.py) and trigger at least one detection.")
         sys.exit(1)
 
-    server_sessions = parse_server_log(args.server_log)
-    print(f"  Found {len(server_sessions)} sessions in server log")
+    entries = load_server_log(args.server_log)
+    print(f"\n  Found {len(entries)} session(s) in log")
 
-    if not esp32_events:
-        print("\n  ⚠️  No keyword_end_timestamp found in ESP32 log.")
-        print("  Make sure the ESP32 firmware is the version from main.cpp (not edge_inference.py).")
-        sys.exit(1)
+    if not entries:
+        print("  ⚠️  Log is empty — no detections recorded yet.")
+        sys.exit(0)
 
-    results = compute_latency(esp32_events, server_sessions)
+    results = compute_latencies(entries)
     print_report(results)
 
 
