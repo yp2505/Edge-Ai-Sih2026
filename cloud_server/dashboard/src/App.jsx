@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
-import NeuralBackground from './components/NeuralBackground.jsx'
-import HudHeader from './components/HudHeader.jsx'
-import CinematicBlob from './components/CinematicBlob.jsx'
-import CyberTerminal from './components/CyberTerminal.jsx'
-import LatencyRadar from './components/LatencyRadar.jsx'
+import MissionHeader from './components/MissionHeader.jsx'
+import NodeTopology from './components/NodeTopology.jsx'
+import HardwareTelemetry from './components/HardwareTelemetry.jsx'
+import Spectrogram from './components/Spectrogram.jsx'
+import InferencePipeline from './components/InferencePipeline.jsx'
+import RightPanel from './components/RightPanel.jsx'
+import SettingsModal from './components/SettingsModal.jsx'
 import './App.css'
 
 const API = 'http://localhost:8080'
@@ -12,6 +14,7 @@ export default function App() {
   const [events, setEvents] = useState([])
   const [health, setHealth] = useState(null)
   const [serverUp, setServerUp] = useState(false)
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
 
   const fetchHealth = useCallback(async () => {
     try {
@@ -30,62 +33,65 @@ export default function App() {
 
   useEffect(() => {
     fetchHealth(); fetchEvents()
-    const h = setInterval(fetchHealth, 3000)
+    const h = setInterval(fetchHealth, 2000) // Faster polling for density
     const e = setInterval(fetchEvents, 800)
     return () => { clearInterval(h); clearInterval(e) }
   }, [fetchHealth, fetchEvents])
 
   const latestEvent = events.length > 0 ? events[events.length - 1] : null
-  const isProcessing = latestEvent && (Date.now() - new Date(latestEvent.timestamp).getTime() < 3000)
 
   return (
-    <div className="spatial-layout">
-      {/* 3D Neural Background */}
-      <div className="neural-canvas-container">
-        <NeuralBackground isActive={isProcessing} />
+    <>
+      {/* Animated 3D Background */}
+      <div className="bg-grid"><div className="bg-grid-inner"></div></div>
+      <div className="bg-orb orb-1"></div>
+      <div className="bg-orb orb-2"></div>
+
+      {/* Settings Modal Overlay */}
+      {isSettingsOpen && <SettingsModal onClose={() => setIsSettingsOpen(false)} />}
+
+      <div className="mission-layout">
+      
+      <div className="mc-panel header-area" style={{ borderRadius: 0, border: 'none', borderBottom: '1px solid var(--panel-border)' }}>
+        <MissionHeader health={health} serverUp={serverUp} totalEvents={events.length} onSettingsClick={() => setIsSettingsOpen(true)} />
       </div>
 
-      {/* Glass Header */}
-      <div className="spatial-header">
-        <HudHeader health={health} serverUp={serverUp} totalEvents={events.length} />
+      <div className="mc-panel node-area">
+        <div className="mc-panel-header">NODE TOPOLOGY</div>
+        <div className="mc-panel-content">
+          <NodeTopology serverUp={serverUp} latestEvent={latestEvent} />
+        </div>
       </div>
 
-      {/* Main Glass Grid */}
-      <div className="spatial-content">
-        
-        {/* Left: Giant Brutalist Latency */}
-        <div className="glass-panel" style={{ padding: 40, justifyContent: 'center' }}>
-          <h2 className="brutal-title" style={{ fontSize: 16, color: 'var(--text-muted)', marginBottom: 20 }}>END-TO-END LATENCY</h2>
-          {latestEvent ? (
-            <div>
-              <div className="mono" style={{ fontSize: 80, fontWeight: 900, color: 'var(--accent-orange)', lineHeight: 0.9, letterSpacing: -4 }}>
-                {(latestEvent.kw_to_connect_ms||0)+(latestEvent.receive_gap_ms||0)+(latestEvent.transcribe_ms||0)}
-              </div>
-              <div className="mono" style={{ fontSize: 20, color: 'var(--text-main)', marginTop: 10 }}>MILLISECONDS</div>
-            </div>
-          ) : (
-            <div className="mono" style={{ fontSize: 60, color: 'var(--text-muted)' }}>--</div>
-          )}
-          
-          <div style={{ marginTop: 60 }}>
-            <h2 className="brutal-title" style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 10 }}>NETWORK RADAR</h2>
-            <div style={{ height: 180, margin: '0 -20px' }}>
-              <LatencyRadar events={events} isMinimal={true} />
-            </div>
-          </div>
+      <div className="mc-panel telemetry-area">
+        <div className="mc-panel-header">HARDWARE TELEMETRY</div>
+        <div className="mc-panel-content">
+          <HardwareTelemetry latestEvent={latestEvent} />
         </div>
-
-        {/* Center: Apple Vision Pro style Orb */}
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
-          <CinematicBlob latestEvent={latestEvent} />
-        </div>
-
-        {/* Right: Glass Terminal */}
-        <div className="glass-panel">
-          <CyberTerminal events={events} isGlass={true} />
-        </div>
-
       </div>
+
+      <div className="mc-panel spectrogram-area">
+        <div className="mc-panel-header">
+          <span>AI ACOUSTIC MODEL (SPECTROGRAM)</span>
+          <span style={{ color: 'var(--accent-cyan)' }}>LIVE</span>
+        </div>
+        <div className="mc-panel-content" style={{ padding: 0 }}>
+          <Spectrogram latestEvent={latestEvent} />
+        </div>
+      </div>
+
+      <div className="mc-panel pipeline-area">
+        <div className="mc-panel-header">INFERENCE PIPELINE & TIMING</div>
+        <div className="mc-panel-content">
+          <InferencePipeline latestEvent={latestEvent} />
+        </div>
+      </div>
+
+      <div className="mc-panel datagrid-area" style={{ padding: 0 }}>
+        <RightPanel events={events} />
+      </div>
+
     </div>
+    </>
   )
 }
