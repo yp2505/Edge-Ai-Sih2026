@@ -92,26 +92,39 @@ def discover_files(data_dir: str):
     """
     Auto-discover positive + negative WAV files from the dataset structure.
 
-    Expected layout (same as download_dataset.py / augment_data.py):
-        data/
-          hey_vaani/      ← positive keyword recordings
-          negative/       ← background noise + other speech
+    Checks:
+      Positives: data/keyword_augmented, data/keyword, data/hey_vaani
+      Negatives: data/background, data/negative, data/noise
     """
-    pos_dir = os.path.join(data_dir, "hey_vaani")
-    neg_dir = os.path.join(data_dir, "negative")
+    pos_dirs = [
+        os.path.join(data_dir, "keyword_augmented"),
+        os.path.join(data_dir, "keyword"),
+        os.path.join(data_dir, "hey_vaani")
+    ]
+    neg_dirs = [
+        os.path.join(data_dir, "background"),
+        os.path.join(data_dir, "negative"),
+        os.path.join(data_dir, "noise")
+    ]
 
     positives = []
     negatives = []
 
-    if os.path.isdir(pos_dir):
-        for f in os.listdir(pos_dir):
-            if f.lower().endswith('.wav'):
-                positives.append(os.path.join(pos_dir, f))
+    for d in pos_dirs:
+        if os.path.isdir(d):
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if f.lower().endswith('.wav'):
+                        positives.append(os.path.join(root, f))
+            if positives:
+                break  # Prefer keyword_augmented if present
 
-    if os.path.isdir(neg_dir):
-        for f in os.listdir(neg_dir):
-            if f.lower().endswith('.wav'):
-                negatives.append(os.path.join(neg_dir, f))
+    for d in neg_dirs:
+        if os.path.isdir(d):
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if f.lower().endswith('.wav'):
+                        negatives.append(os.path.join(root, f))
 
     return positives, negatives
 
