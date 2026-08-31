@@ -3,6 +3,7 @@ venv/
 .venv312/
 __pycache__/
 *.pyc
+*.pyo
 
 # Data and models (too large for GitHub)
 training/data/
@@ -11,9 +12,26 @@ training/plots/
 *.tflite
 *.keras
 
-# Cloud server
+# Cloud server temp files
 cloud_server/temp_audio/
+cloud_server/received_audio/
+cloud_server/server_log.json
+test.wav
 
-# ESP32 build directory
+# ESP32 build artifacts (auto-generated, do NOT commit)
+esp32_firmware/.pio/
 esp32_firmware/build/
 esp32_firmware/sdkconfig
+esp32_firmware/sdkconfig.esp32dev
+esp32_firmware/managed_components/
+esp32_firmware/dependencies.lock
+
+# Node.js
+node_modules/
+cloud_server/dashboard/node_modules/
+cloud_server/dashboard/.next/
+cloud_server/dashboard/dist/
+
+# OS files
+.DS_Store
+Thumbs.db

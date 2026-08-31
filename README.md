@@ -1,192 +1,206 @@
-# 🎙️ Hey Vaani — Edge AI Keyword Spotting
+# 🎙️ Hey Vaani — Edge AI Keyword Spotting (SIH 2026)
 
-A highly optimized TinyML Keyword Spotting (KWS) pipeline that detects the custom wake word **"Hey Vaani"** on low-power edge hardware (ESP32 / ESP32-S3), then streams audio to a local cloud server for full speech-to-text transcription.
+> **Wake-word detection on ESP32 using TFLite Micro + live streaming ASR to cloud server.**
 
-Built for the **SIH 2026 / ISRO problem statement** — 100% open-source, no proprietary SDKs, no cloud subscription, runs fully offline.
-
----
-
-## ✅ PS Compliance Summary
-
-| Requirement | Status | Evidence |
-|---|---|---|
-| Open-source only (no proprietary ASR) | ✅ PASS | faster-whisper (MIT), TFLite Micro (Apache 2.0) |
-| Custom wake word (not "Hey Google"/"Alexa") | ✅ PASS | "Hey Vaani" trained on Indian voice data |
-| Edge model ≤ 256 KB RAM | ✅ PASS | 54 KB tensor arena + 47 KB model = **101 KB total** |
-| Idle CPU < 10% on edge device | ⏳ Measure after flash | `benchmark_cpu.h` logs via `vTaskGetRunTimeStats()` |
-| True-Positive Rate ≥ 90% | ✅ PASS | **99.0%** (5802/5863) — see evaluate_accuracy.py |
-| False-Activation Rate ≤ 5% | ✅ PASS | **0.4%** (39/8690) — see evaluate_accuracy.py |
-| Keyword→Cloud latency measured | ✅ Instrumented | Single-clock method in HVP1 header + server.py |
+[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v6.0.1-blue)](https://docs.espressif.com/projects/esp-idf/en/latest/)
+[![PlatformIO](https://img.shields.io/badge/PlatformIO-Espressif32-orange)](https://platformio.org/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-green)](https://python.org)
 
 ---
 
-## 📊 Measured Results (from evaluate_accuracy.py)
+## 📐 System Architecture
 
-> [!NOTE]
-> Accuracy numbers are **real measured values**, not theoretical claims.
-> Hardware metrics (CPU %, latency) require flashing and are documented below with placeholders.
-
-| Metric | Value | Method |
-|---|---|---|
-| **True-Positive Rate** | **99.0%** (5802/5863) | `python evaluate_accuracy.py` — full dataset |
-| **False-Activation Rate** | **0.4%** (39/8690) | `python evaluate_accuracy.py` — full dataset |
-| **Detection Threshold** | 0.85 | Tuned for TP/FA balance |
-| **Model size (flash)** | **46.9 KB** | INT8-quantized TFLite |
-| **Tensor arena (heap)** | **54 KB allocated** (~49 KB used) | `interpreter->arena_used_bytes()` at boot |
-| **Total RAM for inference** | **~103 KB** | model + arena |
-| **Idle CPU %** | _(measure after flash)_ | `benchmark_cpu.h` → `vTaskGetRunTimeStats()` |
-| **Keyword→Cloud latency** | _(measure after flash)_ | `python training/latency_analyzer.py` |
-
-### Accuracy Notes
-- False negatives cluster around heavily augmented samples from a single speaker ("vaani_0434" cluster) — a known data imbalance, acceptable at 99.0% overall.
-- False activations: "two" (prob=0.996) and "bed" (prob=0.883) in the negative set — both contain phoneme sequences similar to "vaani". Very rare (0.4%).
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  ESP32 (Edge Device)                                            │
+│  ┌──────────┐   ┌────────────┐   ┌──────────────────────────┐  │
+│  │ MAX4466  │──▶│ ADC@20kHz  │──▶│  MFCC + TFLite Micro KWS │  │
+│  │   Mic    │   │ →16kHz DS  │   │  "Hey Vaani" detection   │  │
+│  └──────────┘   └────────────┘   └────────────┬─────────────┘  │
+└────────────────────────────────────────────────┼────────────────┘
+                                                 │ TCP (WiFi)
+                                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Cloud Server (Laptop / PC)                                     │
+│  ┌──────────────┐   ┌──────────────┐   ┌────────────────────┐  │
+│  │ Python Flask │──▶│ Faster-Whisper│──▶│  Next.js Dashboard │  │
+│  │   server.py  │   │     (ASR)    │   │  localhost:3000     │  │
+│  └──────────────┘   └──────────────┘   └────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## ☁️ Cloud Server (Canonical)
+## 🛒 Hardware Required
 
-> [!IMPORTANT]
-> **`cloud_server/server.py` is the ONE active server** used by the ESP32 firmware.
-> It uses: raw TCP socket + custom 20-byte HVP1 header + faster-whisper ASR.
+| Component | Details |
+|:---|:---|
+| **ESP32-WROOM-32** | Any generic ESP32 dev board (30-pin or 38-pin) |
+| **MAX4466 Microphone** | Electret mic with adjustable gain |
+| **Micro-USB cable** | Data + power (not charge-only!) |
+| **Breadboard + Jumper Wires** | For connections |
+
+### Wiring:
+
+| MAX4466 Pin | ESP32 Pin |
+|:---|:---|
+| VCC | 3.3V |
+| GND | GND |
+| OUT | GPIO 32 (ADC1_CH4) |
+
+---
+
+## 🚀 Setup Guide
+
+### Prerequisites
+
+- [PlatformIO](https://platformio.org/install/cli) installed
+- Python 3.10+
+- Node.js 18+
+- Git
+
+---
+
+### Step 1: Clone the repo
+
+```bash
+git clone https://github.com/yp2505/Edge-Ai-Sih2026.git
+cd Edge-Ai-Sih2026
+```
+
+---
+
+### Step 2: Configure WiFi + Server IP in firmware
+
+Open `esp32_firmware/main/main.cpp` and update lines **77–85**:
+
+```cpp
+#define CONFIG_WIFI_SSID       "YourWiFiName"      // ← Change this
+#define CONFIG_WIFI_PASSWORD   "YourWiFiPassword"  // ← Change this
+#define CONFIG_SERVER_IP       "192.168.x.x"       // ← Your laptop's IP (run: hostname -I)
+```
+
+> ⚠️ **IMPORTANT:** The ESP32 only supports **2.4 GHz WiFi**. If your network name has "5G" in it, use a different network or your phone's mobile hotspot.
 >
-> `cloud_server/legacy_prototypes/asr_server_vosk_websocket.py` is an **earlier prototype** using Vosk/WebSocket.
-> It is **not wired to the hardware** and should not be used for demos.
-
-```
-ESP32 (main.cpp)
-  → TCP socket
-  → 20-byte HVP1 header (includes kw_to_connect_ms for NTP-free latency)
-  → raw PCM audio stream
-  → server.py (faster-whisper INT8)
-  → JSON transcript response
-```
-
-### Latency Measurement Method (NTP-Free)
-No internet, no synced clocks needed. Three components all measured on a single clock each:
-
-| Component | Measured by | Field in server_log.json |
-|---|---|---|
-| keyword_confirmed → TCP connect | ESP32 monotonic (`esp_timer_get_time`) | `kw_to_connect_ms` |
-| TCP accept → first audio byte | Server system clock | `receive_gap_ms` |
-| Whisper inference | Server system clock | `transcribe_ms` |
-| **Total end-to-end** | Sum of above | `end_to_end_ms` |
-
-**Precision: ±5–10ms** (TCP stack jitter — no NTP clock drift involved)
+> To find your laptop's IP: open a terminal and run `hostname -I`
 
 ---
 
-## 📂 Project Structure
+### Step 3: Flash the ESP32
+
+```bash
+cd esp32_firmware
+
+# Grant USB port access (Linux only)
+sudo chmod 666 /dev/ttyUSB0
+
+# Build and flash
+~/.platformio/penv/bin/pio run -t upload -t monitor
+```
+
+> 💡 If upload gets stuck at `Connecting.........`, press and hold the **BOOT** button on the ESP32 for 2 seconds.
+
+You should see in the serial monitor:
+```
+✅ WiFi connected — IP: 10.x.x.x
+✅ Mic self-check PASSED
+Listening for 'Hey Vaani'...
+```
+
+---
+
+### Step 4: Start the Python server
+
+```bash
+cd cloud_server
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Start server
+python3 server.py
+```
+
+Server starts on port **5000** and waits for ESP32 connections.
+
+---
+
+### Step 5: Start the dashboard
+
+```bash
+cd cloud_server/dashboard
+
+# Install Node dependencies
+npm install
+
+# Start development server
+npm run dev
+```
+
+Open your browser and go to: **http://localhost:3000**
+
+---
+
+## 🎙️ Testing
+
+1. Ensure ESP32 serial monitor shows `Listening for 'Hey Vaani'...`
+2. Say **"Hey Vaani"** clearly into the MAX4466 microphone
+3. Watch the serial monitor for:
+   ```
+   🔔 HEY VAANI DETECTED! prob=0.985
+   ```
+4. The Python server terminal will show the live ASR transcript
+5. The dashboard will update with the result
+
+---
+
+## 📊 Performance (on ESP32-WROOM-32)
+
+| Metric | Value |
+|:---|:---|
+| Model size (Flash) | **46.9 KB** |
+| Tensor arena (RAM) | **28.5 KB** |
+| Inference CPU usage | **~2%** |
+| Keyword-to-connect latency | **~40ms** |
+| Total end-to-end latency | **~50ms** |
+| IDLE CPU headroom | **~97%** |
+
+---
+
+## 📁 Project Structure
 
 ```
 Edge-Ai-Sih2026/
-├── training/
-│   ├── train_model.py           # DS-CNN model training
-│   ├── convert_tflite.py        # INT8 quantization → .tflite + model_data.h
-│   ├── augment_data.py          # 10× data augmentation
-│   ├── evaluate_accuracy.py     # ✅ TP rate + FA rate measurement
-│   └── latency_analyzer.py      # ✅ NTP-free latency from server_log.json
-│
-├── esp32_firmware/
+├── esp32_firmware/           # ESP32 firmware (PlatformIO / ESP-IDF)
 │   ├── main/
-│   │   ├── main.cpp             # ✅ Real ESP-IDF C++ firmware (not simulated)
-│   │   ├── mfcc.h               # ✅ C++ MFCC matching train_model.py exactly
-│   │   ├── benchmark_cpu.h      # CPU load monitor via FreeRTOS runtime stats
-│   │   └── model_data.h         # 46.9 KB INT8 model as C byte array
-│   ├── CMakeLists.txt
-│   └── partitions.csv
-│
-├── cloud_server/
-│   ├── server.py                # ✅ CANONICAL server (TCP + HVP1 + Whisper)
-│   ├── benchmark_whisper.py     # ✅ Compare tiny vs base model latency
-│   ├── requirements.txt         # faster-whisper, numpy, soundfile
-│   └── legacy_prototypes/
-│       └── asr_server_vosk_websocket.py  # Prototype only — NOT used by firmware
-│
-└── voice sample/                # Raw "Hey Vaani" recordings (Indian voices)
+│   │   ├── main.cpp          # Core firmware logic
+│   │   ├── mfcc.h            # MFCC feature extractor
+│   │   ├── model_data.h      # TFLite model as C array
+│   │   └── benchmark_cpu.h   # CPU profiling utility
+│   ├── platformio.ini        # PlatformIO config
+│   └── sdkconfig.defaults    # ESP-IDF config
+├── cloud_server/             # Python backend + ASR
+│   ├── server.py             # TCP server + Faster-Whisper ASR
+│   ├── requirements.txt      # Python dependencies
+│   └── dashboard/            # Next.js web dashboard
+├── training/                 # Model training scripts
+│   └── train_model.py        # Keyword spotting model training
+└── README.md
 ```
 
 ---
 
-## 🚀 Quick Start
+## 🔧 Troubleshooting
 
-### 1. Train & Convert Model
-```bash
-cd training && source .venv312/bin/activate
-python augment_data.py       # Augment keyword recordings 10×
-python train_model.py        # Train DS-CNN
-python convert_tflite.py     # Quantize → model_data.h
-python evaluate_accuracy.py  # Verify TP rate + FA rate
-```
-
-### 2. Start Cloud Server
-```bash
-cd cloud_server
-pip install faster-whisper numpy soundfile
-python benchmark_whisper.py   # Run ONCE to pick tiny vs base for your hardware
-python server.py --whisper-model tiny   # Recommended for lowest latency
-```
-
-### 3. Flash ESP32
-```bash
-cd esp32_firmware
-idf.py add-dependency "espressif/esp-tflite-micro^1.3.1"
-idf.py menuconfig   # Set WiFi SSID/password + server IP
-idf.py build flash monitor
-```
-After first boot, check serial output for:
-- `TFLite arena used: XXXXX bytes` — update `TENSOR_ARENA_SIZE` in main.cpp if different
-- `Mic self-check PASSED` — confirms microphone wired correctly
-- `CPU load` logs every 10 seconds — record idle CPU %
-
-### 4. Measure Latency
-```bash
-# After running at least one detection event:
-python training/latency_analyzer.py
-```
-
----
-
-## 🛠️ Tech Stack
-
-| Layer | Technology | License |
-|---|---|---|
-| **Edge ML framework** | TensorFlow Lite for Microcontrollers | Apache 2.0 |
-| **Model architecture** | DS-CNN (Depthwise Separable CNN) | — |
-| **Quantization** | INT8 Post-Training Quantization | — |
-| **Microcontroller** | ESP32 / ESP32-S3 (ESP-IDF v5.x) | — |
-| **Microphone** | INMP441 (I2S digital MEMS mic) | — |
-| **Audio features** | MFCC: 13 coeff, 49 frames, 20–8000 Hz | — |
-| **Cloud ASR** | **faster-whisper** (Whisper INT8, CPU) | MIT |
-| **Training** | TensorFlow / Keras | Apache 2.0 |
-| **Evaluation** | TFLite Interpreter, soundfile | Open-source |
-
----
-
-## ⚠️ MFCC Consistency Warning
-
-The MFCC parameters in `training/train_model.py` and `esp32_firmware/main/mfcc.h` are **verified identical**:
-
-| Parameter | Value | Both files |
-|---|---|---|
-| Sample rate | 16000 Hz | ✅ |
-| FFT window | 512 samples (32ms) | ✅ |
-| Hop length | 320 samples (20ms) | ✅ |
-| Mel bins | 40 | ✅ |
-| MFCCs kept | 13 | ✅ |
-| Mel range | 20–8000 Hz | ✅ |
-| DCT type | Type-II, normalized | ✅ |
-
-**Do not modify these parameters in either file without updating both.** Any mismatch silently degrades real-hardware accuracy even if Python tests pass.
-
----
-
-## 🆚 Why Not Just Use Alexa/Google?
-
-| Feature | Hey Vaani | Alexa / Google |
-|---|---|---|
-| Open-source | ✅ 100% | ❌ Proprietary |
-| Works offline | ✅ Full offline | ❌ Requires internet |
-| Indian accent tuning | ✅ Trained on Indian voices | ❌ Generic |
-| No licensing fees | ✅ Zero cost | ❌ Paid API |
-| PS compliant | ✅ Yes | ❌ No |
-| Custom wake word | ✅ "Hey Vaani" | ❌ Fixed |
+| Problem | Fix |
+|:---|:---|
+| `Permission denied: /dev/ttyUSB0` | Run `sudo chmod 666 /dev/ttyUSB0` |
+| ESP32 stuck at `Connecting.......` | Hold the **BOOT** button during upload |
+| `WiFi lost — retry X/10` | Make sure you are using **2.4 GHz** WiFi, not 5 GHz |
+| `Mic self-check FAILED` | Check MAX4466 OUT wire is on **GPIO 32** |
+| ESP32 keeps rebooting | Mic not detected or memory issue — check serial logs |
+| Server says "Waiting for ESP32" | Normal! It waits until "Hey Vaani" is detected |

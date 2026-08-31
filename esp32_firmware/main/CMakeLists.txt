@@ -10,7 +10,6 @@ idf_component_register(
         esp_event
         lwip
         nvs_flash
-        esp_sntp
         esp_timer
         esp-tflite-micro
 )

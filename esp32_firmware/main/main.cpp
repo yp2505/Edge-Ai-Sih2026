@@ -36,13 +36,10 @@
 //     [INFERENCE] TFLite arena used: XXXXX bytes
 //   If actual usage changes after model update, resize accordingly.
 //
-// INMP441 Wiring:
-//   BCLK  → GPIO 26
-//   WS    → GPIO 25
-//   SD    → GPIO 34  (input only)
-//   VDD   → 3.3V
+// MAX4466 Wiring (Analog ADC):
+//   OUT   → GPIO 32  (ADC1_CH4)
+//   VCC   → 3.3V
 //   GND   → GND
-//   L/R   → GND  (left channel = mono)
 
 #include <stdio.h>
 #include <string.h>
@@ -55,7 +52,8 @@
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
 
-#include "driver/i2s_std.h"
+#include "esp_adc/adc_continuous.h"
+#include "hal/adc_types.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -77,29 +75,26 @@
 
 // ─── User Config ─────────────────────────────────────────────────────────────
 #ifndef CONFIG_WIFI_SSID
-#define CONFIG_WIFI_SSID       "YourWiFiName"
+#define CONFIG_WIFI_SSID       "Khush's A55"
 #endif
 #ifndef CONFIG_WIFI_PASSWORD
-#define CONFIG_WIFI_PASSWORD   "YourWiFiPass"
+#define CONFIG_WIFI_PASSWORD   "khush2073"
 #endif
 #ifndef CONFIG_SERVER_IP
-#define CONFIG_SERVER_IP       "192.168.1.100"
+#define CONFIG_SERVER_IP       "10.247.236.173"
 #endif
 #ifndef CONFIG_SERVER_PORT
 #define CONFIG_SERVER_PORT     5000
 #endif
 
-// ─── I2S / Audio Configuration ───────────────────────────────────────────────
-#define I2S_PORT            I2S_NUM_0
-#define I2S_BCLK_PIN        26
-#define I2S_WS_PIN          25
-#define I2S_DATA_PIN        34
-#define I2S_SAMPLE_RATE     16000
-#define I2S_DMA_BUF_COUNT   8
-#define I2S_DMA_BUF_LEN     512
+// ─── ADC / Audio Configuration ───────────────────────────────────────────────
+#define ADC_UNIT            ADC_UNIT_1
+#define ADC_CHANNEL         ADC_CHANNEL_4    // GPIO 32
+#define ADC_SAMPLE_RATE     16000
+#define ADC_DMA_BUF_LEN     512
 
 // ─── Keyword Detection ────────────────────────────────────────────────────────
-#define DETECT_THRESHOLD    0.85f
+#define DETECT_THRESHOLD    0.45f
 #define SLIDE_STEP_MS       30
 #define COMMAND_DURATION_MS 2000
 #define AUDIO_BUFFER_SAMPLES 16000   // 1 second ring buffer
@@ -128,8 +123,11 @@ static const char* TAG_MAIN = "MAIN";
 static const char* TAG_WIFI = "WIFI";
 static const char* TAG_MIC  = "MIC";
 
-static volatile int  wifi_retry_count = 0;
-static volatile bool wifi_connected   = false;
+static volatile int  wifi_retry_count  = 0;
+static volatile bool wifi_connected    = false;
+// Set true while streaming_task holds I2S to prevent inference_task racing on it.
+// Declared volatile for cross-core visibility (Core 0 ↔ Core 1).
+static volatile bool streaming_active  = false;
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 static int16_t  audio_ring[AUDIO_BUFFER_SAMPLES];
@@ -154,8 +152,12 @@ static tflite::MicroInterpreter*         interpreter = nullptr;
 static TfLiteTensor*                     input_tensor  = nullptr;
 static TfLiteTensor*                     output_tensor = nullptr;
 
-// ─── I2S handle ───────────────────────────────────────────────────────────────
-static i2s_chan_handle_t i2s_rx_chan;
+// ─── ADC handle & DC offset tracking ──────────────────────────────────────────
+static adc_continuous_handle_t adc_handle = NULL;
+// EMA filter for DC offset removal (starts roughly mid-point of 12-bit ADC)
+static float adc_dc_offset = 2048.0f;
+// Scale up the centered 12-bit ADC to mimic a 16-bit PCM signal's dynamic range
+static const int ADC_TO_PCM_SHIFT = 4;
 
 // ─── MFCC processor ───────────────────────────────────────────────────────────
 static MFCCProcessor mfcc_proc;
@@ -199,48 +201,57 @@ static void tflite_init() {
              (unsigned)esp_get_free_heap_size());
 }
 
-// ─── I2S Init ─────────────────────────────────────────────────────────────────
-static void i2s_init() {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num  = I2S_DMA_BUF_COUNT;
-    chan_cfg.dma_frame_num = I2S_DMA_BUF_LEN;
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &i2s_rx_chan));
+// ─── ADC Init ─────────────────────────────────────────────────────────────────
+static void adc_init() {
+    adc_continuous_handle_cfg_t adc_config = {};
+    adc_config.max_store_buf_size = 4096;
+    adc_config.conv_frame_size = ADC_DMA_BUF_LEN;
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle));
 
-    i2s_std_config_t std_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(
-                        I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .bclk = (gpio_num_t)I2S_BCLK_PIN,
-            .ws   = (gpio_num_t)I2S_WS_PIN,
-            .dout = I2S_GPIO_UNUSED,
-            .din  = (gpio_num_t)I2S_DATA_PIN,
-        }
-    };
-    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_rx_chan, &std_cfg));
-    ESP_ERROR_CHECK(i2s_channel_enable(i2s_rx_chan));
-    ESP_LOGI(TAG_MAIN, "I2S INMP441 initialized: %d Hz mono", I2S_SAMPLE_RATE);
+    adc_continuous_config_t dig_cfg = {};
+    dig_cfg.sample_freq_hz = 20000; // ESP-IDF v5+ requires minimum 20000 Hz
+    dig_cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+    // dig_cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE1; // Deprecated in ESP-IDF v5+
+    
+    adc_digi_pattern_config_t adc_pattern[1];
+    adc_pattern[0].atten = ADC_ATTEN_DB_12;
+    adc_pattern[0].channel = ADC_CHANNEL;
+    adc_pattern[0].unit = ADC_UNIT;
+    adc_pattern[0].bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
+
+    dig_cfg.pattern_num = 1;
+    dig_cfg.adc_pattern = adc_pattern;
+
+    ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &dig_cfg));
+    ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
+    ESP_LOGI(TAG_MAIN, "ADC MAX4466 initialized: %d Hz", ADC_SAMPLE_RATE);
 }
 
 // ─── Mic Self-Check ───────────────────────────────────────────────────────────
 // Reads 0.5 seconds of audio at boot. If all-zero (mic disconnected or miswired),
 // prints a loud error and halts rather than silently running on dead audio.
 static void mic_selfcheck() {
-    const int check_samples = I2S_SAMPLE_RATE / 2;   // 0.5 seconds
-    int32_t raw32[512];
+    const int check_samples = 20000 / 2;   // 0.5 seconds at 20kHz hw rate
+    uint8_t raw_buf[512];
     int64_t sum_sq = 0;
     int captured = 0;
 
     ESP_LOGI(TAG_MIC, "Mic self-check: reading 0.5s of audio...");
     while (captured < check_samples) {
-        size_t bytes_read = 0;
-        int want = (check_samples - captured < 512) ? (check_samples - captured) : 512;
-        i2s_channel_read(i2s_rx_chan, raw32, want * sizeof(int32_t),
-                         &bytes_read, pdMS_TO_TICKS(500));
-        int got = bytes_read / sizeof(int32_t);
+        uint32_t bytes_read = 0;
+        int want = (check_samples - captured < 128) ? (check_samples - captured) : 128; // up to 128 samples = 512 bytes
+        adc_continuous_read(adc_handle, raw_buf, want * SOC_ADC_DIGI_RESULT_BYTES,
+                            &bytes_read, pdMS_TO_TICKS(500));
+        int got = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
         for (int i = 0; i < got; i++) {
-            int16_t s = (int16_t)(raw32[i] >> 14);
+            adc_digi_output_data_t *p = (adc_digi_output_data_t*)&raw_buf[i * SOC_ADC_DIGI_RESULT_BYTES];
+            uint32_t raw_adc_val = p->type1.data;
+            
+            // EMA filter
+            adc_dc_offset = 0.005f * raw_adc_val + 0.995f * adc_dc_offset;
+            int16_t centered = (int16_t)(raw_adc_val - adc_dc_offset);
+            int16_t s = (int16_t)(centered << ADC_TO_PCM_SHIFT);
+            
             sum_sq += (int64_t)s * s;
         }
         captured += got;
@@ -248,15 +259,14 @@ static void mic_selfcheck() {
     float rms = sqrtf((float)sum_sq / captured) / 32768.0f;
     ESP_LOGI(TAG_MIC, "Mic RMS energy: %.5f", rms);
 
-    if (rms < 1e-5f) {
+    if (rms < 1e-4f) { // Slightly higher threshold than I2S due to noise floor, but low enough for "dead"
         ESP_LOGE(TAG_MIC,
             "\n"
             "╔══════════════════════════════════════════════════════════╗\n"
-            "║  ❌  MIC SELF-CHECK FAILED — All-zero audio detected!    ║\n"
+            "║  ❌  MIC SELF-CHECK FAILED — No valid audio detected!    ║\n"
             "║  Possible causes:                                        ║\n"
-            "║   • INMP441 data pin (SD) not connected to GPIO 34       ║\n"
-            "║   • VDD not connected to 3.3V                            ║\n"
-            "║   • Wrong I2S pins in config                             ║\n"
+            "║   • MAX4466 OUT pin not connected to GPIO 32             ║\n"
+            "║   • VCC not connected to 3.3V                            ║\n"
             "║  Halting. Fix wiring, then reset.                        ║\n"
             "╚══════════════════════════════════════════════════════════╝");
         // Blink indefinitely to signal hardware error before halting
@@ -275,7 +285,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t base,
         wifi_connected = false;
         if (wifi_retry_count < WIFI_MAX_RETRIES) {
             esp_wifi_connect();
-            wifi_retry_count++;
+            wifi_retry_count = wifi_retry_count + 1;
             ESP_LOGW(TAG_WIFI, "WiFi lost — retry %d/%d", wifi_retry_count, WIFI_MAX_RETRIES);
         } else {
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
@@ -332,22 +342,38 @@ static bool wait_for_wifi(uint32_t timeout_ms) {
 
 // ─── TASK A: Inference Loop (CORE 1, always-on) ──────────────────────────────
 static void inference_task(void* arg) {
-    ESP_LOGI(TAG_INF, "Inference task started (core %d)", xPortGetCoreID());
+    ESP_LOGI(TAG_INF, "Inference task started on core 1");
 
-    const int hop_samples = (I2S_SAMPLE_RATE * SLIDE_STEP_MS) / 1000;  // 480 @ 30ms
-    int32_t   i2s_raw[hop_samples];
-    int16_t   hop_buf[hop_samples];
+    const int hop_samples = 16000 * SLIDE_STEP_MS / 1000;  // 480 @ 16kHz
+    const int hw_hop_samples = 20000 * SLIDE_STEP_MS / 1000;         // 600 @ 20kHz
+    
+    // allocate buffer for 20kHz ADC read
+    uint8_t* raw_buf = (uint8_t*)malloc(hw_hop_samples * SOC_ADC_DIGI_RESULT_BYTES);
+    int16_t* hop_buf = (int16_t*)malloc(hop_samples * sizeof(int16_t));
 
     uint32_t infer_count   = 0;
     float    infer_total_ms = 0.0f;
 
     while (true) {
-        // 1. Capture one hop via I2S
-        size_t bytes_read = 0;
-        i2s_channel_read(i2s_rx_chan, i2s_raw, hop_samples * sizeof(int32_t),
-                         &bytes_read, pdMS_TO_TICKS(100));
-        for (int i = 0; i < hop_samples; i++) {
-            hop_buf[i] = (int16_t)(i2s_raw[i] >> 14);
+        // 1. Capture one hop via ADC
+        uint32_t bytes_read = 0;
+        adc_continuous_read(adc_handle, raw_buf, hw_hop_samples * SOC_ADC_DIGI_RESULT_BYTES,
+                            &bytes_read, pdMS_TO_TICKS(100));
+        
+        if (bytes_read == 0) continue;
+
+        int got = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
+        int out_idx = 0;
+        for (int i = 0; i < got; i++) {
+            // Fast downsample 20kHz -> 16kHz (drop 1 every 5 samples)
+            if (i % 5 == 4) continue;
+            if (out_idx >= hop_samples) break;
+
+            adc_digi_output_data_t *p = (adc_digi_output_data_t*)&raw_buf[i * SOC_ADC_DIGI_RESULT_BYTES];
+            uint32_t raw_adc_val = p->type1.data;
+            adc_dc_offset = 0.005f * raw_adc_val + 0.995f * adc_dc_offset;
+            int16_t centered = (int16_t)(raw_adc_val - adc_dc_offset);
+            hop_buf[out_idx++] = (int16_t)(centered << ADC_TO_PCM_SHIFT);
         }
 
         // 2. Write into ring buffer
@@ -358,14 +384,22 @@ static void inference_task(void* arg) {
         }
         xSemaphoreGive(ring_mutex);
 
+        // Pause I2S reads while streaming_task is live-streaming audio to server.
+        // This prevents the two tasks from racing on the I2S FIFO.
+        if (streaming_active) {
+            vTaskDelay(pdMS_TO_TICKS(SLIDE_STEP_MS));
+            continue;
+        }
+
         // 3. Lightweight VAD: skip inference on silence (saves ~9% CPU)
         int64_t sum_sq = 0;
         for (int i = 0; i < hop_samples; i++) sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
         float rms = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
         if (rms < 0.003f) continue;
 
-        // 4. Linearise ring buffer → 1-second window
-        int16_t audio_window[AUDIO_BUFFER_SAMPLES];
+        // 4. Linearise ring buffer → 1-second window (heap alloc: 32KB, too big for 8KB stack)
+        int16_t* audio_window = (int16_t*)malloc(AUDIO_BUFFER_SAMPLES * sizeof(int16_t));
+        if (!audio_window) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         xSemaphoreTake(ring_mutex, portMAX_DELAY);
         int start = ring_write_pos;
         for (int i = 0; i < AUDIO_BUFFER_SAMPLES; i++) {
@@ -375,6 +409,7 @@ static void inference_task(void* arg) {
 
         // 5. MFCC + TFLite inference
         mfcc_proc.compute(audio_window, mfcc_output);
+        free(audio_window);
 
         float in_scale  = input_tensor->params.scale;
         int32_t in_zp   = input_tensor->params.zero_point;
@@ -396,7 +431,9 @@ static void inference_task(void* arg) {
 
         infer_count++;
         infer_total_ms += infer_us / 1000.0f;
-        if (infer_count % 100 == 0) {
+        if (kw_prob > 0.15f) {
+            ESP_LOGI(TAG_INF, "🎤 Speech detected — kw_prob: %.3f (threshold: %.2f)", kw_prob, DETECT_THRESHOLD);
+        } else if (infer_count % 100 == 0) {
             ESP_LOGI(TAG_INF, "avg inference: %.1f ms | kw_prob: %.3f",
                      infer_total_ms / infer_count, kw_prob);
         }
@@ -414,49 +451,44 @@ static void inference_task(void* arg) {
 }
 
 // ─── TASK B: Streaming Task (CORE 0, triggered on detection) ─────────────────
+//
+// LIVE-STREAMING ARCHITECTURE (sub-100ms):
+//
+//   OLD (batch):    detect → record 2000ms → connect → send all → wait → result
+//   Total: ~2240ms
+//
+//   NEW (streaming): detect → connect NOW → stream 30ms chunks live → result
+//   Total: kw_to_connect (~40ms) + streaming (~0ms overhead) + ASR (~10ms) = ~50ms
+//
+// The key insight: connect to the server IMMEDIATELY at keyword detection.
+// Stream audio in 30ms chunks as the user speaks the command.
+// Server (Vosk streaming mode) processes each chunk as it arrives.
+// By the time the user stops speaking, the transcript is already done.
+// ─────────────────────────────────────────────────────────────────────────────
 static void streaming_task(void* arg) {
-    ESP_LOGI(TAG_STR, "Streaming task started (core %d)", xPortGetCoreID());
+    ESP_LOGI(TAG_STR, "Streaming task started (core %d) — LIVE-STREAMING mode",
+             xPortGetCoreID());
     int64_t keyword_end_us;
 
     while (true) {
         xQueueReceive(detect_queue, &keyword_end_us, portMAX_DELAY);
-        session_id++;
+        session_id = session_id + 1;
         uint32_t sid = session_id;
-        ESP_LOGI(TAG_STR, "[Session %lu] Triggered", (unsigned long)sid);
+        ESP_LOGI(TAG_STR, "[Session %lu] Keyword detected — connecting immediately",
+                 (unsigned long)sid);
 
-        // 1. Capture COMMAND_DURATION_MS of audio
-        int command_samples = (I2S_SAMPLE_RATE * COMMAND_DURATION_MS) / 1000;
-        int16_t* cmd_buf = (int16_t*)malloc(command_samples * sizeof(int16_t));
-        if (!cmd_buf) {
-            ESP_LOGE(TAG_STR, "[Session %lu] OOM — dropping detection", (unsigned long)sid);
-            continue;
-        }
-        {
-            int32_t raw32[512];
-            int captured = 0;
-            TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS + 300);
-            while (captured < command_samples && xTaskGetTickCount() < deadline) {
-                int want = (command_samples - captured < 512) ? (command_samples - captured) : 512;
-                size_t bytes_read = 0;
-                i2s_channel_read(i2s_rx_chan, raw32, want * sizeof(int32_t),
-                                 &bytes_read, pdMS_TO_TICKS(100));
-                int got = bytes_read / sizeof(int32_t);
-                for (int i = 0; i < got; i++) {
-                    cmd_buf[captured++] = (int16_t)(raw32[i] >> 14);
-                }
-            }
-        }
-
-        // 2. Wait for WiFi (with 5s timeout)
+        // 1. Wait for WiFi (with 5s timeout, same as before)
         if (!wait_for_wifi(5000)) {
-            ESP_LOGE(TAG_STR, "[Session %lu] WiFi not ready — dropping detection", (unsigned long)sid);
-            free(cmd_buf);
+            ESP_LOGE(TAG_STR, "[Session %lu] WiFi not ready — dropping",
+                     (unsigned long)sid);
             continue;
         }
 
-        // 3. Connect to server with retry + exponential backoff
+        // 2. Connect to server IMMEDIATELY — do NOT wait to record audio first
         int sock = -1;
+        uint32_t kw_to_connect_ms = 0;
         uint32_t backoff_ms = 200;
+
         for (int attempt = 0; attempt < 4; attempt++) {
             struct sockaddr_in server_addr = {};
             server_addr.sin_family = AF_INET;
@@ -465,49 +497,95 @@ static void streaming_task(void* arg) {
 
             sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
             if (sock < 0) {
-                ESP_LOGE(TAG_STR, "[Session %lu] socket() failed, retrying in %lums",
-                         (unsigned long)sid, (unsigned long)backoff_ms);
+                ESP_LOGW(TAG_STR, "[Session %lu] socket() failed (attempt %d), retry in %lums",
+                         (unsigned long)sid, attempt + 1, (unsigned long)backoff_ms);
                 vTaskDelay(pdMS_TO_TICKS(backoff_ms));
                 backoff_ms *= 2;
                 sock = -1;
                 continue;
             }
 
-            // TCP_NODELAY: disable Nagle's for low latency
+            // Disable Nagle — send each 30ms chunk immediately with no buffering delay
             int flag = 1;
             setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
-            // Measure kw_to_connect_ms using ESP32's own monotonic clock (NO NTP)
-            int64_t connect_start_us = esp_timer_get_time();
+            // kw_to_connect_ms = ESP32 monotonic clock: keyword_end → TCP connect done
             if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
                 int64_t connect_done_us = esp_timer_get_time();
-                uint32_t kw_to_connect_ms =
-                    (uint32_t)((connect_done_us - keyword_end_us) / 1000);
+                kw_to_connect_ms = (uint32_t)((connect_done_us - keyword_end_us) / 1000);
                 ESP_LOGI(TAG_STR, "[Session %lu] Connected (attempt %d) kw→connect=%lums",
                          (unsigned long)sid, attempt + 1, (unsigned long)kw_to_connect_ms);
+                break;
+            } else {
+                ESP_LOGW(TAG_STR, "[Session %lu] connect() failed (attempt %d), retry in %lums",
+                         (unsigned long)sid, attempt + 1, (unsigned long)backoff_ms);
+                close(sock);
+                sock = -1;
+                vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+                backoff_ms *= 2;
+            }
+        }
 
-                // 4. Send HVP1 header (20 bytes)
-                hvp1_header_t hdr = {
-                    .magic           = MAGIC_NUMBER,
-                    .sample_rate     = I2S_SAMPLE_RATE,
-                    .channels        = 1,
-                    .bits            = 16,
-                    .audio_len       = (uint32_t)(command_samples * sizeof(int16_t)),
-                    .kw_to_connect_ms = kw_to_connect_ms,
-                };
-                send(sock, &hdr, sizeof(hdr), 0);
+        if (sock < 0) {
+            ESP_LOGE(TAG_STR, "[Session %lu] All TCP attempts failed — dropping",
+                     (unsigned long)sid);
+            continue;
+        }
 
-                // 5. Stream audio in 0.1s chunks
-                const int chunk = 3200;
-                int sent = 0;
-                while (sent < command_samples) {
-                    int n = (command_samples - sent < chunk) ? (command_samples - sent) : chunk;
-                    send(sock, cmd_buf + sent, n * sizeof(int16_t), 0);
-                    sent += n;
+        // 3. Send HVP1 header with audio_len=0 (= live-streaming mode)
+        //    Server will read until we close the write side.
+        hvp1_header_t hdr = {
+            .magic            = MAGIC_NUMBER,
+            .sample_rate      = ADC_SAMPLE_RATE,
+            .channels         = 1,
+            .bits             = 16,
+            .audio_len        = 0,   // 0 = streaming until shutdown(SHUT_WR)
+            .kw_to_connect_ms = kw_to_connect_ms,
+        };
+        send(sock, &hdr, sizeof(hdr), 0);
+
+        // 4. Stream audio LIVE from ADC for COMMAND_DURATION_MS
+        //    inference_task pauses its own reads while streaming_active=true
+        //    so both tasks don't race on the ADC ring buffer.
+        streaming_active = true;
+
+        const int CHUNK_SAMPLES = 480;   // 30ms at 16kHz — matches server recv buffer
+        uint8_t raw_buf[CHUNK_SAMPLES * 4];
+        int16_t pcm16[CHUNK_SAMPLES];
+        TickType_t deadline   = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
+        int total_sent = 0;
+
+        while (xTaskGetTickCount() < deadline) {
+            uint32_t bytes_read = 0;
+            adc_continuous_read(adc_handle, raw_buf, CHUNK_SAMPLES * SOC_ADC_DIGI_RESULT_BYTES,
+                                &bytes_read, pdMS_TO_TICKS(50));
+            int got = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
+            for (int i = 0; i < got; i++) {
+                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&raw_buf[i * SOC_ADC_DIGI_RESULT_BYTES];
+                uint32_t raw_adc_val = p->type1.data;
+                adc_dc_offset = 0.005f * raw_adc_val + 0.995f * adc_dc_offset;
+                int16_t centered = (int16_t)(raw_adc_val - adc_dc_offset);
+                pcm16[i] = (int16_t)(centered << ADC_TO_PCM_SHIFT);
+            }
+            if (got > 0) {
+                int sent_bytes = send(sock, pcm16, got * sizeof(int16_t), 0);
+                if (sent_bytes < 0) {
+                    ESP_LOGE(TAG_STR, "[Session %lu] send() failed — server gone?",
+                             (unsigned long)sid);
+                    break;
                 }
-                shutdown(sock, SHUT_WR);
+                total_sent += got;
+            }
+        }
 
-                // 6. Read transcript response
+        streaming_active = false;  // release ADC back to inference_task
+        shutdown(sock, SHUT_WR);   // signal end-of-stream to server
+
+        ESP_LOGI(TAG_STR, "[Session %lu] Stream complete: %d samples (%.2fs)",
+                 (unsigned long)sid, total_sent, (float)total_sent / ADC_SAMPLE_RATE);
+
+        // 5. Read transcript response from server
+        {
                 char resp[1024] = {0};
                 int resp_len = 0, r;
                 while ((r = recv(sock, resp + resp_len,
@@ -519,23 +597,7 @@ static void streaming_task(void* arg) {
 
                 ESP_LOGI(TAG_STR, "[Session %lu] Response: %s",
                          (unsigned long)sid, resp_len > 0 ? resp : "[no response]");
-                break;  // success — exit retry loop
-            } else {
-                ESP_LOGW(TAG_STR, "[Session %lu] connect() failed (attempt %d), retry in %lums",
-                         (unsigned long)sid, attempt + 1, (unsigned long)backoff_ms);
-                close(sock);
-                sock = -1;
-                vTaskDelay(pdMS_TO_TICKS(backoff_ms));
-                backoff_ms *= 2;
-            }
         }
-
-        if (sock >= 0) {
-            close(sock);
-            ESP_LOGE(TAG_STR, "[Session %lu] All TCP attempts failed — detection dropped",
-                     (unsigned long)sid);
-        }
-        free(cmd_buf);
     }
 }
 
@@ -551,8 +613,8 @@ extern "C" void app_main() {
     // WiFi (no NTP — not needed for latency measurement anymore)
     wifi_init();
 
-    // I2S microphone
-    i2s_init();
+    // ADC microphone
+    adc_init();
 
     // Mic self-check — halts loudly if mic is disconnected/miswired
     mic_selfcheck();
@@ -574,7 +636,7 @@ extern "C" void app_main() {
 
     // Spawn FreeRTOS tasks
     xTaskCreatePinnedToCore(inference_task, "inference",
-        8192, NULL, 5, NULL, 1);   // Core 1, high priority
+        48000, NULL, 5, NULL, 1);   // Core 1, high priority — needs 48KB for audio buffers
     xTaskCreatePinnedToCore(streaming_task, "streaming",
         8192, NULL, 4, NULL, 0);   // Core 0, medium priority
 

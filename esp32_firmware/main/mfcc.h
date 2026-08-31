@@ -64,8 +64,9 @@ public:
     // output:      float[MFCC_N_FRAMES * MFCC_N_MFCC] = float[637]
     //              Layout: row-major [frame][coeff] matching TF tensor [49,13]
     void compute(const int16_t* audio_int16, float* output) {
-        // Normalise int16 → float32 [-1.0, 1.0]
-        float audio_f32[MFCC_AUDIO_SAMPLES];
+        // Normalise int16 → float32 [-1.0, 1.0] (heap allocated to prevent 64KB stack overflow)
+        float* audio_f32 = (float*)malloc(MFCC_AUDIO_SAMPLES * sizeof(float));
+        if (!audio_f32) return;
         for (int i = 0; i < MFCC_AUDIO_SAMPLES; i++) {
             audio_f32[i] = (float)audio_int16[i] / 32768.0f;
         }
@@ -121,6 +122,8 @@ public:
             float* row = output + frame_idx * MFCC_N_MFCC;
             for (int c = 0; c < MFCC_N_MFCC; c++) row[c] = 0.0f;
         }
+
+        free(audio_f32);
     }
 
 private:

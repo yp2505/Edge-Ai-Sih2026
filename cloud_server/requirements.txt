@@ -1,16 +1,12 @@
 # ── Active Cloud Server (server.py) ──────────────────────────────────────────
-# This is the canonical server that the ESP32 firmware connects to.
-# Run: python server.py
+# Run: python server.py                       (tiny model, ~200ms)
+# Run: python server.py --whisper-model base  (better accuracy, ~450ms)
 
-faster-whisper>=0.10.0       # Open-source Whisper ASR, INT8 quantized on CPU ✅
+faster-whisper>=0.10.0       # Open-source Whisper INT8 on CPU ✅
 numpy>=1.23.0
-soundfile>=0.12.0            # WAV read/write for test mode
+soundfile>=0.12.0            # WAV read/write for --test mode
 
 # ── Edge Inference (edge_inference.py on RPi/laptop for testing) ──────────────
 sounddevice>=0.4.6           # Microphone capture
 tflite-runtime>=2.14.0       # Lightweight TFLite (no full TensorFlow needed)
 # OR: tensorflow>=2.13.0    # Full TensorFlow (if tflite-runtime unavailable)
-
-# ── Legacy Prototype (legacy_prototypes/asr_server_vosk_websocket.py) ─────────
-# Only needed if running the deprecated Vosk/WebSocket prototype — NOT required for hardware demo
-# vosk>=0.3.45
