@@ -1,104 +1,133 @@
 import { useEffect, useRef, useState } from 'react'
 import styles from './HeroOrb.module.css'
 
-const BARS = 28   // number of waveform bars
-
 export default function HeroOrb({ latest, serverUp, pingCount }) {
-  const [pulse, setPulse] = useState(false)
+  const [faceState, setFaceState] = useState('sleeping')
+  const [statusLabel, setStatusLabel] = useState('Offline')
+  const [particles, setParticles] = useState([])
   const prevPing = useRef(pingCount)
+  const happyTimeout = useRef(null)
+  const particleId = useRef(0)
 
-  // Trigger pulse animation on new detection
+  const spawnParticles = () => {
+    const p = Array.from({ length: 10 }, (_, i) => ({
+      id: particleId.current++,
+      angle: (i / 10) * 360 + Math.random() * 15,
+      dist: 100 + Math.random() * 50,
+      size: 5 + Math.random() * 6,
+      color: i % 3 === 0 ? 'var(--pink)' : i % 3 === 1 ? 'var(--amber)' : 'var(--primary)',
+    }))
+    setParticles(p)
+    setTimeout(() => setParticles([]), 1300)
+  }
+
   useEffect(() => {
-    if (pingCount !== prevPing.current) {
-      prevPing.current = pingCount
-      setPulse(true)
-      const t = setTimeout(() => setPulse(false), 1200)
-      return () => clearTimeout(t)
+    const isNewPing = pingCount !== prevPing.current
+    if (isNewPing) prevPing.current = pingCount
+
+    if (!serverUp) {
+      setFaceState('sleeping')
+      setStatusLabel('Offline')
+      if (happyTimeout.current) clearTimeout(happyTimeout.current)
+      return
     }
-  }, [pingCount])
 
-  const transcript = latest?.transcript ?? null
-  const total = latest
-    ? (latest.kw_to_connect_ms ?? 0) + (latest.receive_gap_ms ?? 0) + (latest.transcribe_ms ?? 0)
-    : null
+    if (isNewPing) {
+      setFaceState('thinking')
+      setStatusLabel('Processing…')
+      if (happyTimeout.current) clearTimeout(happyTimeout.current)
+      happyTimeout.current = setTimeout(() => {
+        setFaceState('happy')
+        setStatusLabel('Got it!')
+        spawnParticles()
+        happyTimeout.current = setTimeout(() => {
+          setFaceState('searching')
+          setStatusLabel('Listening…')
+        }, 3000)
+      }, 1200)
+      return
+    }
 
-  const latencyColor = total === null ? 'var(--cyan)'
-    : total < 400 ? 'var(--green)'
-    : total < 800 ? 'var(--yellow)'
-    : 'var(--red)'
+    if (faceState !== 'happy' && faceState !== 'thinking') {
+      setFaceState('searching')
+      setStatusLabel('Listening…')
+    }
+
+    return () => { if (happyTimeout.current) clearTimeout(happyTimeout.current) }
+  }, [serverUp, pingCount, latest])
 
   return (
-    <section className={styles.hero}>
+    <div className={styles.heroWrap}>
+      {/* Ambient glow disc */}
+      <div className={`${styles.glowDisc} ${styles['glow_' + faceState]}`} />
 
-      {/* Orb container */}
-      <div className={styles.orbWrap}>
-        {/* Outer spinning ring (Siri-style conic gradient) */}
-        <div className={`${styles.siriRing} ${pulse ? styles.ringPulse : ''}`} />
+      {/* Sparkle particles */}
+      {particles.map(p => (
+        <div
+          key={p.id}
+          className={styles.sparkle}
+          style={{
+            '--angle': `${p.angle}deg`,
+            '--dist': `${p.dist}px`,
+            width: p.size, height: p.size,
+            background: p.color,
+          }}
+        />
+      ))}
 
-        {/* Middle pulse ring */}
-        <div className={`${styles.pulseRing} ${pulse ? styles.pulseActive : ''}`} />
+      {/* Slime blob */}
+      <div className={`${styles.slime} ${styles['slime_' + faceState]}`}>
+        {/* Inner shine */}
+        <div className={styles.shine} />
+        <div className={styles.shine2} />
 
-        {/* Core orb */}
-        <div className={styles.orb}>
-          {/* Waveform bars inside orb */}
-          <div className={styles.waveform} aria-hidden="true">
-            {Array.from({ length: BARS }).map((_, i) => (
-              <div
-                key={i}
-                className={`${styles.bar} ${serverUp && pulse ? styles.barActive : ''}`}
-                style={{
-                  animationDelay: `${(i / BARS) * 1.4}s`,
-                  animationDuration: `${0.6 + (i % 5) * 0.12}s`,
-                }}
-              />
-            ))}
+        {/* Face layer */}
+        <div className={styles.face}>
+          {/* Eyes */}
+          <div className={`${styles.eyeGroup} ${styles['eyes_' + faceState]}`}>
+            <div className={`${styles.eye} ${styles.eyeL}`}>
+              <div className={styles.pupil} />
+              <div className={styles.eyeShine} />
+            </div>
+            <div className={`${styles.eye} ${styles.eyeR}`}>
+              <div className={styles.pupil} />
+              <div className={styles.eyeShine} />
+            </div>
           </div>
+
+          {/* Blush */}
+          <div className={`${styles.blushRow} ${styles['blush_' + faceState]}`}>
+            <div className={styles.blush} />
+            <div className={styles.blush} />
+          </div>
+
+          {/* Mouth */}
+          <div className={`${styles.mouth} ${styles['mouth_' + faceState]}`} />
         </div>
       </div>
 
-      {/* Transcript pill below orb */}
-      <div className={styles.transcriptWrap}>
-        {!serverUp ? (
-          <div className={`${styles.transcriptPill} ${styles.pillOffline} pill`}>
-            <span className={styles.pillDot} style={{ background: 'var(--red)' }} />
-            <span>Server offline — start server.py to begin</span>
-          </div>
-        ) : transcript ? (
-          <div
-            className={`${styles.transcriptPill} ${pulse ? styles.pillNew : ''} pill`}
-            key={latest?.session_id}
-          >
-            <span className={styles.pillDot} style={{ background: 'var(--green)' }} />
-            <span className={styles.transcriptText}>&ldquo;{transcript}&rdquo;</span>
-          </div>
-        ) : (
-          <div className={`${styles.transcriptPill} ${styles.pillWaiting} pill`}>
-            <span className={styles.pillDot} style={{ background: 'var(--cyan)', animation: 'blink-dot 1.5s infinite' }} />
-            <span>Listening for &ldquo;Hey Vaani&rdquo;…</span>
-          </div>
-        )}
-      </div>
-
-      {/* Latency strip — pill shaped, only shown if data exists */}
-      {latest && (
-        <div className={styles.latencyStrip}>
-          {[
-            { label: 'kw→connect', value: latest.kw_to_connect_ms ?? 0, color: 'var(--purple)' },
-            { label: 'rcv gap',    value: latest.receive_gap_ms    ?? 0, color: 'var(--cyan)' },
-            { label: 'transcribe', value: latest.transcribe_ms     ?? 0, color: 'var(--blue)' },
-          ].map(({ label, value, color }) => (
-            <div key={label} className={`${styles.latPill} glass pill`}>
-              <span className={styles.latLabel}>{label}</span>
-              <span className={`${styles.latValue} mono`} style={{ color }}>{value} ms</span>
-            </div>
-          ))}
-          <div className={`${styles.latPillTotal} glass pill`}>
-            <span className={styles.latLabel}>end-to-end</span>
-            <span className={`${styles.latValueXl} mono`} style={{ color: latencyColor }}>{total} ms</span>
-          </div>
+      {/* Sleeping ZZZ overlay */}
+      {faceState === 'sleeping' && (
+        <div className={styles.zzzWrap} aria-hidden="true">
+          <span className={styles.z1}>z</span>
+          <span className={styles.z2}>z</span>
+          <span className={styles.z3}>Z</span>
         </div>
       )}
 
-    </section>
+      {/* Searching pulse ring */}
+      {faceState === 'searching' && (
+        <>
+          <div className={styles.scanRing} />
+          <div className={styles.scanRing2} />
+        </>
+      )}
+
+      {/* Status pill */}
+      <div className={`${styles.statusPill} ${styles['status_' + faceState]}`}>
+        <div className={styles.statusDot} />
+        <span className={styles.statusText}>{statusLabel}</span>
+      </div>
+    </div>
   )
 }

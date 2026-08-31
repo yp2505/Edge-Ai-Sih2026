@@ -180,21 +180,15 @@ export function IconDonut({ size = 16, color = 'currentColor' }) {
 }
 
 /** Unique Hey Vaani logo SVG — stylised V with sound waves */
-export function VaaniLogo({ size = 36 }) {
+export function VaaniLogo({ size = 32 }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 40 40" fill="none">
-      {/* Outer rounded square */}
-      <rect width="40" height="40" rx="10" fill="url(#vaani-grad)" />
-      {/* Stylised V shape */}
-      <path d="M10 11 L20 29 L30 11" stroke="white" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-      {/* Left sound arc */}
-      <path d="M6.5 17 C5.5 19.5 5.5 22 6.5 24.5" stroke="rgba(255,255,255,0.55)" strokeWidth="2" strokeLinecap="round" fill="none"/>
-      {/* Right sound arc */}
-      <path d="M33.5 17 C34.5 19.5 34.5 22 33.5 24.5" stroke="rgba(255,255,255,0.55)" strokeWidth="2" strokeLinecap="round" fill="none"/>
+    <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
+      <path d="M5 10 L16 26 L27 10" stroke="url(#vaani-grad)" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+      <path d="M12 12 L16 18 L20 12" stroke="var(--sky)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
       <defs>
-        <linearGradient id="vaani-grad" x1="0" y1="0" x2="40" y2="40">
-          <stop offset="0%" stopColor="#00c8ff"/>
-          <stop offset="100%" stopColor="#0059ff"/>
+        <linearGradient id="vaani-grad" x1="0" y1="0" x2="32" y2="32">
+          <stop offset="0%" stopColor="var(--primary)"/>
+          <stop offset="100%" stopColor="var(--sky)"/>
         </linearGradient>
       </defs>
     </svg>

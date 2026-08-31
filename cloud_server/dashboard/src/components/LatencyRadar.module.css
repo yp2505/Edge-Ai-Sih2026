@@ -1,0 +1,14 @@
+.radar {
+  display: flex; flex-direction: column; height: 100%;
+}
+.header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 12px 20px; border-bottom: 1px solid rgba(0,240,255,0.1);
+  background: rgba(0,0,0,0.4);
+}
+.title { font-size: 11px; font-family: var(--font-mono); color: var(--neon-cyan); letter-spacing: 2px; }
+.stats { display: flex; gap: 16px; font-size: 10px; font-family: var(--font-mono); color: var(--text-main); }
+.stats span { background: rgba(0,240,255,0.1); padding: 2px 8px; border-radius: 2px; }
+
+.chartWrap { flex: 1; padding: 12px 20px 20px; position: relative; }
+.empty { height: 100%; display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); color: var(--text-muted); font-size: 12px; letter-spacing: 2px; opacity: 0.5; }

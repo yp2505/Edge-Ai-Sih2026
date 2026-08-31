@@ -1,0 +1,38 @@
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+}
+
+.left, .right { display: flex; align-items: center; gap: 30px; }
+
+.logoMark {
+  width: 32px; height: 32px; border-radius: 10px;
+  background: #fff; color: #000;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 900; font-size: 14px; letter-spacing: -1px;
+}
+.brandTitle {
+  font-size: 16px; font-weight: 800; letter-spacing: -0.5px;
+  color: var(--text-main); margin: 0; display: flex; align-items: center; gap: 10px;
+}
+.version {
+  font-size: 10px; padding: 2px 8px; border-radius: 20px;
+  background: rgba(255,255,255,0.1); color: var(--text-muted); font-weight: 600;
+}
+
+.statGroup {
+  display: flex; gap: 20px; border-right: 1px solid rgba(255,255,255,0.1); padding-right: 20px;
+}
+.stat { display: flex; flex-direction: column; align-items: flex-end; }
+.sLabel { font-size: 10px; font-weight: 700; color: var(--text-muted); }
+.stat span.mono { font-size: 14px; font-weight: 700; color: var(--text-main); }
+
+.connection {
+  font-size: 12px; font-weight: 800; letter-spacing: -0.5px;
+}
+.online { display: flex; align-items: center; gap: 8px; color: var(--text-main); }
+.offline { display: flex; align-items: center; gap: 8px; color: var(--text-muted); }
+.dotGreen { width: 10px; height: 10px; border-radius: 50%; background: #34c759; box-shadow: 0 0 10px #34c759; }
+.dotRed { width: 10px; height: 10px; border-radius: 50%; background: #ff3b30; }

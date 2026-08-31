@@ -1,125 +1,39 @@
-/* ═══════════════════════════════════════════════════════════════
-   Hey Vaani — Design System v3  (SaaS Dashboard layout)
-   ═══════════════════════════════════════════════════════════════ */
-
-:root {
-  /* Surfaces */
-  --bg:          #0b0f1a;
-  --surface:     #111827;
-  --surface-2:   #1a2236;
-  --surface-3:   #1f2d45;
-  --border:      rgba(255,255,255,0.07);
-  --border-hover:rgba(255,255,255,0.14);
-
-  /* Brand accent — cyan/teal for voice AI */
-  --accent:       #00c8ff;
-  --accent-dim:   rgba(0,200,255,0.12);
-  --accent-glow:  rgba(0,200,255,0.25);
-
-  /* Semantic */
-  --green:       #22c55e;
-  --green-dim:   rgba(34,197,94,0.12);
-  --yellow:      #eab308;
-  --yellow-dim:  rgba(234,179,8,0.12);
-  --red:         #ef4444;
-  --red-dim:     rgba(239,68,68,0.12);
-  --purple:      #a78bfa;
-  --purple-dim:  rgba(167,139,250,0.12);
-  --orange:      #f97316;
-
-  /* Text */
-  --t1: #f1f5f9;
-  --t2: #94a3b8;
-  --t3: #475569;
-
-  /* Typography */
-  --font: 'Outfit', -apple-system, sans-serif;
-  --mono: 'JetBrains Mono', 'SF Mono', monospace;
-
-  /* Radius */
-  --r-xl: 16px;
-  --r-lg: 12px;
-  --r-md: 8px;
-  --r-sm: 6px;
-  --r-pill: 100px;
-}
-
+/* ── Reset & Base ─────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html { color-scheme: dark; }
 
 body {
-  font-family: var(--font);
-  background: var(--bg);
-  color: var(--t1);
-  min-height: 100vh;
-  overflow-x: hidden;
-  font-size: 14px;
-  line-height: 1.5;
+  font-family: 'Inter', -apple-system, sans-serif;
+  background: #0d1117;
+  color: #e8edf5;
+  height: 100vh;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Scrollbar */
-::-webkit-scrollbar { width: 4px; }
+#root { display: flex; height: 100vh; min-height: 100vh; }
+
+/* ── Scrollbar ────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(0,200,255,0.4); }
+::-webkit-scrollbar-thumb { background: rgba(124,106,247,0.25); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(124,106,247,0.5); }
 
-/* Utilities */
-.mono { font-family: var(--mono); }
-.t1   { color: var(--t1); }
-.t2   { color: var(--t2); }
-.t3   { color: var(--t3); }
-.accent  { color: var(--accent); }
-.green   { color: var(--green); }
-.yellow  { color: var(--yellow); }
-.red     { color: var(--red); }
-.purple  { color: var(--purple); }
-
-/* Card */
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-xl);
-  transition: border-color 0.2s, box-shadow 0.2s;
-}
-.card:hover {
-  border-color: var(--border-hover);
-}
-
-/* Pill badge */
-.badge {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 3px 10px; border-radius: var(--r-pill);
-  font-size: 11px; font-weight: 600; letter-spacing: 0.3px;
-}
-.badge-accent  { background: var(--accent-dim);  color: var(--accent);  border: 1px solid rgba(0,200,255,0.2); }
-.badge-green   { background: var(--green-dim);   color: var(--green);   border: 1px solid rgba(34,197,94,0.2); }
-.badge-yellow  { background: var(--yellow-dim);  color: var(--yellow);  border: 1px solid rgba(234,179,8,0.2); }
-.badge-red     { background: var(--red-dim);     color: var(--red);     border: 1px solid rgba(239,68,68,0.2); }
-.badge-purple  { background: var(--purple-dim);  color: var(--purple);  border: 1px solid rgba(167,139,250,0.2); }
-.badge-muted   { background: rgba(255,255,255,0.05); color: var(--t2); border: 1px solid var(--border); }
-
-/* Trend pill  */
-.trend-up   { color: var(--green); font-size: 11px; font-weight: 600; }
-.trend-down { color: var(--red);   font-size: 11px; font-weight: 600; }
-
-/* Divider */
-.divider { border: none; border-top: 1px solid var(--border); }
-
-/* Animations */
+/* ── Shared Keyframes ─────────────────────────────────── */
 @keyframes pulse-dot {
-  0%,100% { opacity:1; transform:scale(1); }
-  50%      { opacity:0.3; transform:scale(0.7); }
+  0%,100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.3; transform: scale(0.7); }
 }
 @keyframes slide-up {
-  from { opacity:0; transform:translateY(10px); }
-  to   { opacity:1; transform:translateY(0); }
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
-@keyframes siri-ring {
-  to { transform: rotate(360deg); }
+@keyframes blink-dot {
+  0%,100% { opacity: 1; }
+  50%      { opacity: 0.2; }
 }
-@keyframes wave-bar {
-  0%,100% { transform:scaleY(0.25); }
-  50%      { transform:scaleY(1); }
+@keyframes siri-ring { to { transform: rotate(360deg); } }
+@keyframes wave-bar  {
+  0%,100% { transform: scaleY(0.25); }
+  50%      { transform: scaleY(1); }
 }
-
-#root { display: flex; min-height: 100vh; }
