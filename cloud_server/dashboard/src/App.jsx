@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback } from 'react'
-import MissionHeader from './components/MissionHeader.jsx'
-import NodeTopology from './components/NodeTopology.jsx'
-import HardwareTelemetry from './components/HardwareTelemetry.jsx'
-import Spectrogram from './components/Spectrogram.jsx'
-import InferencePipeline from './components/InferencePipeline.jsx'
-import RightPanel from './components/RightPanel.jsx'
+import HeroOrb from './components/HeroOrb.jsx'
+import WavePanel from './components/WavePanel.jsx'
+import DetectionFeedNew from './components/DetectionFeedNew.jsx'
+import HardwareTelemetryNew from './components/HardwareTelemetryNew.jsx'
+import PipelinePanel from './components/PipelinePanel.jsx'
+import TopBar from './components/TopBarNew.jsx'
 import SettingsModal from './components/SettingsModal.jsx'
+import { IconSearch, IconWaveform, IconReport, IconCpu, IconTrendChart } from './components/Icons.jsx'
 import './App.css'
 
 const API = 'http://localhost:8080'
@@ -33,7 +34,7 @@ export default function App() {
 
   useEffect(() => {
     fetchHealth(); fetchEvents()
-    const h = setInterval(fetchHealth, 2000) // Faster polling for density
+    const h = setInterval(fetchHealth, 2000)
     const e = setInterval(fetchEvents, 800)
     return () => { clearInterval(h); clearInterval(e) }
   }, [fetchHealth, fetchEvents])
@@ -42,56 +43,94 @@ export default function App() {
 
   return (
     <>
-      {/* Animated 3D Background */}
-      <div className="bg-grid"><div className="bg-grid-inner"></div></div>
-      <div className="bg-orb orb-1"></div>
-      <div className="bg-orb orb-2"></div>
+      {/* Soft ambient background */}
+      <div className="bg-blobs" aria-hidden="true">
+        <div className="blob blob-1" />
+        <div className="blob blob-2" />
+        <div className="blob blob-3" />
+      </div>
 
-      {/* Settings Modal Overlay */}
       {isSettingsOpen && <SettingsModal onClose={() => setIsSettingsOpen(false)} />}
 
-      <div className="mission-layout">
-      
-      <div className="mc-panel header-area" style={{ borderRadius: 0, border: 'none', borderBottom: '1px solid var(--panel-border)' }}>
-        <MissionHeader health={health} serverUp={serverUp} totalEvents={events.length} onSettingsClick={() => setIsSettingsOpen(true)} />
-      </div>
+      <div className="app-layout">
+        {/* Top Bar */}
+        <div className="area-topbar panel" style={{ borderRadius: 16 }}>
+          <TopBar health={health} serverUp={serverUp} totalEvents={events.length} onSettingsClick={() => setIsSettingsOpen(true)} />
+        </div>
 
-      <div className="mc-panel node-area">
-        <div className="mc-panel-header">NODE TOPOLOGY</div>
-        <div className="mc-panel-content">
-          <NodeTopology serverUp={serverUp} latestEvent={latestEvent} />
+        {/* Hero — Slime Character */}
+        <div className="area-hero panel">
+          <div className="panel-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <IconSearch size={12} color="var(--t3)" />
+              <span>AI Companion</span>
+            </div>
+            <div className="panel-header-dot" style={{ background: serverUp ? 'var(--green)' : 'var(--t3)', boxShadow: serverUp ? '0 0 8px var(--green)' : 'none' }} />
+          </div>
+          <div className="panel-content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <HeroOrb latest={latestEvent} serverUp={serverUp} pingCount={events.length} />
+          </div>
+        </div>
+
+        {/* Voice Waveform + Transcript */}
+        <div className="area-wave panel">
+          <div className="panel-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <IconWaveform size={12} color="var(--t3)" />
+              <span>Voice Activity</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--sky)', animation: 'blink-dot 2s infinite' }} />
+              <span style={{ fontSize: 9, color: 'var(--sky)' }}>LIVE</span>
+            </div>
+          </div>
+          <div className="panel-content no-pad" style={{ display: 'flex', flexDirection: 'column' }}>
+            <WavePanel latestEvent={latestEvent} serverUp={serverUp} />
+          </div>
+        </div>
+
+        {/* Detection Feed */}
+        <div className="area-feed panel">
+          <div className="panel-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <IconReport size={12} color="var(--t3)" />
+              <span>Detection Feed</span>
+            </div>
+            <span className="badge badge-primary">{events.length}</span>
+          </div>
+          <div className="panel-content no-pad scroll">
+            <DetectionFeedNew events={events} />
+          </div>
+        </div>
+
+        {/* Hardware Telemetry */}
+        <div className="area-hw panel">
+          <div className="panel-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <IconCpu size={12} color="var(--t3)" />
+              <span>Hardware</span>
+            </div>
+            <span style={{ fontSize: 9, color: 'var(--t3)' }}>LIVE</span>
+          </div>
+          <div className="panel-content" style={{ padding: '12px 16px' }}>
+            <HardwareTelemetryNew latestEvent={latestEvent} />
+          </div>
+        </div>
+
+        {/* Pipeline + Latency */}
+        <div className="area-pipeline panel">
+          <div className="panel-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <IconTrendChart size={12} color="var(--t3)" />
+              <span>Inference Pipeline</span>
+            </div>
+            <span className="mono" style={{ fontSize: 9, color: 'var(--t3)' }}>E2E TIMING</span>
+          </div>
+          <div className="panel-content" style={{ padding: '12px 16px' }}>
+            <PipelinePanel latestEvent={latestEvent} events={events} />
+          </div>
         </div>
       </div>
-
-      <div className="mc-panel telemetry-area">
-        <div className="mc-panel-header">HARDWARE TELEMETRY</div>
-        <div className="mc-panel-content">
-          <HardwareTelemetry latestEvent={latestEvent} />
-        </div>
-      </div>
-
-      <div className="mc-panel spectrogram-area">
-        <div className="mc-panel-header">
-          <span>AI ACOUSTIC MODEL (SPECTROGRAM)</span>
-          <span style={{ color: 'var(--accent-cyan)' }}>LIVE</span>
-        </div>
-        <div className="mc-panel-content" style={{ padding: 0 }}>
-          <Spectrogram latestEvent={latestEvent} />
-        </div>
-      </div>
-
-      <div className="mc-panel pipeline-area">
-        <div className="mc-panel-header">INFERENCE PIPELINE & TIMING</div>
-        <div className="mc-panel-content">
-          <InferencePipeline latestEvent={latestEvent} />
-        </div>
-      </div>
-
-      <div className="mc-panel datagrid-area" style={{ padding: 0 }}>
-        <RightPanel events={events} />
-      </div>
-
-    </div>
     </>
   )
 }
