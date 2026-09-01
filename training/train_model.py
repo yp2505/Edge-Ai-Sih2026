@@ -143,10 +143,12 @@ def prepare_dataset(max_negative=5000):
     hw_augmented_dir = os.path.join(DATA_DIR, "keyword_hw")  # MAX4466 domain-adapted samples
 
     keyword_files = []
+    # Keep the real recordings as well as their augmentations.  Previously,
+    # newly recorded samples were silently ignored whenever this folder existed.
+    if os.path.exists(keyword_dir):
+        keyword_files += glob.glob(os.path.join(keyword_dir, "*.wav"))
     if os.path.exists(augmented_dir):
         keyword_files += glob.glob(os.path.join(augmented_dir, "*.wav"))
-    if os.path.exists(keyword_dir) and not keyword_files:
-        keyword_files += glob.glob(os.path.join(keyword_dir, "*.wav"))
     # Always include hardware-augmented samples if available (critical for MAX4466 accuracy)
     if os.path.exists(hw_augmented_dir):
         hw_files = glob.glob(os.path.join(hw_augmented_dir, "*.wav"))

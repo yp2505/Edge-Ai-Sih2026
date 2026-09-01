@@ -94,7 +94,8 @@
 #define ADC_DMA_BUF_LEN     512
 
 // ─── Keyword Detection ────────────────────────────────────────────────────────
-#define DETECT_THRESHOLD    0.20f  // Lowered for diagnosis — raise to 0.70 once working
+#define DETECT_THRESHOLD    0.90f  // Tune only after collecting real-device validation audio
+#define DETECTION_HITS_REQUIRED 3  // Consecutive overlapping windows required to trigger
 #define SLIDE_STEP_MS       30
 #define COMMAND_DURATION_MS 2000
 #define AUDIO_BUFFER_SAMPLES 16000   // 1 second ring buffer
@@ -131,6 +132,7 @@ static volatile bool streaming_active  = false;
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 static int16_t  audio_ring[AUDIO_BUFFER_SAMPLES];
+static int16_t  audio_window[AUDIO_BUFFER_SAMPLES];  // Pre-allocated — avoids per-cycle 32KB malloc
 static int      ring_write_pos = 0;
 static SemaphoreHandle_t ring_mutex;
 
@@ -140,11 +142,10 @@ static QueueHandle_t detect_queue;
 static volatile uint32_t session_id = 0;
 
 // ─── Tensor Arena ─────────────────────────────────────────────────────────────
-// Size: measured arena_used_bytes() = ~49152 bytes on first boot, +10% = 54KB.
-// If model is updated, re-check "TFLite arena used: X bytes" in serial log
-// and update this constant to (measured_bytes * 1.10).
-static const size_t TENSOR_ARENA_SIZE = 54 * 1024;
-static uint8_t tflite_arena[54 * 1024];
+// Measured arena_used_bytes() = 29136 bytes. 35KB gives ~20% safety margin.
+// Reduced from 54KB to 35KB to free DRAM for audio_window heap allocation.
+static const size_t TENSOR_ARENA_SIZE = 35 * 1024;
+static uint8_t tflite_arena[35 * 1024];
 
 // TFLite objects
 static tflite::MicroMutableOpResolver<8> resolver;
@@ -342,38 +343,85 @@ static bool wait_for_wifi(uint32_t timeout_ms) {
 
 // ─── TASK A: Inference Loop (CORE 1, always-on) ──────────────────────────────
 static void inference_task(void* arg) {
+    printf(">>> INFERENCE TASK STARTING! <<<\n"); fflush(stdout);
     ESP_LOGI(TAG_INF, "Inference task started on core 1");
 
     const int hop_samples = 16000 * SLIDE_STEP_MS / 1000;  // 480 @ 16kHz
-    const int hw_hop_samples = 20000 * SLIDE_STEP_MS / 1000;         // 600 @ 20kHz
+    // ADC runs at 20 kHz. Dropping one sample in every five produces 16 kHz.
+    // The driver returns one DMA frame at a time (512 bytes = 128 ADC samples),
+    // so collecting a complete 480-sample output hop needs several reads.
     
-    // allocate buffer for 20kHz ADC read
-    uint8_t* raw_buf = (uint8_t*)malloc(hw_hop_samples * SOC_ADC_DIGI_RESULT_BYTES);
+    // Allocate ADC buffers ONCE at startup (audio_window is now static global)
+    uint8_t* raw_buf = (uint8_t*)malloc(ADC_DMA_BUF_LEN);
     int16_t* hop_buf = (int16_t*)malloc(hop_samples * sizeof(int16_t));
+    if (!raw_buf || !hop_buf) {
+        ESP_LOGE(TAG_INF, "FATAL: raw/hop buffer alloc failed! heap=%lu",
+                 (unsigned long)esp_get_free_heap_size());
+        vTaskDelay(pdMS_TO_TICKS(portMAX_DELAY));
+        return;
+    }
+    ESP_LOGI(TAG_INF, "Inference buffers OK (heap=%lu)", (unsigned long)esp_get_free_heap_size());
 
     uint32_t infer_count   = 0;
     float    infer_total_ms = 0.0f;
+    int      decimation_phase = 0;
+    int      valid_ring_samples = 0;
+    int      consecutive_hits = 0;
+    // A DMA frame is 128 raw samples, while a 30 ms output hop needs 600 raw
+    // samples.  Preserve the few valid samples left over from the final frame.
+    int16_t  pending_pcm[ADC_DMA_BUF_LEN / SOC_ADC_DIGI_RESULT_BYTES];
+    int      pending_count = 0;
+
+    // ─── [DEBUG] Heartbeat counter (raw printf, bypasses ESP_LOG filtering) ─
+    uint32_t dbg_loop_count = 0;
 
     while (true) {
-        // 1. Capture one hop via ADC
-        uint32_t bytes_read = 0;
-        adc_continuous_read(adc_handle, raw_buf, hw_hop_samples * SOC_ADC_DIGI_RESULT_BYTES,
-                            &bytes_read, pdMS_TO_TICKS(100));
-        
-        if (bytes_read == 0) continue;
+        dbg_loop_count++;
 
-        int got = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
+        // 1. Capture exactly one valid 480-sample, 16 kHz hop.  Never write a
+        // partial hop: doing so feeds uninitialised memory into the MFCC/model.
         int out_idx = 0;
-        for (int i = 0; i < got; i++) {
-            // Fast downsample 20kHz -> 16kHz (drop 1 every 5 samples)
-            if (i % 5 == 4) continue;
-            if (out_idx >= hop_samples) break;
+        while (pending_count > 0 && out_idx < hop_samples) {
+            hop_buf[out_idx++] = pending_pcm[0];
+            memmove(pending_pcm, pending_pcm + 1,
+                    (size_t)(--pending_count) * sizeof(pending_pcm[0]));
+        }
+        while (out_idx < hop_samples) {
+            uint32_t bytes_read = 0;
+            esp_err_t err = adc_continuous_read(adc_handle, raw_buf, ADC_DMA_BUF_LEN,
+                                                &bytes_read, pdMS_TO_TICKS(100));
+            if (err != ESP_OK || bytes_read == 0) continue;
 
-            adc_digi_output_data_t *p = (adc_digi_output_data_t*)&raw_buf[i * SOC_ADC_DIGI_RESULT_BYTES];
-            uint32_t raw_adc_val = p->type1.data;
-            adc_dc_offset = 0.005f * raw_adc_val + 0.995f * adc_dc_offset;
-            int16_t centered = (int16_t)(raw_adc_val - adc_dc_offset);
-            hop_buf[out_idx++] = (int16_t)(centered << ADC_TO_PCM_SHIFT);
+            int got = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
+            for (int i = 0; i < got; i++) {
+                adc_digi_output_data_t *p =
+                    (adc_digi_output_data_t*)&raw_buf[i * SOC_ADC_DIGI_RESULT_BYTES];
+                uint32_t raw_adc_val = p->type1.data;
+
+                // Keep the DC estimator at the native 20 kHz rate.
+                adc_dc_offset = 0.005f * raw_adc_val + 0.995f * adc_dc_offset;
+                int16_t centered = (int16_t)(raw_adc_val - adc_dc_offset);
+
+                // Deterministic 20 kHz -> 16 kHz decimation: retain 4 of 5.
+                bool keep_sample = decimation_phase != 4;
+                decimation_phase = (decimation_phase + 1) % 5;
+                if (keep_sample) {
+                    int16_t pcm = (int16_t)(centered << ADC_TO_PCM_SHIFT);
+                    if (out_idx < hop_samples) {
+                        hop_buf[out_idx++] = pcm;
+                    } else if (pending_count < (int)(sizeof(pending_pcm) / sizeof(pending_pcm[0]))) {
+                        pending_pcm[pending_count++] = pcm;
+                    }
+                }
+
+            }
+        }
+
+        // [DEBUG] HEARTBEAT — raw printf, fires every 30ms hop
+        if (dbg_loop_count % 50 == 0) {
+            printf("[DEBUG] HEARTBEAT loop=%lu bytes_read=%lu streaming=%d\n",
+                   (unsigned long)dbg_loop_count, (unsigned long)(hop_samples * sizeof(int16_t)), (int)streaming_active);
+            fflush(stdout);
         }
 
         // 2. Write into ring buffer
@@ -383,6 +431,10 @@ static void inference_task(void* arg) {
             ring_write_pos = (ring_write_pos + 1) % AUDIO_BUFFER_SAMPLES;
         }
         xSemaphoreGive(ring_mutex);
+        if (valid_ring_samples < AUDIO_BUFFER_SAMPLES) {
+            valid_ring_samples += hop_samples;
+            continue;  // Do not classify a partly zero/uninitialised startup window.
+        }
 
         // Pause I2S reads while streaming_task is live-streaming audio to server.
         // This prevents the two tasks from racing on the I2S FIFO.
@@ -392,18 +444,15 @@ static void inference_task(void* arg) {
         }
 
         // 3. Lightweight VAD: skip inference on silence (saves ~9% CPU)
-        // VAD DISABLED for diagnosis — re-enable once keyword is working:
-        // int64_t sum_sq = 0;
-        // for (int i = 0; i < hop_samples; i++) sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
-        // float rms = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
-        // if (rms < 0.003f) continue;
         int64_t sum_sq = 0;
         for (int i = 0; i < hop_samples; i++) sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
         float rms = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
+        if (rms < 0.015f) {
+            consecutive_hits = 0;
+            continue;
+        }
 
-        // 4. Linearise ring buffer → 1-second window (heap alloc: 32KB, too big for 8KB stack)
-        int16_t* audio_window = (int16_t*)malloc(AUDIO_BUFFER_SAMPLES * sizeof(int16_t));
-        if (!audio_window) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        // 4. Linearise ring buffer → 1-second window (uses static buffer, no malloc needed)
         xSemaphoreTake(ring_mutex, portMAX_DELAY);
         int start = ring_write_pos;
         for (int i = 0; i < AUDIO_BUFFER_SAMPLES; i++) {
@@ -413,7 +462,6 @@ static void inference_task(void* arg) {
 
         // 5. MFCC + TFLite inference
         mfcc_proc.compute(audio_window, mfcc_output);
-        free(audio_window);
 
         float in_scale  = input_tensor->params.scale;
         int32_t in_zp   = input_tensor->params.zero_point;
@@ -431,25 +479,31 @@ static void inference_task(void* arg) {
         float out_scale   = output_tensor->params.scale;
         int32_t out_zp    = output_tensor->params.zero_point;
         int8_t* out_data  = output_tensor->data.int8;
+        float not_kw_prob = (out_data[0] - out_zp) * out_scale;
         float kw_prob     = (out_data[1] - out_zp) * out_scale;
 
         infer_count++;
         infer_total_ms += infer_us / 1000.0f;
-        // Log EVERY inference — mic RMS + kw_prob for full diagnosis
-        if (infer_count % 10 == 0) {
-            ESP_LOGI(TAG_INF, "[diag] #%lu | mic_rms=%.4f | kw_prob=%.4f | threshold=%.2f%s",
-                     (unsigned long)infer_count, rms, kw_prob,
-                     (float)DETECT_THRESHOLD,
-                     kw_prob >= DETECT_THRESHOLD ? " 🔔 TRIGGER!" : "");
+        bool model_hit = kw_prob >= DETECT_THRESHOLD;
+        consecutive_hits = model_hit ? consecutive_hits + 1 : 0;
+        if (infer_count % 10 == 0 || consecutive_hits > 0) {
+            const char* state = consecutive_hits >= DETECTION_HITS_REQUIRED
+                                    ? "KEYWORD CONFIRMED"
+                                    : "NOT DETECTED";
+            ESP_LOGI(TAG_INF,
+                     "[KWS] #%lu %s | hey_vaani=%.3f not_keyword=%.3f | rms=%.3f | hits=%d/%d",
+                     (unsigned long)infer_count, state, kw_prob, not_kw_prob, rms,
+                     consecutive_hits, DETECTION_HITS_REQUIRED);
         }
 
         // 6. Keyword detected
-        if (kw_prob >= DETECT_THRESHOLD) {
+        if (consecutive_hits >= DETECTION_HITS_REQUIRED) {
             // Capture keyword_end timestamp using ESP32 monotonic clock (NO NTP needed)
             int64_t keyword_end_us = esp_timer_get_time();
             ESP_LOGI(TAG_INF, "🔔 HEY VAANI DETECTED! prob=%.3f  keyword_end_us=%lld",
                      kw_prob, keyword_end_us);
             xQueueSend(detect_queue, &keyword_end_us, 0);
+            consecutive_hits = 0;
             vTaskDelay(pdMS_TO_TICKS(3000));  // cool-down
         }
     }
@@ -641,9 +695,9 @@ extern "C" void app_main() {
 
     // Spawn FreeRTOS tasks
     xTaskCreatePinnedToCore(inference_task, "inference",
-        48000, NULL, 5, NULL, 1);   // Core 1, high priority — needs 48KB for audio buffers
+       8192, NULL, 5, NULL, 1);   // Core 1, 8KB stack
     xTaskCreatePinnedToCore(streaming_task, "streaming",
-        8192, NULL, 4, NULL, 0);   // Core 0, medium priority
+       8192, NULL, 4, NULL, 0);   // Core 0, 8KB stack (INCREASED to fix stack overflow corrupting core 1)
 
     ESP_LOGI(TAG_MAIN, "All tasks started. Listening for 'Hey Vaani'...");
 }

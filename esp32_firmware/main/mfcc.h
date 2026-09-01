@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#include "esp_log.h"
 
 // ─── Constants (must match train_model.py) ───────────────────────────────────
 #define MFCC_SAMPLE_RATE   16000
@@ -38,8 +39,8 @@
 // ─── MFCC Processor Class ────────────────────────────────────────────────────
 class MFCCProcessor {
 public:
-    // Pre-computed mel filterbank [N_MEL][N_FFT/2+1] — computed once at init
-    float mel_filters[MFCC_N_MEL][MFCC_N_FFT / 2 + 1];
+    // Mel filterbank — heap-allocated once in init() to save 40KB DRAM
+    float (*mel_filters)[MFCC_N_FFT / 2 + 1];
 
     // Working buffers (allocated once to avoid stack overflow)
     float  window[MFCC_N_FFT];       // Hann window coefficients
@@ -56,6 +57,12 @@ public:
         for (int i = 0; i < MFCC_N_FFT; i++) {
             window[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / MFCC_N_FFT));
         }
+        // Allocate mel filterbank from heap (40KB, saved from DRAM)
+        mel_filters = (float (*)[MFCC_N_FFT / 2 + 1])malloc(MFCC_N_MEL * (MFCC_N_FFT / 2 + 1) * sizeof(float));
+        if (!mel_filters) {
+            printf("[MFCC] FATAL: mel_filters malloc failed\n");
+            fflush(stdout);
+        }
         _build_mel_filters();
     }
 
@@ -64,21 +71,14 @@ public:
     // output:      float[MFCC_N_FRAMES * MFCC_N_MFCC] = float[637]
     //              Layout: row-major [frame][coeff] matching TF tensor [49,13]
     void compute(const int16_t* audio_int16, float* output) {
-        // Normalise int16 → float32 [-1.0, 1.0] (heap allocated to prevent 64KB stack overflow)
-        float* audio_f32 = (float*)malloc(MFCC_AUDIO_SAMPLES * sizeof(float));
-        if (!audio_f32) return;
-        for (int i = 0; i < MFCC_AUDIO_SAMPLES; i++) {
-            audio_f32[i] = (float)audio_int16[i] / 32768.0f;
-        }
-
-        // Sliding window STFT → mel → log → DCT
+        // Convert int16 → float and apply Hann window per-frame (no 64KB buffer needed)
         int frame_idx = 0;
         for (int start = 0; start + MFCC_N_FFT <= MFCC_AUDIO_SAMPLES && frame_idx < MFCC_N_FRAMES;
              start += MFCC_HOP_LENGTH, frame_idx++) {
 
-            // Apply Hann window
+            // Convert + window in one pass (replaces old 64KB audio_f32 buffer)
             for (int i = 0; i < MFCC_N_FFT; i++) {
-                fft_real[i] = audio_f32[start + i] * window[i];
+                fft_real[i] = ((float)audio_int16[start + i] / 32768.0f) * window[i];
                 fft_imag[i] = 0.0f;
             }
 
@@ -105,9 +105,10 @@ public:
                 log_mel[m] = logf(mel_energy[m] + MFCC_EPSILON);
             }
 
-            // DCT-II (normalised): matches tf.signal.mfccs_from_log_mel_spectrograms
-            // x[n] = (2/N) * sum_{m=0}^{N-1} log_mel[m] * cos(pi*n*(m+0.5)/N)
-            // with orthonormal scaling (n=0 uses 1/sqrt(4N), others 1/sqrt(2N))
+            // DCT-II: matches tf.signal.mfccs_from_log_mel_spectrograms.
+            // TensorFlow's MFCC helper uses a non-orthonormal DCT-II and then
+            // applies sqrt(1 / (2 * N)).  With the sum-only form below that is
+            // sqrt(2 / N) for every coefficient, including c0.
             _dct_ii_normalized(log_mel, dct_out, MFCC_N_MEL, MFCC_N_MFCC);
 
             // Write to output [frame_idx * N_MFCC .. frame_idx * N_MFCC + N_MFCC]
@@ -123,7 +124,6 @@ public:
             for (int c = 0; c < MFCC_N_MFCC; c++) row[c] = 0.0f;
         }
 
-        free(audio_f32);
     }
 
 private:
@@ -172,12 +172,7 @@ private:
             for (int m = 0; m < N_in; m++) {
                 sum += x[m] * cosf(M_PI * n * (m + 0.5f) / N_in);
             }
-            // Orthonormal scaling: matches TF DCT-II with norm='ortho'
-            if (n == 0) {
-                out[n] = sum * sqrtf(1.0f / (4.0f * N_in));
-            } else {
-                out[n] = sum * sqrtf(1.0f / (2.0f * N_in));
-            }
+            out[n] = sum * sqrtf(2.0f / N_in);
         }
     }
 
