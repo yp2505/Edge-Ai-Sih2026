@@ -94,7 +94,7 @@
 #define ADC_DMA_BUF_LEN     512
 
 // ─── Keyword Detection ────────────────────────────────────────────────────────
-#define DETECT_THRESHOLD    0.45f
+#define DETECT_THRESHOLD    0.20f  // Lowered for diagnosis — raise to 0.70 once working
 #define SLIDE_STEP_MS       30
 #define COMMAND_DURATION_MS 2000
 #define AUDIO_BUFFER_SAMPLES 16000   // 1 second ring buffer
@@ -392,10 +392,14 @@ static void inference_task(void* arg) {
         }
 
         // 3. Lightweight VAD: skip inference on silence (saves ~9% CPU)
+        // VAD DISABLED for diagnosis — re-enable once keyword is working:
+        // int64_t sum_sq = 0;
+        // for (int i = 0; i < hop_samples; i++) sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
+        // float rms = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
+        // if (rms < 0.003f) continue;
         int64_t sum_sq = 0;
         for (int i = 0; i < hop_samples; i++) sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
         float rms = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
-        if (rms < 0.003f) continue;
 
         // 4. Linearise ring buffer → 1-second window (heap alloc: 32KB, too big for 8KB stack)
         int16_t* audio_window = (int16_t*)malloc(AUDIO_BUFFER_SAMPLES * sizeof(int16_t));
@@ -431,11 +435,12 @@ static void inference_task(void* arg) {
 
         infer_count++;
         infer_total_ms += infer_us / 1000.0f;
-        if (kw_prob > 0.15f) {
-            ESP_LOGI(TAG_INF, "🎤 Speech detected — kw_prob: %.3f (threshold: %.2f)", kw_prob, DETECT_THRESHOLD);
-        } else if (infer_count % 100 == 0) {
-            ESP_LOGI(TAG_INF, "avg inference: %.1f ms | kw_prob: %.3f",
-                     infer_total_ms / infer_count, kw_prob);
+        // Log EVERY inference — mic RMS + kw_prob for full diagnosis
+        if (infer_count % 10 == 0) {
+            ESP_LOGI(TAG_INF, "[diag] #%lu | mic_rms=%.4f | kw_prob=%.4f | threshold=%.2f%s",
+                     (unsigned long)infer_count, rms, kw_prob,
+                     (float)DETECT_THRESHOLD,
+                     kw_prob >= DETECT_THRESHOLD ? " 🔔 TRIGGER!" : "");
         }
 
         // 6. Keyword detected

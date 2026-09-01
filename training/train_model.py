@@ -140,11 +140,18 @@ def prepare_dataset(max_negative=5000):
     keyword_dir = os.path.join(DATA_DIR, "keyword")
     augmented_dir = os.path.join(DATA_DIR, "keyword_augmented")
     
+    hw_augmented_dir = os.path.join(DATA_DIR, "keyword_hw")  # MAX4466 domain-adapted samples
+
     keyword_files = []
     if os.path.exists(augmented_dir):
         keyword_files += glob.glob(os.path.join(augmented_dir, "*.wav"))
     if os.path.exists(keyword_dir) and not keyword_files:
         keyword_files += glob.glob(os.path.join(keyword_dir, "*.wav"))
+    # Always include hardware-augmented samples if available (critical for MAX4466 accuracy)
+    if os.path.exists(hw_augmented_dir):
+        hw_files = glob.glob(os.path.join(hw_augmented_dir, "*.wav"))
+        keyword_files += hw_files
+        print(f"  ✅ Hardware-augmented (MAX4466) samples: {len(hw_files)}")
     
     print(f"  Loading {len(keyword_files)} keyword samples...")
     for filepath in keyword_files:

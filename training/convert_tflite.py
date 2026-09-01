@@ -65,8 +65,12 @@ def get_representative_dataset():
     keyword_dir = os.path.join(DATA_DIR, "keyword_augmented")
     background_dir = os.path.join(DATA_DIR, "background")
     
+    keyword_hw_dir = os.path.join(DATA_DIR, "keyword_hw")  # MAX4466 hardware samples
+
     all_files = []
-    if os.path.exists(keyword_dir):
+    if os.path.exists(keyword_hw_dir):
+        all_files += glob.glob(os.path.join(keyword_hw_dir, "*.wav"))[:150]
+    elif os.path.exists(keyword_dir):
         all_files += glob.glob(os.path.join(keyword_dir, "*.wav"))[:100]
     if os.path.exists(background_dir):
         all_files += glob.glob(os.path.join(background_dir, "*.wav"))[:100]
