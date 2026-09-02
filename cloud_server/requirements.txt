@@ -8,5 +8,5 @@ soundfile>=0.12.0            # WAV read/write for --test mode
 
 # ── Edge Inference (edge_inference.py on RPi/laptop for testing) ──────────────
 sounddevice>=0.4.6           # Microphone capture
-tflite-runtime>=2.14.0       # Lightweight TFLite (no full TensorFlow needed)
-# OR: tensorflow>=2.13.0    # Full TensorFlow (if tflite-runtime unavailable)
+# tflite-runtime>=2.14.0       # Lightweight TFLite (no full TensorFlow needed)
+tensorflow>=2.13.0    # Full TensorFlow (if tflite-runtime unavailable)

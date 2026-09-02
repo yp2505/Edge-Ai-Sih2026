@@ -24,6 +24,13 @@ Install:
 
 import os
 import sys
+
+# Force UTF-8 encoding on Windows to prevent UnicodeEncodeError with emojis
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import time
 import json
 import struct
@@ -113,6 +120,21 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self): self._send_json({})
 
+    def do_POST(self):
+        if self.path.split("?")[0] != "/api/telemetry":
+            self._send_json({"error": "not found"}, status=404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(data, dict): raise ValueError("expected object")
+            data["received_at"] = datetime.now().isoformat()
+            asr = self.server.asr_server
+            with asr._lock: asr.telemetry = data
+            self._send_json({"ok": True})
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=400)
+
     def do_GET(self):
         asr: "ASRServer" = self.server.asr_server
         path = self.path.split("?")[0]
@@ -125,6 +147,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 "session_count":  count,
                 "asr_engine":     f"faster-whisper-{asr.whisper_model}",
             })
+        elif path == "/api/telemetry":
+            with asr._lock:
+                telemetry = dict(asr.telemetry)
+            self._send_json(telemetry)
         elif path == "/api/events":
             with asr._lock:
                 entries = list(asr.log_entries)
@@ -173,6 +199,7 @@ class ASRServer:
         self.start_time     = time.time()
         self._lock          = threading.Lock()
         self.log_entries: list = []
+        self.telemetry: dict = {}
 
     def start(self):
         self._load_whisper()
@@ -206,6 +233,15 @@ class ASRServer:
                 with self._lock:
                     self.session_count += 1
                     sid = self.session_count
+                    # Publish the on-device wake-word event before audio finishes streaming.
+                    self.log_entries.append({
+                        "session_id": sid,
+                        "timestamp": datetime.now().isoformat(),
+                        "client_ip": client_addr[0],
+                        "status": "wake_word_detected",
+                        "wake_word": "Hey Vaani",
+                    })
+                self._save_log()
                 print(f"  📡 [{sid}] Connection from {client_addr[0]}:{client_addr[1]}")
                 threading.Thread(
                     target=self._handle_client,
@@ -333,8 +369,11 @@ class ASRServer:
             transcript, avg_log_prob = self._transcribe(wav_path)
             transcribe_ms = int((time.time() - t_t0) * 1000)
 
-            end_to_end_ms  = kw_to_connect_ms + receive_gap_ms + transcribe_ms
+            # True end-to-end timing: wake-word detection through command-audio
+            # capture and Whisper completion. total_server_ms is measured on one
+            # clock, so it includes streaming, VAD, WAV save, and inference.
             total_server_ms = int(time.time() * 1000) - connection_accepted_ms
+            end_to_end_ms  = kw_to_connect_ms + total_server_ms
 
             print(f"\n  {'─' * 58}")
             print(f"  📝 [{session_id}] TRANSCRIPT: \"{transcript}\"")
@@ -364,6 +403,7 @@ class ASRServer:
                 "client_ip":              client_addr[0],
                 "audio_bytes":            len(audio_data),
                 "audio_duration_s":       round(audio_duration, 3),
+                "audio_capture_ms":       int(audio_duration * 1000),
                 "sample_rate":            sr,
                 "transcript":             transcript,
                 "avg_log_prob":           round(avg_log_prob, 4) if avg_log_prob else None,
@@ -378,9 +418,16 @@ class ASRServer:
                 "end_to_end_ms":          end_to_end_ms,
                 # latency_analyzer.py compatibility key
                 "cloud_receive_timestamp_ms": first_audio_byte_ms,
+                "status":                 "complete",
+                "wake_word":              "Hey Vaani",
             }
             with self._lock:
-                self.log_entries.append(log_entry)
+                for index, entry in enumerate(self.log_entries):
+                    if entry.get("session_id") == session_id:
+                        self.log_entries[index] = log_entry
+                        break
+                else:
+                    self.log_entries.append(log_entry)
             self._save_log()
 
         except Exception as e:

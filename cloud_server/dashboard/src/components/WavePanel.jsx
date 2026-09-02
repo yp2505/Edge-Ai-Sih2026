@@ -15,8 +15,8 @@ export default function WavePanel({ latestEvent, serverUp }) {
   const barsRef = useRef(Array(BAR_COUNT).fill(0.5))
 
   useEffect(() => {
-    if (latestEvent?.transcript) {
-      setTranscript(latestEvent.transcript)
+    if (latestEvent?.status === 'wake_word_detected' || latestEvent?.transcript) {
+      setTranscript(latestEvent.status === 'wake_word_detected' ? 'HEY VAANI DETECTED - listening for your command...' : latestEvent.transcript)
       setConfidence((92 + Math.random() * 6).toFixed(1))
       setSnr((22 + Math.random() * 4).toFixed(1))
       setIsActive(true)

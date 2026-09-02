@@ -105,8 +105,9 @@ export default function DetectionFeedNew({ events }) {
             </div>
 
             {evts.map((e, idx) => {
-              const total = (e.kw_to_connect_ms ?? 0) + (e.receive_gap_ms ?? 0) + (e.transcribe_ms ?? 0)
+              const total = e.end_to_end_ms ?? ((e.kw_to_connect_ms ?? 0) + (e.receive_gap_ms ?? 0) + (e.transcribe_ms ?? 0))
               const isNewest = name === 'Just Now' && idx === 0
+              const isWakeDetected = e.status === 'wake_word_detected'
 
               return (
                 <div
@@ -157,8 +158,12 @@ export default function DetectionFeedNew({ events }) {
                     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                     marginBottom: total > 0 ? 0 : 0,
                   }}>
-                    {e.transcript
-                      ? `"${e.transcript}"`
+                    {isWakeDetected
+                      ? <span style={{ color: 'var(--green)', fontWeight: 700 }}>HEY VAANI DETECTED - receiving command audio...</span>
+                      : e.transcript
+                      ? `"${isWakeDetected
+                      ? <span style={{ color: 'var(--green)', fontWeight: 700 }}>HEY VAANI DETECTED - receiving command audio...</span>
+                      : e.transcript}"`
                       : <em style={{ color: 'var(--t3)', fontSize: 11 }}>Processing…</em>
                     }
                   </div>

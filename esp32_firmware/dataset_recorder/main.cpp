@@ -90,7 +90,13 @@ static bool capture_clip(int16_t* output) {
         uint32_t bytes_read = 0;
         esp_err_t err = adc_continuous_read(adc_handle, raw, sizeof(raw), &bytes_read,
                                             pdMS_TO_TICKS(200));
-        if (err != ESP_OK || bytes_read == 0) continue;
+        if (err != ESP_OK || bytes_read == 0) {
+            // If the buffer overflowed (INVALID_STATE), or the ADC timed out/locked up,
+            // reset the ADC hardware to recover.
+            adc_continuous_stop(adc_handle);
+            adc_continuous_start(adc_handle);
+            continue;
+        }
 
         const int count = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
         for (int i = 0; i < count && written < RECORD_SAMPLES; ++i) {

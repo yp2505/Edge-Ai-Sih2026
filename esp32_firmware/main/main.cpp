@@ -59,6 +59,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 
 #include "lwip/sockets.h"
@@ -81,7 +82,7 @@
 #define CONFIG_WIFI_PASSWORD   "khush2073"
 #endif
 #ifndef CONFIG_SERVER_IP
-#define CONFIG_SERVER_IP       "10.247.236.173"
+#define CONFIG_SERVER_IP       "10.247.236.188"
 #endif
 #ifndef CONFIG_SERVER_PORT
 #define CONFIG_SERVER_PORT     5000
@@ -93,11 +94,21 @@
 #define ADC_SAMPLE_RATE     16000
 #define ADC_DMA_BUF_LEN     512
 
-// ─── Keyword Detection ────────────────────────────────────────────────────────
-#define DETECT_THRESHOLD    0.90f  // Tune only after collecting real-device validation audio
-#define DETECTION_HITS_REQUIRED 3  // Consecutive overlapping windows required to trigger
+// ─── TFLite Configuration ───────────────────────────────────────────────────────
+// A command session may start only after a high-confidence, sustained wake word.
+// The previous 85% / two-window setting was sensitive enough for mic noise to
+// start command streaming without anyone speaking.
+static const float DETECT_THRESHOLD = 0.90f;
+static const int   DETECTION_HITS_REQUIRED = 3;
+// Calibrate from the actual microphone after boot, then require speech that is
+// substantially louder than that noise floor before KWS can run.
+static const float MIN_SPEECH_RMS = 0.050f;
+static const float NOISE_FLOOR_MULTIPLIER = 2.5f;
+static const int   NOISE_CALIBRATION_FRAMES = 50;  // 1.5 seconds at 30 ms/hop
 #define SLIDE_STEP_MS       30
-#define COMMAND_DURATION_MS 2000
+#define COMMAND_DURATION_MS 4000  // Safety maximum; silence ends capture sooner
+#define COMMAND_MIN_DURATION_MS 700
+#define COMMAND_SILENCE_MS 450
 #define AUDIO_BUFFER_SAMPLES 16000   // 1 second ring buffer
 
 // ─── HVP1 Protocol (must match cloud_server/server.py) ───────────────────────
@@ -129,6 +140,11 @@ static volatile bool wifi_connected    = false;
 // Set true while streaming_task holds I2S to prevent inference_task racing on it.
 // Declared volatile for cross-core visibility (Core 0 ↔ Core 1).
 static volatile bool streaming_active  = false;
+static volatile uint32_t telemetry_inference_count = 0;
+static volatile float telemetry_inference_ms = 0.0f;
+static volatile float telemetry_keyword_confidence = 0.0f;
+static volatile float telemetry_mic_rms = 0.0f;
+static volatile float telemetry_noise_floor_rms = 0.0f;
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 static int16_t  audio_ring[AUDIO_BUFFER_SAMPLES];
@@ -144,8 +160,8 @@ static volatile uint32_t session_id = 0;
 // ─── Tensor Arena ─────────────────────────────────────────────────────────────
 // Measured arena_used_bytes() = 29136 bytes. 35KB gives ~20% safety margin.
 // Reduced from 54KB to 35KB to free DRAM for audio_window heap allocation.
-static const size_t TENSOR_ARENA_SIZE = 35 * 1024;
-static uint8_t tflite_arena[35 * 1024];
+static const size_t TENSOR_ARENA_SIZE = 32 * 1024;
+static uint8_t tflite_arena[32 * 1024];
 
 // TFLite objects
 static tflite::MicroMutableOpResolver<8> resolver;
@@ -157,8 +173,9 @@ static TfLiteTensor*                     output_tensor = nullptr;
 static adc_continuous_handle_t adc_handle = NULL;
 // EMA filter for DC offset removal (starts roughly mid-point of 12-bit ADC)
 static float adc_dc_offset = 2048.0f;
-// Scale up the centered 12-bit ADC to mimic a 16-bit PCM signal's dynamic range
-static const int ADC_TO_PCM_SHIFT = 4;
+// Shift 12-bit ADC to 16-bit PCM. Normal is 4.
+// We use 6 here to provide an automatic 4x software gain (volume boost).
+static const int ADC_TO_PCM_SHIFT = 6;
 
 // ─── MFCC processor ───────────────────────────────────────────────────────────
 static MFCCProcessor mfcc_proc;
@@ -367,6 +384,8 @@ static void inference_task(void* arg) {
     int      decimation_phase = 0;
     int      valid_ring_samples = 0;
     int      consecutive_hits = 0;
+    float    noise_floor_rms = 0.0f;
+    int      noise_calibration_frames = 0;
     // A DMA frame is 128 raw samples, while a 30 ms output hop needs 600 raw
     // samples.  Preserve the few valid samples left over from the final frame.
     int16_t  pending_pcm[ADC_DMA_BUF_LEN / SOC_ADC_DIGI_RESULT_BYTES];
@@ -374,6 +393,7 @@ static void inference_task(void* arg) {
 
     // ─── [DEBUG] Heartbeat counter (raw printf, bypasses ESP_LOG filtering) ─
     uint32_t dbg_loop_count = 0;
+    uint32_t last_raw_adc = 0;
 
     while (true) {
         dbg_loop_count++;
@@ -397,6 +417,7 @@ static void inference_task(void* arg) {
                 adc_digi_output_data_t *p =
                     (adc_digi_output_data_t*)&raw_buf[i * SOC_ADC_DIGI_RESULT_BYTES];
                 uint32_t raw_adc_val = p->type1.data;
+                last_raw_adc = raw_adc_val;
 
                 // Keep the DC estimator at the native 20 kHz rate.
                 adc_dc_offset = 0.005f * raw_adc_val + 0.995f * adc_dc_offset;
@@ -417,13 +438,6 @@ static void inference_task(void* arg) {
             }
         }
 
-        // [DEBUG] HEARTBEAT — raw printf, fires every 30ms hop
-        if (dbg_loop_count % 50 == 0) {
-            printf("[DEBUG] HEARTBEAT loop=%lu bytes_read=%lu streaming=%d\n",
-                   (unsigned long)dbg_loop_count, (unsigned long)(hop_samples * sizeof(int16_t)), (int)streaming_active);
-            fflush(stdout);
-        }
-
         // 2. Write into ring buffer
         xSemaphoreTake(ring_mutex, portMAX_DELAY);
         for (int i = 0; i < hop_samples; i++) {
@@ -436,6 +450,19 @@ static void inference_task(void* arg) {
             continue;  // Do not classify a partly zero/uninitialised startup window.
         }
 
+        // 3. Compute RMS for telemetry and VAD
+        int64_t sum_sq = 0;
+        for (int i = 0; i < hop_samples; i++) sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
+        float rms = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
+        telemetry_mic_rms = rms;
+
+        // Unconditional heartbeat every 5 frames so we don't miss it
+        if (dbg_loop_count % 5 == 0) {
+            printf("[DBG] loop=%lu rms=%.5f raw=%lu dc=%.1f streaming=%d\n",
+                   (unsigned long)dbg_loop_count, rms, (unsigned long)last_raw_adc, (float)adc_dc_offset, (int)streaming_active);
+            fflush(stdout);
+        }
+
         // Pause I2S reads while streaming_task is live-streaming audio to server.
         // This prevents the two tasks from racing on the I2S FIFO.
         if (streaming_active) {
@@ -443,11 +470,24 @@ static void inference_task(void* arg) {
             continue;
         }
 
-        // 3. Lightweight VAD: skip inference on silence (saves ~9% CPU)
-        int64_t sum_sq = 0;
-        for (int i = 0; i < hop_samples; i++) sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
-        float rms = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
-        if (rms < 0.015f) {
+        // 4. Learn the installed microphone's idle noise level before enabling
+        // wake-word inference. This prevents a noisy or floating MAX4466 output
+        // from being mistaken for a spoken command after every restart.
+        if (noise_calibration_frames < NOISE_CALIBRATION_FRAMES) {
+            noise_floor_rms += (rms - noise_floor_rms) /
+                               (float)(++noise_calibration_frames);
+            telemetry_noise_floor_rms = noise_floor_rms;
+            consecutive_hits = 0;
+            continue;
+        }
+
+        // Track only sub-threshold audio as background noise. Speech cannot
+        // raise the gate while a person is talking.
+        float speech_rms_threshold = fmaxf(MIN_SPEECH_RMS,
+                                            noise_floor_rms * NOISE_FLOOR_MULTIPLIER);
+        if (rms < speech_rms_threshold) {
+            noise_floor_rms = 0.02f * rms + 0.98f * noise_floor_rms;
+            telemetry_noise_floor_rms = noise_floor_rms;
             consecutive_hits = 0;
             continue;
         }
@@ -484,27 +524,34 @@ static void inference_task(void* arg) {
 
         infer_count++;
         infer_total_ms += infer_us / 1000.0f;
+        telemetry_inference_count = telemetry_inference_count + 1;
+        telemetry_inference_ms += infer_us / 1000.0f;
+        telemetry_keyword_confidence = kw_prob;
         bool model_hit = kw_prob >= DETECT_THRESHOLD;
         consecutive_hits = model_hit ? consecutive_hits + 1 : 0;
-        if (infer_count % 10 == 0 || consecutive_hits > 0) {
-            const char* state = consecutive_hits >= DETECTION_HITS_REQUIRED
-                                    ? "KEYWORD CONFIRMED"
-                                    : "NOT DETECTED";
-            ESP_LOGI(TAG_INF,
-                     "[KWS] #%lu %s | hey_vaani=%.3f not_keyword=%.3f | rms=%.3f | hits=%d/%d",
-                     (unsigned long)infer_count, state, kw_prob, not_kw_prob, rms,
-                     consecutive_hits, DETECTION_HITS_REQUIRED);
-        }
 
-        // 6. Keyword detected
         if (consecutive_hits >= DETECTION_HITS_REQUIRED) {
-            // Capture keyword_end timestamp using ESP32 monotonic clock (NO NTP needed)
+            // 6. Keyword detected
             int64_t keyword_end_us = esp_timer_get_time();
-            ESP_LOGI(TAG_INF, "🔔 HEY VAANI DETECTED! prob=%.3f  keyword_end_us=%lld",
-                     kw_prob, keyword_end_us);
+            printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+            printf("║  🟢 🔔 KEYWORD CONFIRMED: \"Hey Vaani\" (Confidence: %5.1f%%)  ║\n", kw_prob * 100.0f);
+            printf("║  📡 Streaming 4s command audio to Cloud Whisper Server...    ║\n");
+            printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+            fflush(stdout);
+
             xQueueSend(detect_queue, &keyword_end_us, 0);
             consecutive_hits = 0;
-            vTaskDelay(pdMS_TO_TICKS(3000));  // cool-down
+            vTaskDelay(pdMS_TO_TICKS(1000));  // short re-arm delay
+        } else if (consecutive_hits > 0) {
+            printf("  [⚡ Analyzing Match] Frame %d/%d (Confidence: %.1f%%)...\n",
+                   consecutive_hits, DETECTION_HITS_REQUIRED, kw_prob * 100.0f);
+            fflush(stdout);
+        } else if (kw_prob >= 0.30f) {
+            printf("  [🎙️ Voice Detected] Confidence: %.1f%% (Threshold: 50.0%%)\n", kw_prob * 100.0f);
+            fflush(stdout);
+        } else if (infer_count % 20 == 0) {
+            printf("  [🎙️ Listening] Audio RMS: %.4f | Peak Conf: %.1f%%\n", rms, kw_prob * 100.0f);
+            fflush(stdout);
         }
     }
 }
@@ -608,32 +655,58 @@ static void streaming_task(void* arg) {
         //    so both tasks don't race on the ADC ring buffer.
         streaming_active = true;
 
-        const int CHUNK_SAMPLES = 480;   // 30ms at 16kHz — matches server recv buffer
-        uint8_t raw_buf[CHUNK_SAMPLES * 4];
+        // Convert 20kHz ADC input to the 16kHz PCM declared in HVP1. This
+        // keeps Whisper timing correct and produces a true 30ms chunk.
+        const int CHUNK_SAMPLES = 480;
+        const int RAW_CHUNK_SAMPLES = 600;
+        uint8_t raw_buf[RAW_CHUNK_SAMPLES * SOC_ADC_DIGI_RESULT_BYTES];
         int16_t pcm16[CHUNK_SAMPLES];
-        TickType_t deadline   = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
+        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
         int total_sent = 0;
+        int streamed_ms = 0;
+        int consecutive_silence_ms = 0;
+        int decimation_phase = 0;
 
         while (xTaskGetTickCount() < deadline) {
             uint32_t bytes_read = 0;
-            adc_continuous_read(adc_handle, raw_buf, CHUNK_SAMPLES * SOC_ADC_DIGI_RESULT_BYTES,
-                                &bytes_read, pdMS_TO_TICKS(50));
-            int got = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
-            for (int i = 0; i < got; i++) {
+            esp_err_t read_err = adc_continuous_read(adc_handle, raw_buf, sizeof(raw_buf),
+                                                     &bytes_read, pdMS_TO_TICKS(50));
+            if (read_err != ESP_OK || bytes_read == 0) continue;
+
+            int output_samples = 0;
+            int raw_samples = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
+            for (int i = 0; i < raw_samples && output_samples < CHUNK_SAMPLES; i++) {
                 adc_digi_output_data_t *p = (adc_digi_output_data_t*)&raw_buf[i * SOC_ADC_DIGI_RESULT_BYTES];
                 uint32_t raw_adc_val = p->type1.data;
                 adc_dc_offset = 0.005f * raw_adc_val + 0.995f * adc_dc_offset;
                 int16_t centered = (int16_t)(raw_adc_val - adc_dc_offset);
-                pcm16[i] = (int16_t)(centered << ADC_TO_PCM_SHIFT);
+                bool keep_sample = decimation_phase != 4;
+                decimation_phase = (decimation_phase + 1) % 5;
+                if (keep_sample) pcm16[output_samples++] = (int16_t)(centered << ADC_TO_PCM_SHIFT);
             }
-            if (got > 0) {
-                int sent_bytes = send(sock, pcm16, got * sizeof(int16_t), 0);
-                if (sent_bytes < 0) {
-                    ESP_LOGE(TAG_STR, "[Session %lu] send() failed — server gone?",
-                             (unsigned long)sid);
+            if (output_samples == 0) continue;
+
+            int sent_bytes = send(sock, pcm16, output_samples * sizeof(int16_t), 0);
+            if (sent_bytes < 0) {
+                ESP_LOGE(TAG_STR, "[Session %lu] send() failed � server gone?", (unsigned long)sid);
+                break;
+            }
+            total_sent += output_samples;
+            int chunk_ms = output_samples * 1000 / ADC_SAMPLE_RATE;
+            streamed_ms += chunk_ms;
+
+            int64_t sum_sq = 0;
+            for (int i = 0; i < output_samples; i++) sum_sq += (int64_t)pcm16[i] * pcm16[i];
+            float chunk_rms = sqrtf((float)sum_sq / output_samples) / 32768.0f;
+            float silence_threshold = fmaxf(0.025f, telemetry_noise_floor_rms * 1.5f);
+            if (streamed_ms >= COMMAND_MIN_DURATION_MS) {
+                consecutive_silence_ms = chunk_rms < silence_threshold
+                    ? consecutive_silence_ms + chunk_ms : 0;
+                if (consecutive_silence_ms >= COMMAND_SILENCE_MS) {
+                    ESP_LOGI(TAG_STR, "[Session %lu] Command ended on silence after %dms",
+                             (unsigned long)sid, streamed_ms);
                     break;
                 }
-                total_sent += got;
             }
         }
 
@@ -654,12 +727,60 @@ static void streaming_task(void* arg) {
                 close(sock);
                 sock = -1;
 
-                ESP_LOGI(TAG_STR, "[Session %lu] Response: %s",
-                         (unsigned long)sid, resp_len > 0 ? resp : "[no response]");
+                printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+                printf("║  📝 CLOUD WHISPER TRANSCRIPTION:                             ║\n");
+                printf("║  → %-56s  ║\n", resp_len > 0 ? resp : "[no response from server]");
+                printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+                fflush(stdout);
         }
     }
 }
 
+// Sends measured ESP32 health data once per second. This is deliberately low-rate:
+// the microphone and wake-word model run continuously, while telemetry must not
+// consume the CPU budget reserved for inference.
+static void telemetry_task(void* arg) {
+    float previous_ms = 0.0f;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!wifi_connected) continue;
+        wifi_ap_record_t ap = {};
+        int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
+        uint32_t count = telemetry_inference_count;
+        float total_ms = telemetry_inference_ms;
+        float duty_pct = total_ms >= previous_ms ? (total_ms - previous_ms) / 10.0f : 0.0f;
+        previous_ms = total_ms;
+        uint32_t heap_total = heap_caps_get_total_size(MALLOC_CAP_8BIT);
+        uint32_t heap_free = esp_get_free_heap_size();
+        uint32_t heap_min = esp_get_minimum_free_heap_size();
+        char body[512];
+        int body_len = snprintf(body, sizeof(body),
+            "{\"device\":\"esp32\",\"uptime_ms\":%llu,\"free_heap_bytes\":%lu,\"min_free_heap_bytes\":%lu,\"heap_total_bytes\":%lu,\"tflite_arena_bytes\":%u,\"audio_buffer_bytes\":%u,\"keyword_confidence\":%.4f,\"mic_rms\":%.5f,\"inference_count\":%lu,\"inference_duty_pct\":%.3f,\"wifi_rssi_dbm\":%d,\"streaming\":%s}",
+            (unsigned long long)(esp_timer_get_time() / 1000), (unsigned long)heap_free,
+            (unsigned long)heap_min, (unsigned long)heap_total, (unsigned)TENSOR_ARENA_SIZE,
+            (unsigned)(sizeof(audio_ring) + sizeof(audio_window)), telemetry_keyword_confidence,
+            telemetry_mic_rms, (unsigned long)count, duty_pct, rssi, streaming_active ? "true" : "false");
+        if (body_len <= 0 || body_len >= (int)sizeof(body)) continue;
+        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (sock < 0) continue;
+        
+        // 200ms connection and send timeout to prevent blocking
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        struct sockaddr_in addr = {};
+        addr.sin_family = AF_INET; addr.sin_port = htons(8080);
+        inet_pton(AF_INET, CONFIG_SERVER_IP, &addr.sin_addr);
+        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            char request[700];
+            int request_len = snprintf(request, sizeof(request),
+                "POST /api/telemetry HTTP/1.1\r\nHost: esp32\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", body_len, body);
+            if (request_len > 0 && request_len < (int)sizeof(request)) send(sock, request, request_len, 0);
+        }
+        close(sock);
+    }
+}
 // ─── app_main ─────────────────────────────────────────────────────────────────
 extern "C" void app_main() {
     ESP_LOGI(TAG_MAIN, "=== Hey Vaani Edge Firmware (SIH 2026) ===");
@@ -682,8 +803,8 @@ extern "C" void app_main() {
     tflite_init();
     mfcc_proc.init();
 
-    // CPU load benchmark (logs every 10 sec)
-    benchmark_cpu_start();
+    // CPU load benchmark (disabled to keep terminal output clean)
+    // benchmark_cpu_start();
 
     // Log firmware memory footprint
     ESP_LOGI(TAG_MAIN, "Model size (flash): %u bytes (%.1f KB)",
@@ -693,11 +814,13 @@ extern "C" void app_main() {
     ESP_LOGI(TAG_MAIN, "Free heap after init: %u bytes",
              (unsigned)esp_get_free_heap_size());
 
-    // Spawn FreeRTOS tasks
+    // Spawn FreeRTOS tasks (24KB stack for inference to support TFLite operators safely)
     xTaskCreatePinnedToCore(inference_task, "inference",
-       8192, NULL, 5, NULL, 1);   // Core 1, 8KB stack
+       24576, NULL, 5, NULL, 1);   // Core 1, 24KB stack
     xTaskCreatePinnedToCore(streaming_task, "streaming",
-       8192, NULL, 4, NULL, 0);   // Core 0, 8KB stack (INCREASED to fix stack overflow corrupting core 1)
+       8192, NULL, 4, NULL, 0);    // Core 0, 8KB stack
+    xTaskCreatePinnedToCore(telemetry_task, "telemetry",
+       4096, NULL, 1, NULL, 0);    // Core 0, 4KB stack
 
     ESP_LOGI(TAG_MAIN, "All tasks started. Listening for 'Hey Vaani'...");
 }

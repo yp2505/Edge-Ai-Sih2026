@@ -1,0 +1,210 @@
+ets Jul 29 2019 12:21:46
+
+rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+configsip: 0, SPIWP:0xee
+clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+mode:DIO, clock div:2
+load:0x3fff0040,len:6272
+load:0x40078000,len:15824
+load:0x40080400,len:3988
+entry 0x4008063c
+I (27) boot: ESP-IDF 6.1.0 2nd stage bootloader
+I (27) boot: compile time Sep  2 2026 08:15:07
+I (28) boot: Multicore bootloader
+I (29) boot: chip revision: v3.1
+I (31) boot.esp32: SPI Speed      : 40MHz
+I (35) boot.esp32: SPI Mode       : DIO
+I (39) boot.esp32: SPI Flash Size : 4MB
+I (42) boot: Enabling RNG early entropy source...
+I (47) boot: Partition Table:
+I (49) boot: ## Label            Usage          Type ST Offset   Length
+I (56) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (62) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (69) boot:  2 factory          factory app      00 00 00010000 00200000
+I (75) boot: End of partition table
+I (79) esp_image: segment 0: paddr=00010020 vaddr=3f400020 size=2c9a4h (182692) map
+I (151) esp_image: segment 1: paddr=0003c9cc vaddr=3ffb0000 size=0364ch ( 13900) load
+I (157) esp_image: segment 2: paddr=00040020 vaddr=400d0020 size=a5474h (676980) map
+I (398) esp_image: segment 3: paddr=000e549c vaddr=3ffb364c size=01050h (  4176) load
+I (400) esp_image: segment 4: paddr=000e64f4 vaddr=40080000 size=16374h ( 90996) load
+I (440) esp_image: segment 5: paddr=000fc870 vaddr=50000000 size=00028h (    40) load
+I (451) boot: Loaded app from partition at offset 0x10000
+I (451) boot: Disabling RNG early entropy source...
+I (462) cpu_start: Multicore app
+I (470) cpu_start: GPIO 3 and 1 are used as console UART I/O pins
+I (471) cpu_start: Pro cpu start user code
+I (471) cpu_start: cpu freq: 160000000 Hz
+I (472) app_init: Application information:
+I (476) app_init: Project name:     hey_vaani_kws
+I (481) app_init: App version:      6b08568-dirty
+I (485) app_init: Compile time:     Sep  2 2026 08:12:59
+I (490) app_init: ELF file SHA256:  2bf17b7bc...
+I (494) app_init: ESP-IDF:          6.1.0
+I (498) efuse_init: Min chip rev:     v0.0
+I (502) efuse_init: Max chip rev:     v3.99 
+I (506) efuse_init: Chip rev:         v3.1
+I (510) heap_init: Initializing. RAM available for dynamic allocation:
+I (516) heap_init: At 3FFAE6E0 len 00001920 (6 KiB): DRAM
+I (521) heap_init: At 3FFD39E8 len 0000C618 (49 KiB): DRAM
+I (526) heap_init: At 3FFE0440 len 00003AE0 (14 KiB): D/IRAM
+I (532) heap_init: At 3FFE4350 len 0001BCB0 (111 KiB): D/IRAM
+I (537) heap_init: At 40096374 len 00009C8C (39 KiB): IRAM
+W (544) spi_flash: Detected boya flash chip but using generic driver. For optimal functionality, enable `SPI_FLASH_SUPPORT_BOYA_CHIP` in menuconfig
+I (556) spi_flash: detected chip: generic
+I (559) spi_flash: flash io: dio
+I (564) main_task: Started on CPU0
+I (564) main_task: Calling app_main()
+I (564) MAIN: === Hey Vaani Edge Firmware (SIH 2026) ===
+I (604) wifi:wifi driver task: 3ffdbe7c, prio:23, stack:6656, core=0
+I (614) wifi:wifi firmware version: e12a754
+I (614) wifi:wifi certification version: v7.0
+I (614) wifi:config NVS flash: enabled
+I (614) wifi:config nano formatting: disabled
+I (624) wifi:Init data frame dynamic rx buffer num: 32
+I (624) wifi:Init static rx mgmt buffer num: 5
+I (634) wifi:Init management short buffer num: 32
+I (634) wifi:Init dynamic tx buffer num: 32
+I (634) wifi:Init static rx buffer size: 1600
+I (644) wifi:Init static rx buffer num: 10
+I (644) wifi:Init dynamic rx buffer num: 32
+I (654) wifi_init: rx ba win: 6
+I (654) wifi_init: accept mbox: 6
+I (654) wifi_init: tcpip mbox: 32
+I (654) wifi_init: udp mbox: 6
+I (664) wifi_init: tcp mbox: 6
+I (664) wifi_init: tcp tx win: 5760
+I (664) wifi_init: tcp rx win: 5760
+I (674) wifi_init: tcp mss: 1440
+I (674) wifi_init: WiFi IRAM OP enabled
+I (674) wifi_init: WiFi RX IRAM OP enabled
+W (684) wifi:Password length matches WPA2 standards, authmode threshold changes from OPEN to WPA2
+I (694) phy_init: phy_version 4863,a3a4459,Oct 28 2025,14:30:06
+I (774) wifi:mode : sta (20:50:0d:30:67:90)
+I (774) wifi:enable tsf
+I (794) wifi:new:<6,0>, old:<1,0>, ap:<255,255>, sta:<6,0>, prof:1, snd_ch_cfg:0x0
+I (794) wifi:state: init -> auth (0xb0)
+I (814) wifi:state: auth -> assoc (0x0)
+I (814) wifi:state: assoc -> run (0x10)
+I (824) wifi:state: run -> init (0x2c0)
+W (834) WIFI: WiFi lost — retry 1/10
+I (3224) wifi:state: init -> auth (0xb0)
+I (3234) wifi:state: auth -> assoc (0x0)
+I (3244) wifi:state: assoc -> run (0x10)
+I (3274) wifi:connected with Khush's A55, aid = 1, channel 6, BW20, bssid = 1a:fa:c4:86:cd:87
+I (3274) wifi:security: WPA2-PSK, phy: bgn, rssi: -7, cipher(pairwise:0x3, group:0x3), pmf:0
+I (3284) wifi:pm start, type: 1
+
+I (3284) wifi:dp: 1, bi: 102400, li: 3, scale listen interval from 307200 us to 307200 us
+I (3294) wifi:dp: 2, bi: 102400, li: 4, scale listen interval from 307200 us to 409600 us
+I (3294) wifi:AP's beacon interval = 102400 us, DTIM period = 2
+I (3314) wifi:<ba-add>idx:0 (ifx:0, 1a:fa:c4:86:cd:87), tid:0, ssn:0, winSize:64
+I (3314) wifi:<ba-del>idx:0, tid:0
+I (3344) wifi:<ba-add>idx:0 (ifx:0, 1a:fa:c4:86:cd:87), tid:0, ssn:0, winSize:64
+I (4354) esp_netif_handlers: sta ip: 10.247.236.164, mask: 255.255.255.0, gw: 10.247.236.3
+I (4354) WIFI: ✅ WiFi connected — IP: 10.247.236.164
+I (4354) WIFI: WiFi ready
+I (4354) MAIN: ADC MAX4466 initialized: 16000 Hz
+I (4354) MIC: Mic self-check: reading 0.5s of audio...
+I (4864) MIC: Mic RMS energy: 0.02255
+I (4874) MIC: ✅ Mic self-check PASSED (RMS=0.02255)
+I (4884) INFERENCE: TFLite arena used: 29132 bytes (28.4 KB) — margin: 3636 bytes
+I (4884) INFERENCE: Free heap after TFLite init: 106704 bytes
+I (4894) MAIN: Model size (flash): 48072 bytes (46.9 KB)
+I (4894) MAIN: Tensor arena alloc: 32768 bytes (32 KB)
+I (4894) MAIN: Free heap after init: 101580 bytes
+>>> INFERENCE TASK STARTING! <<<
+I (4904) STREAM: Streaming task started (core 0) — LIVE-STREAMING mode
+I (4904) MAIN: All tasks started. Listening for 'Hey Vaani'...
+I (4914) INFERENCE: Inference task started on core 1
+I (4914) main_task: Returned from app_main()
+I (4924) INFERENCE: Inference buffers OK (heap=62876)
+I (5554) wifi:<ba-del>idx:0, tid:0
+I (5554) wifi:<ba-add>idx:0 (ifx:0, 1a:fa:c4:86:cd:87), tid:0, ssn:0, winSize:64
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  97.3%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+I (6574) STREAM: [Session 1] Keyword detected — connecting immediately
+I (9654) wifi:<ba-del>idx:0, tid:0
+I (9664) wifi:<ba-add>idx:0 (ifx:0, 1a:fa:c4:86:cd:87), tid:0, ssn:0, winSize:64
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  94.1%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  96.5%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  98.0%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+I (17664) wifi:<ba-del>idx:0, tid:0
+I (17664) wifi:<ba-add>idx:0 (ifx:0, 1a:fa:c4:86:cd:87), tid:0, ssn:0, winSize:64
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  98.4%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+W (24654) STREAM: [Session 1] connect() failed (attempt 1), retry in 200ms
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  97.7%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  97.7%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  98.4%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+I (33804) wifi:<ba-del>idx:0, tid:0
+I (33804) wifi:<ba-add>idx:0 (ifx:0, 1a:fa:c4:86:cd:87), tid:0, ssn:0, winSize:64
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  99.2%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  98.4%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  99.2%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+W (43354) STREAM: [Session 1] connect() failed (attempt 2), retry in 400ms
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  99.2%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════╗
+║  🟢 🔔 KEYWORD CONFIRMED: "Hey Vaani" (Confidence:  98.4%)  ║
+║  📡 Streaming 2s command audio to Cloud Whisper Server...    ║
+╚══════════════════════════════════════════════════════════════╝
+
+
