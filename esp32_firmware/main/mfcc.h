@@ -32,6 +32,8 @@
 
 // Input buffer: 1 second of 16kHz mono audio = 16000 int16 samples
 #define MFCC_AUDIO_SAMPLES 16000
+// The widest triangular Mel band uses 32 non-zero FFT bins at these fixed settings.
+#define MFCC_MAX_MEL_BINS 32
 
 // Output shape: [N_FRAMES, N_MFCC] = [49, 13] = 637 floats
 #define MFCC_OUTPUT_SIZE   (MFCC_N_FRAMES * MFCC_N_MFCC)
@@ -39,8 +41,11 @@
 // ─── MFCC Processor Class ────────────────────────────────────────────────────
 class MFCCProcessor {
 public:
-    // Mel filterbank — heap-allocated once in init() to save 40KB DRAM
-    float (*mel_filters)[MFCC_N_FFT / 2 + 1];
+    // Sparse triangular Mel filterbank. Only non-zero weights are stored.
+    // This is mathematically identical to the former 40 x 257 dense matrix.
+    float    (*mel_filters)[MFCC_MAX_MEL_BINS];
+    uint16_t mel_start[MFCC_N_MEL];
+    uint8_t  mel_count[MFCC_N_MEL];
 
     // Working buffers (allocated once to avoid stack overflow)
     float  window[MFCC_N_FFT];       // Hann window coefficients
@@ -57,12 +62,8 @@ public:
         for (int i = 0; i < MFCC_N_FFT; i++) {
             window[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / MFCC_N_FFT));
         }
-        // Allocate mel filterbank from heap (40KB, saved from DRAM)
-        mel_filters = (float (*)[MFCC_N_FFT / 2 + 1])malloc(MFCC_N_MEL * (MFCC_N_FFT / 2 + 1) * sizeof(float));
-        if (!mel_filters) {
-            printf("[MFCC] FATAL: mel_filters malloc failed\n");
-            fflush(stdout);
-        }
+        mel_filters = (float (*)[MFCC_MAX_MEL_BINS])malloc(MFCC_N_MEL * MFCC_MAX_MEL_BINS * sizeof(float));
+        if (!mel_filters) { printf("[MFCC] FATAL: sparse Mel allocation failed\n"); abort(); }
         _build_mel_filters();
     }
 
@@ -91,11 +92,11 @@ public:
                                       fft_imag[k] * fft_imag[k]);
             }
 
-            // Mel filterbank: dot(power_spec, mel_filters[m])
+            // Sparse Mel dot product: identical non-zero weights, no zero multiplications.
             for (int m = 0; m < MFCC_N_MEL; m++) {
                 float sum = 0.0f;
-                for (int k = 0; k <= MFCC_N_FFT / 2; k++) {
-                    sum += power_spec[k] * mel_filters[m][k];
+                for (int i = 0; i < mel_count[m]; i++) {
+                    sum += power_spec[mel_start[m] + i] * mel_filters[m][i];
                 }
                 mel_energy[m] = sum;
             }
@@ -132,40 +133,32 @@ private:
     void _build_mel_filters() {
         const float mel_low  = _hz_to_mel(MFCC_MEL_LOW_HZ);
         const float mel_high = _hz_to_mel(MFCC_MEL_HIGH_HZ);
-        const int   n_bins   = MFCC_N_FFT / 2 + 1;
-
-        // N_MEL + 2 centre frequencies in mel scale
         float mel_pts[MFCC_N_MEL + 2];
-        for (int i = 0; i < MFCC_N_MEL + 2; i++) {
-            mel_pts[i] = mel_low + (mel_high - mel_low) * i / (MFCC_N_MEL + 1);
-        }
-
-        // Convert mel → Hz → FFT bin index
         float hz_pts[MFCC_N_MEL + 2];
         for (int i = 0; i < MFCC_N_MEL + 2; i++) {
+            mel_pts[i] = mel_low + (mel_high - mel_low) * i / (MFCC_N_MEL + 1);
             hz_pts[i] = _mel_to_hz(mel_pts[i]);
         }
-
-        // Build triangular filters
         for (int m = 0; m < MFCC_N_MEL; m++) {
-            for (int k = 0; k < n_bins; k++) {
+            int count = 0;
+            mel_start[m] = 0;
+            for (int k = 0; k <= MFCC_N_FFT / 2; k++) {
                 float freq = (float)k * MFCC_SAMPLE_RATE / MFCC_N_FFT;
-                float left   = hz_pts[m];
-                float center = hz_pts[m + 1];
-                float right  = hz_pts[m + 2];
-
-                if (freq <= left || freq >= right) {
-                    mel_filters[m][k] = 0.0f;
-                } else if (freq < center) {
-                    mel_filters[m][k] = (freq - left) / (center - left);
-                } else {
-                    mel_filters[m][k] = (right - freq) / (right - center);
+                float weight = 0.0f;
+                if (freq > hz_pts[m] && freq < hz_pts[m + 2]) {
+                    weight = freq < hz_pts[m + 1]
+                        ? (freq - hz_pts[m]) / (hz_pts[m + 1] - hz_pts[m])
+                        : (hz_pts[m + 2] - freq) / (hz_pts[m + 2] - hz_pts[m + 1]);
+                }
+                if (weight != 0.0f) {
+                    if (count == 0) mel_start[m] = k;
+                    if (count >= MFCC_MAX_MEL_BINS) { printf("[MFCC] FATAL: sparse Mel band overflow\n"); abort(); }
+                    mel_filters[m][count++] = weight;
                 }
             }
+            mel_count[m] = count;
         }
     }
-
-    // ── DCT-II (normalised), matching TensorFlow's implementation ────────
     void _dct_ii_normalized(const float* x, float* out, int N_in, int N_out) {
         for (int n = 0; n < N_out; n++) {
             float sum = 0.0f;

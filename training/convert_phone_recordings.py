@@ -52,6 +52,9 @@ def convert_file(input_path: str, output_path: str) -> bool:
     # Fallback: try pydub (handles m4a, mp3, etc.)
     try:
         from pydub import AudioSegment
+        import imageio_ffmpeg
+        AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
+        
         audio_seg = AudioSegment.from_file(input_path)
         audio_seg = audio_seg.set_channels(1)           # mono
         audio_seg = audio_seg.set_frame_rate(SAMPLE_RATE)  # 16kHz

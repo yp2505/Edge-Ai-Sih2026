@@ -14,6 +14,7 @@ const API = 'http://localhost:8080'
 export default function App() {
   const [events, setEvents] = useState([])
   const [health, setHealth] = useState(null)
+  const [telemetry, setTelemetry] = useState(null)
   const [serverUp, setServerUp] = useState(false)
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
 
@@ -25,6 +26,16 @@ export default function App() {
     } catch { setServerUp(false) }
   }, [])
 
+  const fetchTelemetry = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/api/telemetry`, { signal: AbortSignal.timeout(2000) })
+      if (r.ok) {
+        const data = await r.json()
+        setTelemetry(Object.keys(data).length ? data : null)
+      }
+    } catch {}
+  }, [])
+
   const fetchEvents = useCallback(async () => {
     try {
       const r = await fetch(`${API}/api/events`, { signal: AbortSignal.timeout(2000) })
@@ -33,11 +44,12 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    fetchHealth(); fetchEvents()
+    fetchHealth(); fetchEvents(); fetchTelemetry()
     const h = setInterval(fetchHealth, 2000)
     const e = setInterval(fetchEvents, 800)
-    return () => { clearInterval(h); clearInterval(e) }
-  }, [fetchHealth, fetchEvents])
+    const t = setInterval(fetchTelemetry, 1000)
+    return () => { clearInterval(h); clearInterval(e); clearInterval(t) }
+  }, [fetchHealth, fetchEvents, fetchTelemetry])
 
   const latestEvent = events.length > 0 ? events[events.length - 1] : null
 
@@ -113,7 +125,7 @@ export default function App() {
             <span style={{ fontSize: 9, color: 'var(--t3)' }}>LIVE</span>
           </div>
           <div className="panel-content" style={{ padding: '12px 16px' }}>
-            <HardwareTelemetryNew latestEvent={latestEvent} />
+            <HardwareTelemetryNew telemetry={telemetry} />
           </div>
         </div>
 

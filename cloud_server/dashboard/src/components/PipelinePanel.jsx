@@ -2,11 +2,9 @@ import { useMemo } from 'react'
 import { IconCpu, IconWifi, IconSatellite, IconSearch, IconTrendChart } from './Icons.jsx'
 
 const STEPS = [
-  { key: 'mic',       label: 'Mic Buffer', sub: 'I2S',       fixed: 12, icon: IconSearch },
-  { key: 'mfcc',      label: 'Feature Ext',sub: 'TFLite',    fixed: 28, icon: IconCpu },
-  { key: 'tx',        label: 'Transmit',   sub: 'ESP32 Wi-Fi',prop: 'kw_to_connect_ms', color: 'var(--sky)', icon: IconWifi },
-  { key: 'rx',        label: 'Receive',    sub: 'Cloud WS',  prop: 'receive_gap_ms',   color: 'var(--primary)', icon: IconSatellite },
-  { key: 'asr',       label: 'Inference',  sub: 'Whisper',   prop: 'transcribe_ms',    color: 'var(--pink)', icon: IconCpu },
+  { key: 'tx', label: 'Wake to Server', sub: 'ESP32 Wi-Fi', color: 'var(--sky)', icon: IconWifi },
+  { key: 'rx', label: 'First Audio Byte', sub: 'Server receive', color: 'var(--primary)', icon: IconSatellite },
+  { key: 'asr', label: 'Whisper ASR', sub: 'Server CPU', color: 'var(--pink)', icon: IconCpu },
 ]
 
 function LatencyMiniChart({ events }) {
@@ -52,9 +50,7 @@ export default function PipelinePanel({ latestEvent, events }) {
     rx:   active ? (latestEvent?.receive_gap_ms    ?? 0) : 0,
     asr:  active ? (latestEvent?.transcribe_ms     ?? 0) : 0,
   }
-  const total = active
-    ? values.mic + values.mfcc + values.tx + values.rx + values.asr
-    : 0
+  const total = active ? (latestEvent?.end_to_end_ms ?? values.tx + values.rx + values.asr) : 0
   const totalColor = total < 400 ? 'var(--green)' : total < 800 ? 'var(--yellow)' : 'var(--red)'
 
   return (
@@ -64,7 +60,7 @@ export default function PipelinePanel({ latestEvent, events }) {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
           <div style={{ fontSize: 10, color: 'var(--t2)', fontWeight: 600, letterSpacing: '1px', textTransform: 'uppercase', marginBottom: 2 }}>End-to-End Latency</div>
-          <div style={{ fontSize: 11, color: 'var(--t2)' }}>Full round trip duration</div>
+          <div style={{ fontSize: 11, color: 'var(--t2)' }}>Measured: wake to Wi-Fi to audio to Whisper</div>
         </div>
         <div style={{
           fontFamily: 'var(--font-mono)', fontSize: 32, fontWeight: 800,

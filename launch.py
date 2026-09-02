@@ -17,6 +17,13 @@ Requirements:
 
 import os
 import sys
+
+# Force UTF-8 on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import time
 import signal
 import subprocess
@@ -35,7 +42,7 @@ except ImportError:
 PROJECT_ROOT    = Path(__file__).parent
 SERVER_DIR      = PROJECT_ROOT / "cloud_server"
 DASHBOARD_DIR   = PROJECT_ROOT / "cloud_server" / "dashboard"
-DASHBOARD_URL   = "http://localhost:3000"
+DASHBOARD_URL   = "http://localhost:5173"
 SERVER_PORT     = 5000
 
 # ESP32 USB identifiers (works for most CP210x and CH340 chips)
@@ -79,14 +86,23 @@ def start_process(name, cmd, cwd, env=None):
     """Start a subprocess and track it."""
     print(f"\n🚀 Starting {name}...")
     print(f"   Command: {' '.join(cmd)}")
+    env_vars = {
+        **os.environ,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        **(env or {}),
+    }
     proc = subprocess.Popen(
         cmd,
         cwd=str(cwd),
-        env={**os.environ, **(env or {})},
+        env=env_vars,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
+        shell=(sys.platform == 'win32' and cmd[0] == 'npm'),
     )
     processes.append((name, proc))
 
@@ -100,8 +116,61 @@ def start_process(name, cmd, cwd, env=None):
     t.start()
     return proc
 
+stop_requested = False
+
+def start_serial_monitor(port, baudrate=115200):
+    """Monitor ESP32 serial output in background thread and print live detections."""
+    def _read_serial():
+        import serial
+        # Retry opening port up to 10 times (server.py may briefly hold it)
+        ser = None
+        for attempt in range(10):
+            try:
+                time.sleep(0.8)
+                ser = serial.Serial(port, baudrate, timeout=1)
+                break
+            except serial.SerialException as e:
+                print(f"⚠️  [ESP32] Serial open attempt {attempt+1}/10 failed: {e}")
+                sys.stdout.flush()
+                time.sleep(1.5)
+        if ser is None:
+            print(f"❌ [ESP32] Could not open {port} after 10 attempts — serial logs disabled.")
+            sys.stdout.flush()
+            return
+
+        print(f"📡 Serial monitor active on {port} ({baudrate} baud)")
+        sys.stdout.flush()
+
+        buf = b""
+        while not stop_requested:
+            try:
+                chunk = ser.read(ser.in_waiting or 1)
+                if chunk:
+                    buf += chunk
+                    # Split on newlines, keeping incomplete trailing line in buf
+                    while b"\n" in buf:
+                        line_bytes, buf = buf.split(b"\n", 1)
+                        # Decode robustly — replace any bad bytes
+                        line_str = line_bytes.replace(b"\r", b"").decode("utf-8", errors="replace").strip()
+                        if line_str:
+                            print(f"[ESP32] {line_str}")
+                            sys.stdout.flush()
+            except serial.SerialException:
+                break
+            except Exception:
+                time.sleep(0.05)
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_read_serial, daemon=True)
+    t.start()
+
 def shutdown(signum=None, frame=None):
     """Gracefully kill all child processes."""
+    global stop_requested
+    stop_requested = True
     print("\n\n🛑 Shutting down Hey Vaani launcher...")
     for name, proc in processes:
         if proc.poll() is None:
@@ -119,7 +188,7 @@ def check_npm():
     nm = DASHBOARD_DIR / "node_modules"
     if not nm.exists():
         print("\n📦 Installing dashboard dependencies (npm install)...")
-        subprocess.run(["npm", "install"], cwd=str(DASHBOARD_DIR), check=True)
+        subprocess.run(["npm", "install"], cwd=str(DASHBOARD_DIR), check=True, shell=(sys.platform == 'win32'))
         print("✅ npm install complete!")
 
 def open_browser_when_ready():
@@ -152,9 +221,15 @@ def main():
     print(f"   Server Dir  : {SERVER_DIR}")
     print(f"   Dashboard   : {DASHBOARD_URL}")
 
-    # Step 2: Start Python ASR server
+    # Step 2: Start Serial Monitor for live ESP32 logs
+    start_serial_monitor(esp32_port)
+
+    # Step 3: Start Python ASR server
     # Use venv python if available
-    venv_python = SERVER_DIR / "venv" / "bin" / "python3"
+    if sys.platform == 'win32':
+        venv_python = SERVER_DIR / "venv" / "Scripts" / "python.exe"
+    else:
+        venv_python = SERVER_DIR / "venv" / "bin" / "python3"
     python_cmd = str(venv_python) if venv_python.exists() else sys.executable
 
     server_proc = start_process(
@@ -164,7 +239,7 @@ def main():
     )
     time.sleep(2)  # give server a moment to bind the port
 
-    # Step 3: Check npm deps + start dashboard
+    # Step 4: Check npm deps + start dashboard
     check_npm()
     dash_proc = start_process(
         name = "Dashboard",
@@ -172,7 +247,7 @@ def main():
         cwd  = DASHBOARD_DIR,
     )
 
-    # Step 4: Open browser when ready
+    # Step 5: Open browser when ready
     open_browser_when_ready()
 
     print("\n" + "═" * 60)
