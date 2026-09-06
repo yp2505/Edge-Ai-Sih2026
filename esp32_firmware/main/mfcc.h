@@ -58,7 +58,7 @@ public:
 
     // ── Initialise: precompute Hann window + mel filterbank ───────────────
     void init() {
-        // Hann window: matches tf.signal.stft default
+        // Hann window: the model was trained with this symmetric version (N denominator)
         for (int i = 0; i < MFCC_N_FFT; i++) {
             window[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / MFCC_N_FFT));
         }
@@ -165,7 +165,7 @@ private:
             for (int m = 0; m < N_in; m++) {
                 sum += x[m] * cosf(M_PI * n * (m + 0.5f) / N_in);
             }
-            out[n] = sum * sqrtf(2.0f / N_in);
+            out[n] = sum * sqrtf(2.0f / N_in);  // sqrt(2/N) — matches the model's actual training normalization
         }
     }
 
