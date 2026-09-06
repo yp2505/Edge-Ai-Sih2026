@@ -38,9 +38,9 @@ import socket
 import wave
 import argparse
 import threading
-from datetime import datetime
+import re
+from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
 import numpy as np
 
 # ─── Server-side VAD (Silence Detection) ─────────────────────────────────────
@@ -55,7 +55,62 @@ import numpy as np
 #
 VAD_RMS_THRESHOLD = 0.008    # 0.8% of full scale — works well for most mics
 VAD_SILENCE_MS    = 350      # stop after 350ms of consecutive silence
-VAD_MIN_AUDIO_MS  = 500      # wait at least 500ms (keyword echo + command start)
+VAD_MIN_AUDIO_MS  = 1500     # wait at least 1.5s (ring buffer 1s + command start)
+
+# ─── Pre-Transcription Gates ─────────────────────────────────────────────────
+# These filters run BEFORE calling Whisper at all.
+# They prevent the most common hallucination trigger: near-silent or very short
+# audio clips reaching the model.
+#
+# ENERGY_RMS_THRESHOLD:
+#   RMS energy of the full audio buffer (normalised 0.0–1.0).
+#   Clips below this are near-silent and are skipped entirely.
+#   Typical quiet room noise floor ≈ 0.001–0.003; human speech ≈ 0.015+.
+#   Start at 0.005, raise if still getting hallucinations on silence.
+ENERGY_RMS_THRESHOLD = 0.005
+
+# MIN_AUDIO_DURATION_MS:
+#   Clips shorter than this are skipped — too short to contain a real command.
+#   Whisper is especially prone to hallucination on clips < 500ms.
+MIN_AUDIO_DURATION_MS = 300    # milliseconds (tune: 300–500ms)
+
+# ─── Whisper Hallucination-Suppression Parameters ────────────────────────────
+# All passed directly to faster-whisper's transcribe() call.
+# Each is tunable without touching the function body.
+
+WHISPER_BEAM_SIZE = 5
+
+# WHISPER_NO_SPEECH_THRESHOLD (0.0–1.0):
+#   Segments whose no_speech_prob exceeds this are silently dropped.
+#   Most effective single hallucination filter for short clips. Default: 0.6.
+WHISPER_NO_SPEECH_THRESHOLD = 0.6
+
+# WHISPER_LOG_PROB_THRESHOLD (negative float):
+#   Segments below this average log-probability are discarded.
+#   Raise toward 0.0 to be more aggressive (e.g. -0.5). Default: -1.0.
+WHISPER_LOG_PROB_THRESHOLD = -1.0
+
+# WHISPER_COMPRESSION_RATIO_THRESHOLD:
+#   Segments with gzip compression ratio above this are repetition loops.
+#   Default: 2.4.
+WHISPER_COMPRESSION_RATIO_THRESHOLD = 2.4
+
+# WHISPER_CONDITION_ON_PREVIOUS_TEXT:
+#   When True (default), Whisper anchors on prior context — causing runaway
+#   hallucinations across short disconnected clips. Set False for our use case.
+WHISPER_CONDITION_ON_PREVIOUS_TEXT = False
+
+# WHISPER_VAD_FILTER / WHISPER_VAD_PARAMETERS:
+#   Use Silero VAD inside faster-whisper to trim silence before the model.
+#   min_silence_duration_ms: shorten from the 2000ms default for short clips.
+WHISPER_VAD_FILTER = True
+WHISPER_VAD_PARAMETERS = {
+    "min_silence_duration_ms": 500,
+}
+
+# WHISPER_REPETITION_PENALTY:
+#   Decoder-level penalty for repeated n-grams. 1.0 = disabled. 1.1 recommended.
+WHISPER_REPETITION_PENALTY = 1.1
 
 # ─── Startup check — FAIL LOUDLY if faster-whisper missing ──────────────────
 try:
@@ -108,15 +163,21 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass  # silence access log
 
     def _send_json(self, data, status: int = 200):
-        body = json.dumps(data, indent=2).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(data, indent=2).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Browsers can cancel a poll/navigation while its JSON response is
+            # being written. The request is already gone, so no response or
+            # traceback is useful here.
+            pass
 
     def do_OPTIONS(self): self._send_json({})
 
@@ -219,6 +280,7 @@ class ASRServer:
         print(f"  Status:          🟢 RUNNING")
         print(f"  Address:         {local_ip}:{self.port}")
         print(f"  ASR engine:      faster-whisper '{self.whisper_model}' (INT8, CPU)")
+        print("  Wake word:       custom TFLite Micro model on ESP32 (edge-authoritative)")
         print(f"  Protocol:        HVP1 v1 — 20-byte header, live-stream mode")
         print(f"  Log:             {LOG_FILE}")
         print("=" * 62)
@@ -320,11 +382,15 @@ class ASRServer:
                     audio_data += chunk
                     remaining -= len(chunk)
             else:
-                # Live-streaming mode — read 30ms chunks with server-side VAD.
-                # Stop early when the user has clearly stopped speaking instead
-                # of waiting the full COMMAND_DURATION_MS (2000ms).
+                # The custom, open-source TFLite Micro KWS model runs on the
+                # ESP32. After its ring buffer arrives, acknowledge the edge
+                # detection immediately and keep receiving command audio for
+                # ASR. Whisper is deliberately not used to judge the wake word.
                 consecutive_silence_ms = 0
-                total_audio_ms         = 0
+                total_audio_ms = 0
+                stage = "ring_buffer"  # first1s = ring buffer containing keyword
+                ring_buffer_audio = b""
+                edge_wake_word_accepted = False
 
                 while True:
                     chunk = client_socket.recv(960)   # 960B ≈ 30ms at 16kHz int16
@@ -336,47 +402,76 @@ class ASRServer:
                     audio_data += chunk
                     total_audio_ms += 30
 
-                    # ── Server-side VAD ────────────────────────────────────
-                    # Measure RMS of this 30ms chunk to decide if it's speech
-                    # or silence. Only apply VAD after VAD_MIN_AUDIO_MS to
-                    # avoid cutting off before the command word starts.
-                    if total_audio_ms >= VAD_MIN_AUDIO_MS:
-                        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
-                        rms = np.sqrt(np.mean(samples ** 2)) / 32768.0
+                    # Collect first1s for wake-word verification
+                    if stage == "ring_buffer":
+                        ring_buffer_audio += chunk
+                        if len(ring_buffer_audio) >= sr * 2:  # 1s = sr * 2 bytes
+                            # Send this before the user has finished the command.
+                            # The newline separates it from final ASR JSON.
+                            client_socket.sendall(json.dumps({
+                                "event": "edge_wake_word_accepted",
+                                "session_id": session_id,
+                                "wake_word_confirmed": True,
+                            }).encode("utf-8") + b"\n")
+                            edge_wake_word_accepted = True
+                            stage = "live_stream"
+                            print(f"  ✅ [{session_id}] Edge wake-word accepted — receiving command")
+                            continue
+                    
+                    # Stage 2: Live streaming (after wake-word confirmed)
+                    if stage == "live_stream":
+                        if total_audio_ms >= VAD_MIN_AUDIO_MS:
+                            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+                            rms = np.sqrt(np.mean(samples ** 2)) / 32768.0
 
-                        if rms < VAD_RMS_THRESHOLD:
-                            consecutive_silence_ms += 30
-                            if consecutive_silence_ms >= VAD_SILENCE_MS:
-                                # User stopped speaking — don't wait for the full
-                                # COMMAND_DURATION_MS. Run Whisper immediately.
-                                print(f"  🔇 [{session_id}] Silence detected "
-                                      f"after {total_audio_ms}ms — cutting stream early")
-                                break
-                        else:
-                            consecutive_silence_ms = 0  # reset on speech chunk
+                            if rms < VAD_RMS_THRESHOLD:
+                                consecutive_silence_ms += 30
+                                if consecutive_silence_ms >= VAD_SILENCE_MS:
+                                    print(f"  🔇 [{session_id}] Silence detected "
+                                          f"after {total_audio_ms}ms — cutting stream early")
+                                    break
+                            else:
+                                consecutive_silence_ms = 0
 
-            audio_duration = len(audio_data) / (sr * ch * (bits // 8)) if audio_data else 0
-            receive_gap_ms = (first_audio_byte_ms or int(time.time()*1000)) - connection_accepted_ms
+            audio_duration_s  = len(audio_data) / (sr * ch * (bits // 8)) if audio_data else 0.0
+            audio_duration_ms = int(audio_duration_s * 1000)
+            receive_gap_ms    = (first_audio_byte_ms or int(time.time()*1000)) - connection_accepted_ms
 
-            print(f"  📊 [{session_id}] {len(audio_data):,}B ({audio_duration:.2f}s) "
+            print(f"  📊 [{session_id}] {len(audio_data):,}B ({audio_duration_s:.2f}s) "
                   f"| gap={receive_gap_ms}ms")
 
-            # ── Step 3: Save WAV & Transcribe ─────────────────────────────
+            # ── Step 3: Save WAV (always — useful for debugging) ───────────
             wav_path = self._save_wav(audio_data, session_id, sr, ch, bits)
 
-            print(f"  🗣️  [{session_id}] Transcribing with faster-whisper '{self.whisper_model}'...")
-            t_t0 = time.time()
-            transcript, avg_log_prob = self._transcribe(wav_path)
-            transcribe_ms = int((time.time() - t_t0) * 1000)
+            # ── Step 3a: Pre-transcription gates ──────────────────────────
+            # Energy + duration checks BEFORE calling Whisper.
+            # Prevents the most common hallucination trigger: near-silent clips.
+            skip_reason = self._check_audio_gates(
+                audio_data, sr, ch, bits, audio_duration_ms, session_id
+            )
 
-            # True end-to-end timing: wake-word detection through command-audio
-            # capture and Whisper completion. total_server_ms is measured on one
-            # clock, so it includes streaming, VAD, WAV save, and inference.
+            if skip_reason:
+                # Audio failed a pre-transcription gate — skip Whisper entirely.
+                transcript    = skip_reason   # e.g. "[skipped: below energy threshold]"
+                avg_log_prob  = None
+                transcribe_ms = 0
+                print(f"  ⚠️  [{session_id}] SKIPPED transcription — {skip_reason}")
+            else:
+                print(f"  🗣️  [{session_id}] Transcribing with faster-whisper '{self.whisper_model}'...")
+                t_t0 = time.time()
+                transcript, avg_log_prob = self._transcribe(wav_path, session_id)
+                transcribe_ms = int((time.time() - t_t0) * 1000)
+
+            # Step 3: Two-step Verification Gate evaluation
+            is_confirmed, match_score, matched_var = self._verify_keyword_transcript(transcript)
+            verification_status = "CONFIRMED" if is_confirmed else "REJECTED"
+
             total_server_ms = int(time.time() * 1000) - connection_accepted_ms
-            end_to_end_ms  = kw_to_connect_ms + total_server_ms
+            end_to_end_ms   = kw_to_connect_ms + total_server_ms
 
             print(f"\n  {'─' * 58}")
-            print(f"  📝 [{session_id}] TRANSCRIPT: \"{transcript}\"")
+            print(f"  📝 [{session_id}] RAW TRANSCRIPT:  \"{transcript}\"")
+            print(f"  🛡️  [{session_id}] VERIFICATION GATE: {verification_status} (score={match_score:.2f}, match='{matched_var}')")
             print(f"  ⏱️  [{session_id}] kw→connect   (ESP32):   {kw_to_connect_ms}ms")
             print(f"  ⏱️  [{session_id}] connect→1st byte:        {receive_gap_ms}ms")
             print(f"  ⏱️  [{session_id}] Whisper '{self.whisper_model}':   {transcribe_ms}ms")
@@ -385,11 +480,16 @@ class ASRServer:
 
             # ── Step 4: Send JSON response to ESP32 ───────────────────────
             response = json.dumps({
-                "transcript":    transcript,
-                "end_to_end_ms": end_to_end_ms,
-                "transcribe_ms": transcribe_ms,
-                "session_id":    session_id,
-                "asr_engine":    f"faster-whisper-{self.whisper_model}",
+                "transcript":          transcript,
+                "verification_status": verification_status,
+                "verified":            is_confirmed,
+                "match_score":         round(match_score, 2),
+                "matched_variant":     matched_var,
+                "end_to_end_ms":       end_to_end_ms,
+                "transcribe_ms":       transcribe_ms,
+                "session_id":          session_id,
+                "asr_engine":          f"faster-whisper-{self.whisper_model}",
+                "wake_word_confirmed": is_confirmed,
             }).encode("utf-8")
             try:
                 client_socket.sendall(response)
@@ -402,11 +502,19 @@ class ASRServer:
                 "timestamp":              datetime.now().isoformat(),
                 "client_ip":              client_addr[0],
                 "audio_bytes":            len(audio_data),
-                "audio_duration_s":       round(audio_duration, 3),
-                "audio_capture_ms":       int(audio_duration * 1000),
+                "audio_duration_s":       round(audio_duration_s, 3),
+                "audio_duration_ms":      audio_duration_ms,
+                "audio_capture_ms":       audio_duration_ms,
                 "sample_rate":            sr,
+                "raw_transcript":         transcript,
                 "transcript":             transcript,
+                "verification_status":    verification_status,
+                "verified":                is_confirmed,
+                "match_score":            round(match_score, 2),
+                "matched_variant":        matched_var,
                 "avg_log_prob":           round(avg_log_prob, 4) if avg_log_prob else None,
+                "skipped":                skip_reason is not None,
+                "skip_reason":            skip_reason,
                 "asr_engine":             f"faster-whisper-{self.whisper_model}",
                 # Single-clock latency (no NTP needed)
                 "kw_to_connect_ms":       kw_to_connect_ms,
@@ -435,26 +543,167 @@ class ASRServer:
         finally:
             client_socket.close()
 
-    # ── Transcription ──────────────────────────────────────────────────────
-    def _transcribe(self, wav_path: str) -> tuple:
-        """Run faster-whisper on a saved WAV file. Returns (transcript, avg_log_prob)."""
-        try:
-            segments, _ = self.transcriber.transcribe(
-                wav_path,
-                beam_size=5,
-                language="en",
-                vad_filter=True,
+    # ── Pre-Transcription Audio Quality Gates ──────────────────────────────
+    def _check_audio_gates(
+        self,
+        audio_data: bytes,
+        sr: int, ch: int, bits: int,
+        audio_duration_ms: int,
+        session_id: int,
+    ) -> "str | None":
+        """
+        Run lightweight audio quality checks BEFORE calling Whisper.
+
+        Returns a skip-reason string when Whisper should be bypassed,
+        or None when the audio is acceptable.
+
+        Gate order (cheapest checks first):
+          0. Empty buffer
+          1. Duration too short  (< MIN_AUDIO_DURATION_MS)
+          2. Energy too low      (RMS < ENERGY_RMS_THRESHOLD)
+        """
+        if not audio_data:
+            reason = "[skipped: empty audio buffer]"
+            print(f"  🚫 [{session_id}] Gate 0 TRIGGERED — empty buffer")
+            return reason
+
+        if audio_duration_ms < MIN_AUDIO_DURATION_MS:
+            reason = (
+                f"[skipped: audio too short "
+                f"({audio_duration_ms}ms < {MIN_AUDIO_DURATION_MS}ms minimum)]"
             )
+            print(f"  🚫 [{session_id}] Gate 1 TRIGGERED — {reason}")
+            return reason
+
+        try:
+            samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+            rms = float(np.sqrt(np.mean(samples ** 2)) / 32768.0)
+            print(
+                f"  🔬 [{session_id}] Energy check: RMS={rms:.5f} "
+                f"(threshold={ENERGY_RMS_THRESHOLD})"
+            )
+            if rms < ENERGY_RMS_THRESHOLD:
+                reason = (
+                    f"[skipped: audio below energy threshold "
+                    f"(RMS={rms:.5f} < {ENERGY_RMS_THRESHOLD})]"
+                )
+                print(f"  🚫 [{session_id}] Gate 2 TRIGGERED — {reason}")
+                return reason
+        except Exception as e:
+            print(f"  ⚠️  [{session_id}] Energy gate error (continuing anyway): {e}")
+
+        print(f"  ✅ [{session_id}] Audio passed all pre-transcription gates — calling Whisper")
+        return None
+
+    # ── Step 3: Two-step Verification Gate ──────────────────────────────────
+    def _verify_keyword_transcript(self, transcript: str) -> tuple:
+        """
+        Fuzzy-match the raw ASR transcript against 'hey vaani' and real-world variants.
+        Returns: (is_confirmed: bool, best_score: float, matched_variant: str)
+        """
+        if not transcript or transcript.startswith("[skipped"):
+            return False, 0.0, "none"
+
+        clean_text = re.sub(r"[^\w\s]", "", transcript.lower()).strip()
+        if not clean_text:
+            return False, 0.0, "empty"
+
+        target_variants = [
+            "hey vaani", "hey vani", "hi vaani", "hay vaani",
+            "hey wani", "hey banni", "hey vanni", "hey bhani",
+            "vaani", "vani", "wani"
+        ]
+
+        # 1. Direct substring match check
+        for var in target_variants:
+            if var in clean_text:
+                return True, 1.0, var
+
+        # 2. Fuzzy sequence similarity check
+        best_score = 0.0
+        best_variant = "none"
+        for var in target_variants:
+            # Check against full text & sliding window tokens
+            ratio = SequenceMatcher(None, clean_text, var).ratio()
+            if ratio > best_score:
+                best_score = ratio
+                best_variant = var
+
+            # Check sub-phrases
+            words = clean_text.split()
+            for i in range(len(words)):
+                for j in range(i + 1, min(i + 4, len(words) + 1)):
+                    sub_phrase = " ".join(words[i:j])
+                    sub_ratio = SequenceMatcher(None, sub_phrase, var).ratio()
+                    if sub_ratio > best_score:
+                        best_score = sub_ratio
+                        best_variant = var
+
+        # Accept threshold: 0.65+ for fuzzy phoneme variants
+        is_confirmed = best_score >= 0.65
+        return is_confirmed, best_score, best_variant
+
+    # ── Transcription ──────────────────────────────────────────────────────
+    def _transcribe(self, wav_path: str, session_id: int = 0) -> tuple:
+        """
+        Run faster-whisper with hallucination-suppression parameters.
+        Returns (transcript, avg_log_prob).
+
+        All threshold values are defined as module-level constants (top of file)
+        so they can be tuned without touching this function.
+        """
+        try:
+            segments, info = self.transcriber.transcribe(
+                wav_path,
+                language="en",
+                beam_size=WHISPER_BEAM_SIZE,
+                # ── Hallucination suppression ──────────────────────────────
+                condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
+                no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+                log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+                compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
+                repetition_penalty=WHISPER_REPETITION_PENALTY,
+                # ── VAD (silence stripping before model) ──────────────────
+                vad_filter=WHISPER_VAD_FILTER,
+                vad_parameters=WHISPER_VAD_PARAMETERS,
+            )
+
             parts, log_probs = [], []
             for seg in segments:
-                if seg.text.strip():
-                    parts.append(seg.text.strip())
-                if hasattr(seg, "avg_logprob"):
-                    log_probs.append(seg.avg_logprob)
-            transcript   = " ".join(parts) if parts else "[silence]"
+                text      = seg.text.strip()
+                no_speech = getattr(seg, "no_speech_prob", None)
+                avg_lp    = getattr(seg, "avg_logprob", None)
+                comp_r    = getattr(seg, "compression_ratio", None)
+                # Per-segment diagnostic log — helps distinguish Whisper filters
+                # from too-aggressive threshold settings during calibration.
+                ns_str = f"{no_speech:.3f}" if no_speech is not None else "N/A"
+                lp_str = f"{avg_lp:.3f}"    if avg_lp    is not None else "N/A"
+                cr_str = f"{comp_r:.2f}"    if comp_r    is not None else "N/A"
+                print(
+                    f"  🔍 [{session_id}] seg [{seg.start:.2f}s–{seg.end:.2f}s] "
+                    f"no_speech={ns_str} logprob={lp_str} "
+                    f"compression={cr_str} text={repr(text)}"
+                )
+                if text:
+                    parts.append(text)
+                if avg_lp is not None:
+                    log_probs.append(avg_lp)
+
+            if not parts:
+                print(
+                    f"  🔕 [{session_id}] All segments filtered by Whisper thresholds "
+                    f"(no_speech≥{WHISPER_NO_SPEECH_THRESHOLD} or "
+                    f"logprob≤{WHISPER_LOG_PROB_THRESHOLD})"
+                )
+                transcript = "[silence]"
+            else:
+                transcript = " ".join(parts)
+
             avg_log_prob = sum(log_probs) / len(log_probs) if log_probs else None
             return transcript, avg_log_prob
+
         except Exception as e:
+            print(f"  ❌ [{session_id}] Transcription error: {e}")
             return f"[transcription error: {e}]", None
 
     # ── Helpers ────────────────────────────────────────────────────────────
@@ -528,7 +777,10 @@ def test_with_file(filepath: str, port: int = DEFAULT_PORT):
         resp += chunk
     sock.close()
 
-    result = json.loads(resp.decode("utf-8"))
+    # Streaming mode sends an early confirmation event followed by final ASR
+    # JSON.  Display the final response, not the acknowledgement event.
+    messages = [json.loads(line) for line in resp.decode("utf-8").splitlines() if line.strip()]
+    result = next(message for message in reversed(messages) if "transcript" in message)
     print(f"\n  📝 Transcript:   {result['transcript']}")
     print(f"  ⏱️  End-to-end:  {result['end_to_end_ms']}ms")
     print(f"  ⏱️  Transcribe:  {result['transcribe_ms']}ms")
@@ -555,9 +807,9 @@ Deploy to Oracle Cloud:
     )
     parser.add_argument("--port",          type=int, default=DEFAULT_PORT,
                         help=f"TCP port for ESP32 audio stream (default {DEFAULT_PORT})")
-    parser.add_argument("--whisper-model", type=str, default="tiny",
+    parser.add_argument("--whisper-model", type=str, default="base",
                         choices=["tiny", "base", "small", "medium"],
-                        help="Whisper model size (default: tiny)")
+                        help="Whisper model size (default: base)")
     parser.add_argument("--test",          type=str, metavar="WAV_FILE",
                         help="Test by streaming a WAV file as if from ESP32")
     args = parser.parse_args()

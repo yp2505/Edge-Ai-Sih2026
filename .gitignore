@@ -35,3 +35,17 @@ cloud_server/dashboard/dist/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Additional large directories and data
+*.zip
+*.tar.gz
+models/
+new model/
+tmp_voice_samples/
+keywords and augmented/
+voice sample/
+new_dataset/
+
+# Additional virtual envs
+.venv/
+cloud_server/.venv/

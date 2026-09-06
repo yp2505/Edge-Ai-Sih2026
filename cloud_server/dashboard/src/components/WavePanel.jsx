@@ -15,17 +15,39 @@ export default function WavePanel({ latestEvent, serverUp }) {
   const barsRef = useRef(Array(BAR_COUNT).fill(0.5))
 
   useEffect(() => {
-    if (latestEvent?.status === 'wake_word_detected' || latestEvent?.transcript) {
-      setTranscript(latestEvent.status === 'wake_word_detected' ? 'HEY VAANI DETECTED - listening for your command...' : latestEvent.transcript)
+    if (latestEvent?.status === 'wake_word_detected') {
+      setTranscript('HEY VAANI DETECTED - listening for your command...')
       setConfidence((92 + Math.random() * 6).toFixed(1))
       setSnr((22 + Math.random() * 4).toFixed(1))
       setIsActive(true)
       isActiveRef.current = true
-      const t = setTimeout(() => {
+      const timer = setTimeout(() => {
         setIsActive(false)
         isActiveRef.current = false
       }, 3500)
-      return () => clearTimeout(t)
+      return () => clearTimeout(timer)
+    } else if (latestEvent?.transcript) {
+      const t = latestEvent.transcript
+      const isRealSpeech = t &&
+        !t.startsWith('[skipped:') &&
+        !t.startsWith('[silence') &&
+        !t.startsWith('[transcription error')
+      if (isRealSpeech) {
+        setTranscript(t)
+        setConfidence((92 + Math.random() * 6).toFixed(1))
+        setSnr((22 + Math.random() * 4).toFixed(1))
+        setIsActive(true)
+        isActiveRef.current = true
+        const timer = setTimeout(() => {
+          setIsActive(false)
+          isActiveRef.current = false
+        }, 3500)
+        return () => clearTimeout(timer)
+      } else {
+        setTranscript(t)
+        setIsActive(false)
+        isActiveRef.current = false
+      }
     }
   }, [latestEvent])
 
@@ -234,7 +256,14 @@ export default function WavePanel({ latestEvent, serverUp }) {
             whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
             transition: 'all 0.3s',
           }}>
-            {isActive && transcript ? `"${transcript}"` : !serverUp ? 'Server offline' : 'Waiting for "Hey Vaani"…'}
+            {isActive && transcript
+              ? `"${transcript}"`
+              : transcript && (transcript.startsWith('[skipped:') || transcript.startsWith('[silence'))
+                ? <span style={{ color: 'var(--t3)', fontSize: 11 }}>{transcript}</span>
+                : !serverUp
+                  ? 'Server offline'
+                  : 'Waiting for "Hey Vaani"…'
+            }
           </div>
         </div>
 

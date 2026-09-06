@@ -34,6 +34,21 @@ export default function HardwareTelemetryNew({ telemetry }) {
   const duty = connected ? telemetry.inference_duty_pct : NaN
   const confidence = connected ? telemetry.keyword_confidence * 100 : NaN
   const heapText = connected ? `${(heapUsed / 1024).toFixed(1)} KB heap used` : 'Waiting for ESP32 telemetry'
+
+  // Live mic RMS from ESP32 telemetry (0.0 – 1.0 normalised)
+  const micRms = connected && telemetry.mic_rms != null ? telemetry.mic_rms : null
+  const rmsColor = micRms == null
+    ? 'var(--t3)'
+    : micRms >= 0.05 ? 'var(--green)'   // speech-level signal
+    : micRms >= 0.01 ? 'var(--amber)'   // weak / background noise
+    : 'var(--red)'                       // near-silent / likely not picking up
+  const rmsLabel = micRms == null
+    ? '—'
+    : `${micRms.toFixed(5)}${micRms >= 0.05 ? ' 🎙' : micRms >= 0.01 ? ' 〰' : ' 🔇'}`
+
+  // Visual bar: scale 0..0.15 → 0..100% (typical speech is 0.05-0.12)
+  const rmsBarPct = micRms != null ? Math.min(100, (micRms / 0.15) * 100) : 0
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 11, height: '100%', justifyContent: 'center' }}>
       <div style={{ display: 'flex', justifyContent: 'space-around' }}>
@@ -41,6 +56,34 @@ export default function HardwareTelemetryNew({ telemetry }) {
         <Gauge label="HEAP USED" value={heapPct} color="var(--sky)" icon={<IconCpu size={10} color="var(--t3)" />} />
         <Gauge label="WAKE CONF." value={confidence} color="var(--pink)" icon={<IconFlash size={10} color="var(--t3)" />} />
       </div>
+      <div style={{ height: 1, background: 'var(--border)' }} />
+
+      {/* ── Live Mic RMS ─────────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span style={{ fontSize: 10, color: 'var(--t3)', fontWeight: 700 }}>🎤 MIC RMS</span>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700, color: rmsColor }}>
+            {rmsLabel}
+          </span>
+        </div>
+        {/* Progress bar */}
+        <div style={{ height: 5, borderRadius: 4, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
+          <div style={{
+            height: '100%',
+            width: `${rmsBarPct}%`,
+            background: rmsColor,
+            borderRadius: 4,
+            transition: 'width 0.25s ease, background 0.3s',
+            boxShadow: micRms >= 0.05 ? `0 0 8px ${rmsColor}` : 'none',
+          }} />
+        </div>
+        <div style={{ fontSize: 9, color: 'var(--t3)', display: 'flex', justifyContent: 'space-between' }}>
+          <span>0.00</span>
+          <span style={{ color: micRms >= 0.05 ? 'var(--green)' : 'var(--t3)' }}>speech ≥ 0.05</span>
+          <span>0.15</span>
+        </div>
+      </div>
+
       <div style={{ height: 1, background: 'var(--border)' }} />
       <Row label="RAM" value={heapText} color={connected ? 'var(--sky)' : 'var(--t3)'} icon={<IconCpu size={10} color="var(--t3)" />} />
       <Row label="TFLITE ARENA" value={connected ? `${(telemetry.tflite_arena_bytes / 1024).toFixed(1)} KB` : '—'} icon={<IconCpu size={10} color="var(--t3)" />} />

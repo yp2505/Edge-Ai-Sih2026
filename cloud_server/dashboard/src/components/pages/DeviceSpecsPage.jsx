@@ -5,7 +5,7 @@ const SPECS = {
   model: { name: 'DS-CNN', precision: 'INT8', size: '46.9 KB', framework: 'TensorFlow Lite Micro' },
   memory: { tensor_arena: '~54 KB', heap_free: '~200 KB', flash_total: '4 MB' },
   cpu: { idle: '< 10%', inference: '~25%', wifi: '~15%', note: 'Update from serial: [CPU] log' },
-  hw: { mcu: 'ESP32-S3', mic: 'INMP441 (I2S)', freq: '240 MHz', cores: 'Dual-core Xtensa LX7' },
+  hw: { mcu: 'ESP32', mic: 'MAX4466 (ADC)', freq: '160 MHz', cores: 'Dual-core Xtensa LX6' },
   benchmark: { tpr: '99.0%', far: '0.4%', tpr_target: '≥ 90%', far_target: '≤ 5%' },
   protocol: { name: 'HVP1 v1', transport: 'TCP', port: 5000, header: '20-byte binary header' },
 }

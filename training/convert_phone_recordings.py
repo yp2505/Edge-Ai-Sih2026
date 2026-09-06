@@ -141,16 +141,16 @@ def check_dependencies():
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert phone recordings → 16kHz mono WAV for Hey Vaani training"
-    )
-    parser.add_argument("--input",   type=str, required=True,
-                        help="Path to folder OR .zip file containing phone recordings")
-    parser.add_argument("--speaker", type=str, default="phone",
-                        help="Speaker name tag (default: phone)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would be converted without converting")
+    parser = argparse.ArgumentParser(description="Convert phone recordings → 16kHz mono WAV for Hey Vaani training")
+    parser.add_argument("--input", required=True, help="Path to folder OR .zip file containing phone recordings")
+    parser.add_argument("--speaker", type=str, default="phone", help="Speaker name tag (default: phone)")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be converted without converting")
+    parser.add_argument("--output", type=str, default=os.path.join(os.path.dirname(__file__), "data", "keyword"), help="Output directory")
+
     args = parser.parse_args()
+    global OUTPUT_DIR
+    OUTPUT_DIR = args.output
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print("=" * 60)
     print("  📱 Phone Recording Converter → Hey Vaani Training Data")

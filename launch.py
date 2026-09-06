@@ -110,7 +110,7 @@ def start_process(name, cmd, cwd, env=None):
     def stream(n, p):
         prefix = f"[{n}]"
         for line in p.stdout:
-            print(f"{prefix} {line}", end="")
+            print(f"{prefix} {line}", end="", flush=True)
 
     t = threading.Thread(target=stream, args=(name, proc), daemon=True)
     t.start()
@@ -120,43 +120,58 @@ stop_requested = False
 
 def start_serial_monitor(port, baudrate=115200):
     """Monitor ESP32 serial output in background thread and print live detections."""
+
+    def _open_port():
+        """Open serial WITHOUT resetting the ESP32 (DTR/RTS stay LOW)."""
+        import serial
+        ser = serial.Serial()
+        ser.port     = port
+        ser.baudrate = baudrate
+        ser.timeout  = 1
+        ser.dtr      = False  # ← CRITICAL: prevents ESP32 reset on connect
+        ser.rts      = False  # ← CRITICAL: prevents ESP32 reset on connect
+        ser.open()
+        return ser
+
     def _read_serial():
         import serial
-        # Retry opening port up to 10 times (server.py may briefly hold it)
+        # Wait for server to finish starting before we grab the port
+        time.sleep(2.5)
         ser = None
-        for attempt in range(10):
+        for attempt in range(15):
             try:
-                time.sleep(0.8)
-                ser = serial.Serial(port, baudrate, timeout=1)
+                ser = _open_port()
                 break
             except serial.SerialException as e:
-                print(f"⚠️  [ESP32] Serial open attempt {attempt+1}/10 failed: {e}")
-                sys.stdout.flush()
+                print(f"⚠️  [ESP32] Serial open attempt {attempt+1}/15 failed: {e}", flush=True)
                 time.sleep(1.5)
         if ser is None:
-            print(f"❌ [ESP32] Could not open {port} after 10 attempts — serial logs disabled.")
-            sys.stdout.flush()
+            print(f"❌ [ESP32] Could not open {port} after 15 attempts — serial logs disabled.", flush=True)
             return
 
-        print(f"📡 Serial monitor active on {port} ({baudrate} baud)")
-        sys.stdout.flush()
+        print(f"\n{'─'*60}", flush=True)
+        print(f"📡 Serial monitor active on {port} ({baudrate} baud) [ESP32 not reset]", flush=True)
+        print(f"{'─'*60}\n", flush=True)
 
         buf = b""
         while not stop_requested:
             try:
-                chunk = ser.read(ser.in_waiting or 1)
+                waiting = ser.in_waiting
+                chunk = ser.read(waiting if waiting > 0 else 1)
                 if chunk:
                     buf += chunk
-                    # Split on newlines, keeping incomplete trailing line in buf
                     while b"\n" in buf:
                         line_bytes, buf = buf.split(b"\n", 1)
-                        # Decode robustly — replace any bad bytes
                         line_str = line_bytes.replace(b"\r", b"").decode("utf-8", errors="replace").strip()
                         if line_str:
-                            print(f"[ESP32] {line_str}")
-                            sys.stdout.flush()
-            except serial.SerialException:
-                break
+                            print(f"[ESP32] {line_str}", flush=True)
+            except serial.SerialException as e:
+                print(f"⚠️  [ESP32] Serial error: {e} — retrying...", flush=True)
+                time.sleep(1)
+                try:
+                    ser = _open_port()
+                except Exception:
+                    pass
             except Exception:
                 time.sleep(0.05)
         try:
@@ -166,6 +181,7 @@ def start_serial_monitor(port, baudrate=115200):
 
     t = threading.Thread(target=_read_serial, daemon=True)
     t.start()
+
 
 def shutdown(signum=None, frame=None):
     """Gracefully kill all child processes."""
@@ -221,16 +237,15 @@ def main():
     print(f"   Server Dir  : {SERVER_DIR}")
     print(f"   Dashboard   : {DASHBOARD_URL}")
 
-    # Step 2: Start Serial Monitor for live ESP32 logs
-    start_serial_monitor(esp32_port)
-
-    # Step 3: Start Python ASR server
-    # Use venv python if available
+    # Step 2: Start Python ASR server FIRST (before serial, to avoid port races)
+    # Use venv python if available (.venv or venv)
     if sys.platform == 'win32':
-        venv_python = SERVER_DIR / "venv" / "Scripts" / "python.exe"
+        dot_venv = SERVER_DIR / ".venv" / "Scripts" / "python.exe"
+        venv_dir = SERVER_DIR / "venv" / "Scripts" / "python.exe"
     else:
-        venv_python = SERVER_DIR / "venv" / "bin" / "python3"
-    python_cmd = str(venv_python) if venv_python.exists() else sys.executable
+        dot_venv = SERVER_DIR / ".venv" / "bin" / "python3"
+        venv_dir = SERVER_DIR / "venv" / "bin" / "python3"
+    python_cmd = str(dot_venv) if dot_venv.exists() else str(venv_dir) if venv_dir.exists() else sys.executable
 
     server_proc = start_process(
         name    = "Python Server",
@@ -238,6 +253,9 @@ def main():
         cwd     = SERVER_DIR,
     )
     time.sleep(2)  # give server a moment to bind the port
+
+    # Step 3: Start Serial Monitor AFTER server is up
+    start_serial_monitor(esp32_port)
 
     # Step 4: Check npm deps + start dashboard
     check_npm()
@@ -259,12 +277,21 @@ def main():
     print("═" * 60 + "\n")
 
     # Keep main thread alive, monitor child processes
+    restart_cooldown = {}
     while True:
         time.sleep(5)
-        for name, proc in processes:
+        for name, proc in list(processes):
             if proc.poll() is not None:
-                print(f"\n⚠️  {name} exited with code {proc.returncode}! Restarting...")
-                processes.remove((name, proc))
+                now = time.time()
+                last = restart_cooldown.get(name, 0)
+                if now - last < 10:
+                    # Crashed again within 10s — don't spam-restart
+                    print(f"\n❌ {name} crashed again too quickly — not restarting. Check logs above.", flush=True)
+                    processes.remove((name, proc))
+                else:
+                    print(f"\n⚠️  {name} exited with code {proc.returncode}! Restarting...", flush=True)
+                    restart_cooldown[name] = now
+                    processes.remove((name, proc))
                 break
 
 if __name__ == "__main__":

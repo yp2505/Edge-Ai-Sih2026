@@ -41,9 +41,10 @@ N_FFT = 512           # FFT window size (512 samples = 32ms at 16kHz)
 HOP_LENGTH = 320      # Hop size (320 samples = 20ms at 16kHz)
 N_FRAMES = 49         # Number of time frames for 1 second
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
-PLOTS_DIR = os.path.join(os.path.dirname(__file__), "plots")
+# Paths are now set dynamically in main() based on arguments
+DATA_DIR = ""
+MODEL_DIR = ""
+PLOTS_DIR = ""
 
 # Labels
 LABEL_KEYWORD = 1     # "Hey Vaani"
@@ -450,7 +451,15 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate existing model")
+    parser.add_argument("--data-dir", type=str, default=os.path.join(os.path.dirname(__file__), "data"), help="Dataset directory")
+    parser.add_argument("--model-dir", type=str, default=os.path.join(os.path.dirname(__file__), "models"), help="Output model directory")
     args = parser.parse_args()
+    
+    global DATA_DIR, MODEL_DIR, PLOTS_DIR
+    DATA_DIR = args.data_dir
+    MODEL_DIR = args.model_dir
+    PLOTS_DIR = os.path.join(MODEL_DIR, "plots")
+
     
     if args.evaluate:
         model_path = os.path.join(MODEL_DIR, "ds_cnn_final.keras")

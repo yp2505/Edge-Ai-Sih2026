@@ -37,7 +37,7 @@ N_FRAMES        = 49         # Must match training exactly
 CHANNELS        = 1          # Mono audio
 
 KEYWORD         = "Hey Vaani"
-DETECTION_THRESHOLD = 0.85   # Confidence above this = keyword detected
+DETECTION_THRESHOLD = 0.50   # Confidence above this = keyword detected
 COMMAND_DURATION    = 2.0    # ⚡ OPTIMIZED: 2s capture (was 4.0s) → saves ~2s latency
 SLIDE_STEP          = 0.25   # ⚡ OPTIMIZED: infer every 0.25s (4Hz, was 0.5s) → faster detection
 STREAM_CHUNK_SIZE   = 3200   # ⚡ Stream 0.1s chunks in real-time (100ms per chunk)
@@ -48,7 +48,7 @@ HEADER_FORMAT   = "<IIHHII"   # magic, sample_rate, channels, bits, audio_len, s
 HEADER_SIZE     = struct.calcsize(HEADER_FORMAT)
 
 # Default paths
-DEFAULT_MODEL   = os.path.join(os.path.dirname(__file__), "..", "..", "training", "models", "ds_cnn_quantized.tflite")
+DEFAULT_MODEL   = os.path.join(os.path.dirname(__file__), "..", "..", "new_dataset", "new_model", "hey_vaani_kws_int8.tflite")
 DEFAULT_SERVER  = "127.0.0.1"
 DEFAULT_PORT    = 5000
 
@@ -159,10 +159,10 @@ class KeywordDetector:
         print(f"  🔷 Input shape:  {self.input_details[0]['shape']}")
         print(f"  🔷 Output shape: {self.output_details[0]['shape']}")
 
-    def predict(self, mfcc: np.ndarray) -> tuple[float, float]:
+    def predict(self, mfcc: np.ndarray) -> float:
         """
         Run inference on a (49, 13) MFCC array.
-        Returns: (keyword_prob, not_keyword_prob) as floats in [0, 1]
+        Returns: keyword_prob as float in [0, 1] (sigmoid output)
         """
         # Add batch + channel dims: (49, 13) → (1, 49, 13, 1)
         x = mfcc[np.newaxis, ..., np.newaxis].astype(np.float32)
@@ -181,11 +181,9 @@ class KeywordDetector:
             out_scale, out_zp = self.output_details[0]['quantization']
             output = (output.astype(np.float32) - out_zp) * out_scale
 
-        # output shape: (1, 2) → [not_keyword_prob, keyword_prob]
-        probs = output[0]
-        not_kw_prob = float(probs[0])
-        kw_prob     = float(probs[1])
-        return kw_prob, not_kw_prob
+        # output shape: (1, 1) → single sigmoid value
+        kw_prob = float(output[0][0])
+        return kw_prob
 
 
 # ─── Audio Ring Buffer ────────────────────────────────────────────────────────
@@ -421,6 +419,10 @@ class HeyVaaniEdge:
         self._total_inference_ms = 0.0
         self._vad_skipped     = 0
 
+        # Inference smoothing (rolling average over 8 frames)
+        self._smooth_window = 8
+        self._smooth_buffer = []
+
     def _audio_callback(self, indata, frames, time_info, status):
         """Called by sounddevice for each audio chunk."""
         if status:
@@ -474,26 +476,35 @@ class HeyVaaniEdge:
 
             # Run inference
             t0 = time.time()
-            kw_prob, not_kw_prob = self.detector.predict(mfcc)
+            kw_prob = self.detector.predict(mfcc)
             inference_ms = (time.time() - t0) * 1000
 
             self._inference_count += 1
             self._total_inference_ms += inference_ms
 
+            # Apply rolling average smoothing over 8 frames
+            # Reset buffer when confidence drops low to prevent carry-over
+            if kw_prob < 0.30:
+                self._smooth_buffer.clear()
+            self._smooth_buffer.append(kw_prob)
+            if len(self._smooth_buffer) > self._smooth_window:
+                self._smooth_buffer.pop(0)
+            kw_prob_smooth = sum(self._smooth_buffer) / len(self._smooth_buffer)
+
             # Display status bar (speech mode)
             bar_len  = 20
-            filled   = int(kw_prob * bar_len)
+            filled   = int(kw_prob_smooth * bar_len)
             bar      = "█" * filled + "░" * (bar_len - filled)
-            marker   = "🔔 DETECTED!" if kw_prob >= self.threshold else "  "
+            marker   = "🔔 DETECTED!" if kw_prob_smooth >= self.threshold else "  "
             print(
-                f"\r  [{bar}] {kw_prob:.2f} | {inference_ms:.1f}ms "
+                f"\r  [{bar}] {kw_prob_smooth:.2f} | {inference_ms:.1f}ms "
                 f"rms={vad_metrics['rms']:.4f} {marker}",
                 end="", flush=True
             )
 
             # Keyword detected — start command capture
-            if kw_prob >= self.threshold and not self._is_capturing:
-                self._on_keyword_detected(kw_prob)
+            if kw_prob_smooth >= self.threshold and not self._is_capturing:
+                self._on_keyword_detected(kw_prob_smooth)
 
             # Adaptive sleep — maintain target inference rate
             elapsed = time.time() - loop_start

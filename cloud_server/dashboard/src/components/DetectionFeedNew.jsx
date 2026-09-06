@@ -152,21 +152,27 @@ export default function DetectionFeedNew({ events }) {
                   </div>
 
                   {/* Transcript */}
-                  <div style={{
-                    fontSize: 12, fontWeight: isNewest ? 500 : 400,
-                    color: isNewest ? 'var(--t1)' : 'var(--t2)',
-                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                    marginBottom: total > 0 ? 0 : 0,
-                  }}>
-                    {isWakeDetected
-                      ? <span style={{ color: 'var(--green)', fontWeight: 700 }}>HEY VAANI DETECTED - receiving command audio...</span>
-                      : e.transcript
-                      ? `"${isWakeDetected
-                      ? <span style={{ color: 'var(--green)', fontWeight: 700 }}>HEY VAANI DETECTED - receiving command audio...</span>
-                      : e.transcript}"`
-                      : <em style={{ color: 'var(--t3)', fontSize: 11 }}>Processing…</em>
-                    }
-                  </div>
+                  {(() => {
+                    const t = e.transcript || ''
+                    const isFiltered = t.startsWith('[skipped:') || t.startsWith('[silence') || t.startsWith('[transcription error')
+                    return (
+                      <div style={{
+                        fontSize: 12, fontWeight: isNewest && !isFiltered ? 500 : 400,
+                        color: isFiltered ? 'var(--t3)' : isNewest ? 'var(--t1)' : 'var(--t2)',
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        fontStyle: isFiltered ? 'italic' : 'normal',
+                      }}>
+                        {isWakeDetected
+                          ? <span style={{ color: 'var(--green)', fontWeight: 700 }}>HEY VAANI DETECTED - receiving command audio...</span>
+                          : isFiltered
+                            ? t
+                            : t
+                              ? `"${t}"`
+                              : <em style={{ color: 'var(--t3)', fontSize: 11 }}>Processing…</em>
+                        }
+                      </div>
+                    )
+                  })()}
 
                   {/* Latency mini bar */}
                   <LatencyMini kw={e.kw_to_connect_ms} rcv={e.receive_gap_ms} asr={e.transcribe_ms} />
