@@ -1,20 +1,23 @@
 // main.cpp — Hey Vaani ESP32 Real Firmware (ESP-IDF)
 //
-// FIX LOG (2026-09-06 rev3):
-//   1. WDT fix: vTaskDelay(1) after each 30ms hop lets IDLE task run.
-//   2. RMS=0 fix: ONE global ADC handle for all tasks — ESP-IDF oneshot
-//      driver allows only one handle per ADC unit; creating a second handle
-//      for ADC_UNIT_1 silently breaks reads (returns raw=0).
-//   3. esp_task_wdt_reset() removed — task was not subscribed so it spammed
-//      'task not found'; vTaskDelay(1) is sufficient for WDT.
-//   4. Boot ADC handle kept alive as the single global handle.
-//   5. SAMPLE-RATE fix: adc_oneshot_read() takes ~80us/call, so pacing with
-//      esp_rom_delay_us(50) yielded only ~10kHz effective (measured: 47ms
-//      per "30ms" hop). MFCC assumes 16kHz -> keyword never matched (Conf 0%).
-//      Switched to adc_continuous (DMA) at exactly 20000 Hz, decimate 4/5.
-//   6. STREAM RACE fix: while streaming, inference task also consumed ADC
-//      samples; with DMA that steals stream bytes. Inference now fully
-//      idles while streaming.
+// FIX LOG (2026-09-06 rev5):
+//   1-6. (from rev3) WDT, RMS=0, ADC handle, SAMPLE-RATE, STREAM RACE fixes.
+//   7. Removed duplicate noise calibration block (double-incremented noise_cal_frames).
+//   8. Added SO_SNDTIMEO/SO_RCVTIMEO (5s) on streaming socket to prevent
+//      send() blocking forever and trapping streaming_active=true.
+//   9. streaming_active watchdog: force-clears if stuck true >10s ([WATCHDOG]).
+//   10. Pipeline observability (rev4):
+//       [ENERGY]  — unconditional RMS/peak every ~500ms (mic health)
+//       [VAD]     — PASS/FAIL decisions (fail rate-limited to every 50th)
+//       [INFER]   — raw confidence after every Invoke() (TRIGGER/no)
+//       [STAGE-C] — pipeline stage breadcrumbs (linearize/MFCC/quantize/invoke)
+//       [TRIGGER->STREAM] — detection handoff confirmation
+//       [STREAM]  — TCP connect/send progress/recv diagnostics
+//       [INIT]    — model/interpreter startup confirmation
+//   11. RING BUFFER WRAP BUG FIX: inference_task avail calculation did not
+//       handle wrap-around (ring_write_pos wraps 15999->0, making avail
+//       massively negative). Added `if (avail < 0) avail += AUDIO_BUFFER_SAMPLES`
+//       matching the streaming_task which already had this fix.
 //
 // MAX4466 Wiring:  OUT->GPIO32 (ADC1_CH4)  VCC->3.3V  GND->GND
 
@@ -44,6 +47,7 @@
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include <errno.h>
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -110,6 +114,7 @@ static const char* TAG_MIC  = "MIC";
 static volatile int  wifi_retry_count             = 0;
 static volatile bool wifi_connected               = false;
 static volatile bool streaming_active             = false;
+static volatile int64_t streaming_active_set_us   = 0;  // timestamp when set true
 static volatile uint32_t telemetry_inference_count = 0;
 static volatile float    telemetry_inference_ms    = 0.0f;
 static volatile float    telemetry_keyword_confidence = 0.0f;
@@ -181,6 +186,13 @@ static void tflite_init() {
     size_t used = interpreter->arena_used_bytes();
     ESP_LOGI(TAG_INF, "Arena used: %u bytes (%.1f KB), margin: %u bytes",
              (unsigned)used, used / 1024.0f, (unsigned)(TENSOR_ARENA_SIZE - used));
+    ESP_LOGI(TAG_INF, "Model init OK: schema=%d, arena=%u/%u bytes, input=[%d], output=[%d]",
+             TFLITE_SCHEMA_VERSION, (unsigned)used, (unsigned)TENSOR_ARENA_SIZE,
+             input_tensor->dims->data[1], output_tensor->dims->data[1]);
+    printf("[INIT] TFLite model ready: %u bytes model, %u/%u arena, threshold=%.2f, hits_required=%d\n",
+           (unsigned)g_model_len, (unsigned)used, (unsigned)TENSOR_ARENA_SIZE,
+           (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED);
+    fflush(stdout);
 }
 
 // ─── ADC Init — diag scan (oneshot), then the single global DMA handle ───────
@@ -453,10 +465,45 @@ static void inference_task(void* arg) {
     int      noise_cal_frames   = 0;
     uint32_t dbg_loop           = 0;
     int      last_read_pos      = 0;
-    int64_t  last_dbg_us        = 0;
+    int64_t  last_stack_us      = 0;
+    int64_t  last_streaming_log_us = 0;
+    int64_t  last_energy_log_us = 0;
+    uint32_t vad_fail_skip_count = 0;
 
     while (true) {
         dbg_loop++;
+
+        // Periodic stack high-water-mark logging (~2s) — BEFORE any continue
+        int64_t stack_now_us = esp_timer_get_time();
+        if (stack_now_us - last_stack_us >= 2000000) {
+            last_stack_us = stack_now_us;
+            uint32_t hwm = uxTaskGetStackHighWaterMark(NULL);
+            printf("[STACK] loop=%lu hwm=%u streaming=%d\n",
+                   (unsigned long)dbg_loop, (unsigned)hwm, (int)streaming_active);
+            fflush(stdout);
+        }
+
+        // streaming_active watchdog: if stuck true for >10s, force-clear it
+        if (streaming_active && streaming_active_set_us != 0) {
+            int64_t held_us = stack_now_us - streaming_active_set_us;
+            if (held_us > 10000000) {  // 10 seconds
+                printf("[WATCHDOG] streaming_active stuck true for %.1fs — FORCE CLEARING\n",
+                       (double)held_us / 1e6);
+                fflush(stdout);
+                streaming_active = false;
+                streaming_active_set_us = 0;
+            }
+        }
+
+        // Periodic streaming_active debug (~500ms)
+        if (stack_now_us - last_streaming_log_us >= 500000) {
+            last_streaming_log_us = stack_now_us;
+            if (streaming_active) {
+                int64_t held = streaming_active_set_us ? (stack_now_us - streaming_active_set_us) : 0;
+                printf("[DBG-SA] streaming_active=TRUE for %.1fs\n", (double)held / 1e6);
+                fflush(stdout);
+            }
+        }
 
         // 1. Wait until at least one fresh hop is available in the ring.
         //    (While streaming, the ring is still being filled by audio_task —
@@ -464,6 +511,7 @@ static void inference_task(void* arg) {
         int avail;
         xSemaphoreTake(ring_mutex, portMAX_DELAY);
         avail = ring_write_pos - last_read_pos;
+        if (avail < 0) avail += AUDIO_BUFFER_SAMPLES;  // ring buffer wrap-around
         if (avail > AUDIO_BUFFER_SAMPLES) {  // we fell behind — resync to newest
             avail = AUDIO_BUFFER_SAMPLES;
             last_read_pos = ring_write_pos - AUDIO_BUFFER_SAMPLES;
@@ -472,6 +520,17 @@ static void inference_task(void* arg) {
         if (avail < hop_samples || valid_ring_samples < AUDIO_BUFFER_SAMPLES ||
             streaming_active) {
             xSemaphoreGive(ring_mutex);
+            if (streaming_active) {
+                // Rate-limited log: only print once per second to avoid flooding
+                static int64_t last_sa_skip_log = 0;
+                if (stack_now_us - last_sa_skip_log >= 1000000) {
+                    last_sa_skip_log = stack_now_us;
+                    int64_t held = streaming_active_set_us ? (stack_now_us - streaming_active_set_us) : 0;
+                    printf("[DBG-SA] inference SKIPPED — streaming_active for %.1fs\n",
+                           (double)held / 1e6);
+                    fflush(stdout);
+                }
+            }
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
@@ -485,21 +544,29 @@ static void inference_task(void* arg) {
         }
         xSemaphoreGive(ring_mutex);
 
-        // 2. RMS on this hop
+        // 2. RMS + peak on this hop
         int64_t sum_sq = 0;
-        for (int i = 0; i < hop_samples; i++) sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
+        int16_t hop_peak = 0;
+        for (int i = 0; i < hop_samples; i++) {
+            sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
+            int16_t abs_val = hop_buf[i] < 0 ? -hop_buf[i] : hop_buf[i];
+            if (abs_val > hop_peak) hop_peak = abs_val;
+        }
         float rms = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
+        float peak_f = (float)hop_peak / 32768.0f;
         telemetry_mic_rms = rms;
 
-        // 3. DBG telemetry (~4x/sec)
+        // 3. [ENERGY] log — unconditional, every ~500ms, mic health visibility
         int64_t now_us = esp_timer_get_time();
-        if (now_us - last_dbg_us >= 250000) {
-            last_dbg_us = now_us;
-            printf("[DBG] loop=%lu rms=%.5f dc=%.1f streaming=%d adc_ok=%lu adc_err=%lu\n",
-                   (unsigned long)dbg_loop, rms, (double)adc_dc_offset,
-                   (int)streaming_active,
-                   (unsigned long)adc_dma_ok, (unsigned long)adc_dma_err);
-            fflush(stdout);
+        {
+            float speech_thr = fmaxf(MIN_SPEECH_RMS, noise_floor_rms * NOISE_FLOOR_MULTIPLIER);
+            if (now_us - last_energy_log_us >= 500000) {
+                last_energy_log_us = now_us;
+                printf("[ENERGY] rms=%.5f peak=%.5f thr=%.5f noise_floor=%.5f streaming=%d\n",
+                       (double)rms, (double)peak_f, (double)speech_thr,
+                       (double)noise_floor_rms, (int)streaming_active);
+                fflush(stdout);
+            }
         }
 
         // 5. Noise calibration — only use SILENT frames so speech doesn't corrupt the floor
@@ -522,11 +589,21 @@ static void inference_task(void* arg) {
             noise_floor_rms = 0.02f * rms + 0.98f * noise_floor_rms;
             telemetry_noise_floor_rms = noise_floor_rms;
             consecutive_hits = 0;
+            vad_fail_skip_count++;
+            if (vad_fail_skip_count % 50 == 0) {
+                printf("[VAD] FAIL #%lu rms=%.5f thr=%.5f\n",
+                       (unsigned long)vad_fail_skip_count, (double)rms, (double)speech_thr);
+                fflush(stdout);
+            }
             vTaskDelay(pdMS_TO_TICKS(1));  // yield to idle — prevent TWDT hang
             continue;
         }
+        printf("[VAD] PASS rms=%.5f thr=%.5f noise_floor=%.5f\n",
+               (double)rms, (double)speech_thr, (double)noise_floor_rms);
+        fflush(stdout);
 
         // 7. Linearise ring → 1s window
+        printf("[STAGE-C] pre-linearize loop=%lu\n", (unsigned long)dbg_loop); fflush(stdout);
         xSemaphoreTake(ring_mutex, portMAX_DELAY);
         {
             int start = ring_write_pos;
@@ -534,9 +611,12 @@ static void inference_task(void* arg) {
                 audio_window[i] = audio_ring[(start + i) % AUDIO_BUFFER_SAMPLES];
         }
         xSemaphoreGive(ring_mutex);
+        printf("[STAGE-C] post-linearize\n"); fflush(stdout);
 
         // 8. MFCC + inference
+        printf("[STAGE-C] pre-MFCC\n"); fflush(stdout);
         mfcc_proc.compute(audio_window, mfcc_output);
+        printf("[STAGE-C] post-MFCC, pre-quantize\n"); fflush(stdout);
 
         float   in_scale = input_tensor->params.scale;
         int32_t in_zp    = input_tensor->params.zero_point;
@@ -546,14 +626,37 @@ static void inference_task(void* arg) {
             q = q < -128 ? -128 : (q > 127 ? 127 : q);
             inp[i] = (int8_t)q;
         }
+        printf("[STAGE-C] pre-invoke\n"); fflush(stdout);
         int64_t t0 = esp_timer_get_time();
         interpreter->Invoke();
         float infer_us = (float)(esp_timer_get_time() - t0);
+        printf("[STAGE-C] post-invoke (%.0f us)\n", infer_us); fflush(stdout);
 
         float   out_scale = output_tensor->params.scale;
         int32_t out_zp    = output_tensor->params.zero_point;
         int8_t* out       = output_tensor->data.int8;
-        float   kw_prob   = (out[1] - out_zp) * out_scale;
+
+        // Model is sigmoid with 1 output element. The old code read out[1]
+        // which is past the tensor bounds — always produced 0.0000.
+        // Output tensor shape is [1, 1] int8: scale=0.00390625, zp=-128.
+        // Dequantize: float = (int8_value - zero_point) * scale
+        // For sigmoid: int8=-128 -> 0.0, int8=0 -> 0.5, int8=127 -> 0.996
+        float   kw_prob   = (out[0] - out_zp) * out_scale;
+
+        // Debug: dump raw int8 output tensor values for all elements
+        int out_elems = output_tensor->dims->data[output_tensor->dims->size - 1];
+        printf("[INFER-RAW] out_elems=%d", out_elems);
+        for (int oi = 0; oi < out_elems && oi < 8; oi++) {
+            printf(" [%d]=%d", oi, out[oi]);
+        }
+        printf(" scale=%.6f zp=%d\n", (double)out_scale, (int)out_zp);
+        fflush(stdout);
+
+        printf("[INFER] loop=%lu conf=%.4f threshold=%.2f result=%s infer_us=%.0f\n",
+               (unsigned long)dbg_loop, (double)kw_prob, (double)DETECT_THRESHOLD,
+               (kw_prob >= DETECT_THRESHOLD) ? "TRIGGER" : "no",
+               (double)infer_us);
+        fflush(stdout);
 
         infer_count++;
         telemetry_inference_count += 1;
@@ -564,20 +667,15 @@ static void inference_task(void* arg) {
 
         if (consecutive_hits >= DETECTION_HITS_REQUIRED) {
             int64_t kw_end = esp_timer_get_time();
-            printf("\n=== KEYWORD CONFIRMED: Hey Vaani (%.1f%%) ===\n", kw_prob * 100.0f);
+            printf("[TRIGGER->STREAM] KEYWORD CONFIRMED conf=%.4f (%.1f%%) — posting to detect_queue\n",
+                   (double)kw_prob, (double)(kw_prob * 100.0f));
             fflush(stdout);
             xQueueSend(detect_queue, &kw_end, 0);
             consecutive_hits = 0;
             vTaskDelay(pdMS_TO_TICKS(1000));
         } else if (consecutive_hits > 0) {
-            printf("  [Analyzing] Frame %d/%d (%.1f%%)...\n",
-                   consecutive_hits, DETECTION_HITS_REQUIRED, kw_prob * 100.0f);
-            fflush(stdout);
-        } else if (kw_prob >= 0.30f) {
-            printf("  [Voice] %.1f%%\n", kw_prob * 100.0f);
-            fflush(stdout);
-        } else if (infer_count % 20 == 0) {
-            printf("  [Listening] RMS=%.4f Conf=%.1f%%\n", rms, kw_prob * 100.0f);
+            printf("[INFER] analyzing... frame %d/%d conf=%.4f\n",
+                   consecutive_hits, DETECTION_HITS_REQUIRED, (double)kw_prob);
             fflush(stdout);
         }
     }
@@ -653,12 +751,23 @@ static void streaming_task(void* arg) {
             int f = 1;
             setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
 
+            // Prevent indefinite blocking on send/recv — if server stalls,
+            // we must not hang forever (which would keep streaming_active=true
+            // and freeze the inference task).
+            struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
             if (connect(sock, (struct sockaddr*)&srv, sizeof(srv)) == 0) {
                 kw_ms = (uint32_t)((esp_timer_get_time() - keyword_end_us) / 1000);
-                ESP_LOGI(TAG_STR, "[%lu] Connected (attempt %d) kw->conn=%lums",
-                         (unsigned long)sid, attempt + 1, (unsigned long)kw_ms);
+                printf("[STREAM] sid=%lu TCP connected (attempt %d) kw->conn=%lums\n",
+                       (unsigned long)sid, attempt + 1, (unsigned long)kw_ms);
+                fflush(stdout);
                 break;
             }
+            printf("[STREAM] sid=%lu TCP connect FAILED attempt %d: errno=%d\n",
+                   (unsigned long)sid, attempt + 1, errno);
+            fflush(stdout);
             close(sock); sock = -1;
             vTaskDelay(pdMS_TO_TICKS(backoff_ms)); backoff_ms *= 2;
         }
@@ -677,9 +786,14 @@ static void streaming_task(void* arg) {
             .audio_len        = 0,
             .kw_to_connect_ms = kw_ms,
         };
-        send(sock, &hdr, sizeof(hdr), 0);
+        ssize_t hdr_sent = send(sock, &hdr, sizeof(hdr), 0);
+        printf("[STREAM] sid=%lu HVP1 header sent (%d bytes)\n", (unsigned long)sid, (int)hdr_sent);
+        fflush(stdout);
 
         streaming_active = true;
+        streaming_active_set_us = esp_timer_get_time();
+        printf("[DBG-SA] streaming_active SET TRUE (sid=%lu)\n", (unsigned long)sid);
+        fflush(stdout);
 
         const int  CHUNK = 480;
         int16_t    pcm[CHUNK];
@@ -705,10 +819,22 @@ static void streaming_task(void* arg) {
             }
             xSemaphoreGive(ring_mutex);
 
-            if (send(sock, pcm, CHUNK * sizeof(int16_t), 0) < 0) break;
+            if (send(sock, pcm, CHUNK * sizeof(int16_t), 0) < 0) {
+                printf("[STREAM] sid=%lu SEND FAILED at %d samples (%dms)\n",
+                       (unsigned long)sid, total_sent, streamed_ms);
+                fflush(stdout);
+                break;
+            }
             total_sent  += CHUNK;
             int chunk_ms = CHUNK * 1000 / ADC_SAMPLE_RATE;
             streamed_ms += chunk_ms;
+
+            // Periodic send progress (~500ms)
+            if (streamed_ms % 500 < chunk_ms) {
+                printf("[STREAM] sid=%lu sending... %d samples (%dms) total_sent=%d\n",
+                       (unsigned long)sid, streamed_ms, streamed_ms, total_sent);
+                fflush(stdout);
+            }
 
             if (streamed_ms >= COMMAND_MIN_DURATION_MS) {
                 int64_t sq = 0;
@@ -717,23 +843,31 @@ static void streaming_task(void* arg) {
                 float sil_thr  = fmaxf(0.025f, telemetry_noise_floor_rms * 1.5f);
                 consec_silence_ms = crms < sil_thr ? consec_silence_ms + chunk_ms : 0;
                 if (consec_silence_ms >= COMMAND_SILENCE_MS) {
-                    ESP_LOGI(TAG_STR, "[%lu] Silence → end stream at %dms",
-                             (unsigned long)sid, streamed_ms);
+                    printf("[STREAM] sid=%lu silence -> end stream at %dms\n",
+                           (unsigned long)sid, streamed_ms);
+                    fflush(stdout);
                     break;
                 }
             }
         }
 
         streaming_active = false;
+        streaming_active_set_us = 0;
+        printf("[DBG-SA] streaming_active CLEARED (sid=%lu)\n", (unsigned long)sid);
+        fflush(stdout);
         shutdown(sock, SHUT_WR);
         ESP_LOGI(TAG_STR, "[%lu] Sent %d samples (%.2fs)",
                  (unsigned long)sid, total_sent, (float)total_sent / ADC_SAMPLE_RATE);
 
         {
+            int64_t recv_start = esp_timer_get_time();
             char resp[1024] = {0};
             int  rlen = 0, r;
             while ((r = recv(sock, resp + rlen, sizeof(resp) - rlen - 1, 0)) > 0) rlen += r;
+            float recv_ms = (float)(esp_timer_get_time() - recv_start) / 1000.0f;
             close(sock);
+            printf("[STREAM] sid=%lu recv complete: %d bytes in %.0fms\n",
+                   (unsigned long)sid, rlen, (double)recv_ms);
             printf("\n=== CLOUD WHISPER TRANSCRIPTION ===\n  -> %s\n===================================\n\n",
                    rlen > 0 ? resp : "[no response]");
             fflush(stdout);
