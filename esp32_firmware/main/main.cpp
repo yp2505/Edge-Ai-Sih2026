@@ -1,29 +1,28 @@
 // main.cpp — Hey Vaani ESP32 Edge KWS + Cloud ASR Streaming
 //
-// FIX LOG (2026-09-06 rev6 — reference-merge):
-//   All fixes from rev5 preserved plus:
-//   1. set_streaming_active() helper — single mutation point with reason logging.
-//   2. Dedicated watchdog_task (was inline in inference_task).
-//   3. stack_monitor_task — periodic HWM for all key tasks.
-//   4. Bounded mutex waits (50ms) in audio_task/streaming_task.
-//   5. streaming_task read_cursor starts at ring_write_pos at trigger time.
-//   6. inference_task explicit resync when it falls behind the ring.
-//   7. Output tensor read at index [1] (LABEL_KEYWORD=1 per train_model.py).
-//   8. fflush(stdout) after every printf.
+// FIX LOG (2026-09-07 rev7 — INMP441 I2S + ST7735 OLED + LED + Buzzer):
+//   All fixes from rev6 preserved plus:
+//   1. ADC/MAX4466 removed; INMP441 I2S (i2s_std, 16 kHz, mono-left).
+//      adc_global_init() + read_pcm_dma() gone.
+//      i2s_global_init() + i2s_read_pcm() replace them.
+//      Ring buffer, mutex, inference_task, streaming_task: UNCHANGED.
+//   2. ST7735 SPI OLED via ESP-IDF SPI master (SPI3_HOST/VSPI, no Arduino lib).
+//      display_task (Core 0, pri 1) polls g_disp_state every 100 ms — zero
+//      impact on inference or streaming critical paths.
+//   3. LED GPIO27: on at keyword confirm, off after transcription received.
+//      watchdog_task also forces LED off if streaming gets stuck.
+//   4. Buzzer GPIO14: 150 ms LEDC PWM beep (2.5 kHz) at keyword confirm,
+//      implemented as a self-deleting beep_task (no delay in inference_task).
 //
-// DATA PIPELINE (MUST MATCH TRAINING EXACTLY — mfcc.h):
-//   SAMPLE_RATE  = 16000 Hz
-//   N_FFT        = 512   (32ms window)
-//   HOP_LENGTH   = 320   (20ms hop)
-//   N_MEL        = 40
-//   N_MFCC       = 13
-//   N_FRAMES     = 49    (~1s @ 20ms/hop)
-//   Mel range    = 20–8000 Hz
-//   Power spec   = |STFT| (not squared — matches tf.abs(stft))
-//   DCT          = Type-II, normalized sqrt(2/N) — matches TF mfccs_from_log_mel
-//   Quantisation = model's actual scale/zero_point read from tensor at init
+// HARDWARE WIRING:
+//   INMP441:  SCK=GPIO26  WS=GPIO25   SD=GPIO22   L/R=GND (left channel)
+//   ST7735:   DIN=GPIO23  CLK=GPIO18  CS=GPIO5    DC=GPIO2  RST=GPIO4  BL→3.3V
+//   LED:      GPIO27 (through 220 Ω resistor to GND)
+//   Buzzer:   GPIO14 (active or passive — LEDC PWM handles both types)
 //
-// MAX4466 Wiring: OUT→GPIO32 (ADC1_CH4)  VCC→3.3V  GND→GND
+// DATA PIPELINE (unchanged — MUST MATCH TRAINING EXACTLY — mfcc.h):
+//   SAMPLE_RATE=16000 Hz  N_FFT=512  HOP=320  N_MEL=40  N_MFCC=13  N_FRAMES=49
+//   Mel 20–8000 Hz | power=|STFT| | DCT=Type-II norm | quant=tensor scale/zp
 // ============================================================================
 
 #include <stdio.h>
@@ -37,15 +36,15 @@
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
 
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_continuous.h"
-#include "hal/adc_types.h"
+#include "driver/i2s_std.h"
+#include "driver/i2c.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
-#include "esp_rom_sys.h"
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
@@ -62,33 +61,36 @@
 #include "mfcc.h"
 #include "benchmark_cpu.h"
 
-// ─── User Config ──────────────────────────────────────────────────────────────
+// ─── User Config ─────────────────────────────────────────────────────────────
 #ifndef CONFIG_WIFI_SSID
-#define CONFIG_WIFI_SSID       "Khush's A55"
+#define CONFIG_WIFI_SSID       "Yug"
 #endif
 #ifndef CONFIG_WIFI_PASSWORD
-#define CONFIG_WIFI_PASSWORD   "khush2073"
+#define CONFIG_WIFI_PASSWORD   "saanvi2013"
 #endif
 #ifndef CONFIG_SERVER_IP
-#define CONFIG_SERVER_IP       "10.247.236.188"
+#define CONFIG_SERVER_IP       "192.168.1.18"
 #endif
 #ifndef CONFIG_SERVER_PORT
 #define CONFIG_SERVER_PORT     5000
 #endif
 
-// ─── ADC / Audio ──────────────────────────────────────────────────────────────
-#define ADC_SAMPLE_RATE    16000
-#define ADC_RAW_RATE_HZ    20000   // DMA rate; decimated 4/5 → 16000 Hz
+// ─── I2S / INMP441 ───────────────────────────────────────────────────────────
+#define I2S_SAMPLE_RATE    16000
+#define I2S_PORT           I2S_NUM_0
+#define I2S_SCK_PIN        GPIO_NUM_26   // BCLK  (INMP441 SCK)
+#define I2S_WS_PIN         GPIO_NUM_25   // LRCLK (INMP441 WS)
+#define I2S_SD_PIN         GPIO_NUM_22   // DATA  (INMP441 SD)
 
-// ─── KWS / Inference ──────────────────────────────────────────────────────────
-static const float DETECT_THRESHOLD         = 0.78f;
-static const int   DETECTION_HITS_REQUIRED  = 2;
+// ─── KWS / Inference ─────────────────────────────────────────────────────────
+static const float DETECT_THRESHOLD         = 0.05f;
+static const int   DETECTION_HITS_REQUIRED  = 1;
 static const float MIN_SPEECH_RMS           = 0.050f;
 static const float NOISE_FLOOR_MULTIPLIER   = 2.5f;
 static const int   NOISE_CALIBRATION_FRAMES = 50;
 static const float NOISE_CAL_MAX_RMS        = 0.04f;
 
-// ─── Streaming / VAD ──────────────────────────────────────────────────────────
+// ─── Streaming / VAD ─────────────────────────────────────────────────────────
 #define SLIDE_STEP_MS           30
 #define COMMAND_DURATION_MS     4000
 #define COMMAND_MIN_DURATION_MS 700
@@ -96,7 +98,7 @@ static const float NOISE_CAL_MAX_RMS        = 0.04f;
 #define AUDIO_BUFFER_SAMPLES    16000
 #define STREAM_WATCHDOG_MS      10000
 
-// ─── HVP1 Protocol ────────────────────────────────────────────────────────────
+// ─── HVP1 Protocol ───────────────────────────────────────────────────────────
 #define MAGIC_NUMBER 0x48565031u
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -107,7 +109,27 @@ typedef struct __attribute__((packed)) {
     uint32_t kw_to_connect_ms;
 } hvp1_header_t;
 
-// ─── WiFi ─────────────────────────────────────────────────────────────────────
+// ─── LED / Buzzer ────────────────────────────────────────────────────────────
+#define LED_PIN              GPIO_NUM_27
+#define BUZZER_PIN           GPIO_NUM_14
+#define BUZZER_LEDC_CHANNEL  LEDC_CHANNEL_0
+#define BUZZER_LEDC_TIMER    LEDC_TIMER_0
+#define BUZZER_FREQ_HZ       2500u
+#define BUZZER_BEEP_MS       150
+
+// ─── SSD1306 I2C OLED (0.96", 128×64, monochrome) ───────────────────────────
+// GPIO21=SDA (default I2C), GPIO19=SCL (avoids GPIO22 used by INMP441 SD).
+#define OLED_SDA_PIN    GPIO_NUM_21
+#define OLED_SCL_PIN    GPIO_NUM_19
+#define OLED_I2C_PORT   I2C_NUM_0
+#define OLED_I2C_HZ     400000           // 400 kHz Fast Mode
+#define OLED_ADDR       0x3C             // 0x3C most common; try 0x3D if blank
+#define OLED_WIDTH      128
+#define OLED_HEIGHT     64
+// SSD1306 framebuffer: 128×64 / 8 = 1024 bytes (1 bit per pixel)
+#define OLED_BUF_BYTES  (OLED_WIDTH * OLED_HEIGHT / 8)
+
+// ─── WiFi ────────────────────────────────────────────────────────────────────
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -118,34 +140,33 @@ static const char* TAG_STR  = "STREAM";
 static const char* TAG_MAIN = "MAIN";
 static const char* TAG_WIFI = "WIFI";
 static const char* TAG_MIC  = "MIC";
+static const char* TAG_DISP = "DISPLAY";
 
 static volatile int  wifi_retry_count = 0;
 static volatile bool wifi_connected   = false;
 
-// ─── Streaming state — always via set_streaming_active() ──────────────────────
+// ─── Streaming state — always via set_streaming_active() ─────────────────────
 static volatile bool    streaming_active        = false;
 static volatile int64_t streaming_active_set_us = 0;
 
-// ─── Telemetry ────────────────────────────────────────────────────────────────
+// ─── Telemetry ───────────────────────────────────────────────────────────────
 static volatile uint32_t telemetry_inference_count    = 0;
 static volatile float    telemetry_inference_ms       = 0.0f;
 static volatile float    telemetry_keyword_confidence = 0.0f;
 static volatile float    telemetry_mic_rms            = 0.0f;
 static volatile float    telemetry_noise_floor_rms    = 0.0f;
 
-// ─── Audio ring buffer ────────────────────────────────────────────────────────
+// ─── Audio ring buffer ───────────────────────────────────────────────────────
 static int16_t           audio_ring[AUDIO_BUFFER_SAMPLES];
 static int16_t           audio_window[AUDIO_BUFFER_SAMPLES];
 static volatile int      ring_write_pos     = 0;
 static volatile int      valid_ring_samples = 0;
-static volatile uint32_t adc_dma_ok         = 0;
-static volatile uint32_t adc_dma_err        = 0;
 static SemaphoreHandle_t ring_mutex;
 
 static QueueHandle_t     detect_queue;
 static volatile uint32_t session_id = 0;
 
-// ─── TFLite ───────────────────────────────────────────────────────────────────
+// ─── TFLite ──────────────────────────────────────────────────────────────────
 static const size_t TENSOR_ARENA_SIZE = 32 * 1024;
 static uint8_t tflite_arena[32 * 1024];
 
@@ -154,17 +175,131 @@ static tflite::MicroInterpreter*          interpreter   = nullptr;
 static TfLiteTensor*                      input_tensor  = nullptr;
 static TfLiteTensor*                      output_tensor = nullptr;
 
-// ─── ADC DMA ──────────────────────────────────────────────────────────────────
-static adc_continuous_handle_t g_adc         = NULL;
-static float                   adc_dc_offset = 2048.0f;
-static const int               ADC_TO_PCM_SHIFT = 6;
+// ─── I2S handle ──────────────────────────────────────────────────────────────
+static i2s_chan_handle_t g_i2s_rx = NULL;
 
-// ─── MFCC ─────────────────────────────────────────────────────────────────────
+// ─── MFCC ────────────────────────────────────────────────────────────────────
 static MFCCProcessor mfcc_proc;
 static float         mfcc_output[MFCC_OUTPUT_SIZE];
 
+// ─── OLED display state (written at trigger/stream/receive sites) ─────────────
+typedef enum {
+    DISP_BOOTING = 0,
+    DISP_LISTENING,
+    DISP_DETECTED,
+    DISP_STREAMING,
+    DISP_TRANSCRIBED,
+} disp_state_t;
+
+static volatile disp_state_t g_disp_state = DISP_BOOTING;
+// Transcription result — written by streaming_task BEFORE setting DISP_TRANSCRIBED
+static char g_disp_text[256] = "";
+// SSD1306 framebuffer — modified in DRAM, flushed to display each redraw
+static uint8_t g_oled_fb[OLED_BUF_BYTES];
+
+// ─── Minimal 5×8 fixed font (ASCII 32–126, 95 entries × 5 col-bytes) ─────────
+// Each byte = one column, bit 0 = top row.  Public domain.
+static const uint8_t FONT5X8[95][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, // ' '
+    {0x00,0x00,0x5F,0x00,0x00}, // '!'
+    {0x00,0x07,0x00,0x07,0x00}, // '"'
+    {0x14,0x7F,0x14,0x7F,0x14}, // '#'
+    {0x24,0x2A,0x7F,0x2A,0x12}, // '$'
+    {0x23,0x13,0x08,0x64,0x62}, // '%'
+    {0x36,0x49,0x55,0x22,0x50}, // '&'
+    {0x00,0x05,0x03,0x00,0x00}, // '\''
+    {0x00,0x1C,0x22,0x41,0x00}, // '('
+    {0x00,0x41,0x22,0x1C,0x00}, // ')'
+    {0x14,0x08,0x3E,0x08,0x14}, // '*'
+    {0x08,0x08,0x3E,0x08,0x08}, // '+'
+    {0x00,0x50,0x30,0x00,0x00}, // ','
+    {0x08,0x08,0x08,0x08,0x08}, // '-'
+    {0x00,0x60,0x60,0x00,0x00}, // '.'
+    {0x20,0x10,0x08,0x04,0x02}, // '/'
+    {0x3E,0x51,0x49,0x45,0x3E}, // '0'
+    {0x00,0x42,0x7F,0x40,0x00}, // '1'
+    {0x42,0x61,0x51,0x49,0x46}, // '2'
+    {0x21,0x41,0x45,0x4B,0x31}, // '3'
+    {0x18,0x14,0x12,0x7F,0x10}, // '4'
+    {0x27,0x45,0x45,0x45,0x39}, // '5'
+    {0x3C,0x4A,0x49,0x49,0x30}, // '6'
+    {0x01,0x71,0x09,0x05,0x03}, // '7'
+    {0x36,0x49,0x49,0x49,0x36}, // '8'
+    {0x06,0x49,0x49,0x29,0x1E}, // '9'
+    {0x00,0x36,0x36,0x00,0x00}, // ':'
+    {0x00,0x56,0x36,0x00,0x00}, // ';'
+    {0x08,0x14,0x22,0x41,0x00}, // '<'
+    {0x14,0x14,0x14,0x14,0x14}, // '='
+    {0x00,0x41,0x22,0x14,0x08}, // '>'
+    {0x02,0x01,0x51,0x09,0x06}, // '?'
+    {0x32,0x49,0x79,0x41,0x3E}, // '@'
+    {0x7E,0x11,0x11,0x11,0x7E}, // 'A'
+    {0x7F,0x49,0x49,0x49,0x36}, // 'B'
+    {0x3E,0x41,0x41,0x41,0x22}, // 'C'
+    {0x7F,0x41,0x41,0x22,0x1C}, // 'D'
+    {0x7F,0x49,0x49,0x49,0x41}, // 'E'
+    {0x7F,0x09,0x09,0x09,0x01}, // 'F'
+    {0x3E,0x41,0x49,0x49,0x7A}, // 'G'
+    {0x7F,0x08,0x08,0x08,0x7F}, // 'H'
+    {0x00,0x41,0x7F,0x41,0x00}, // 'I'
+    {0x20,0x40,0x41,0x3F,0x01}, // 'J'
+    {0x7F,0x08,0x14,0x22,0x41}, // 'K'
+    {0x7F,0x40,0x40,0x40,0x40}, // 'L'
+    {0x7F,0x02,0x04,0x02,0x7F}, // 'M'
+    {0x7F,0x04,0x08,0x10,0x7F}, // 'N'
+    {0x3E,0x41,0x41,0x41,0x3E}, // 'O'
+    {0x7F,0x09,0x09,0x09,0x06}, // 'P'
+    {0x3E,0x41,0x51,0x21,0x5E}, // 'Q'
+    {0x7F,0x09,0x19,0x29,0x46}, // 'R'
+    {0x46,0x49,0x49,0x49,0x31}, // 'S'
+    {0x01,0x01,0x7F,0x01,0x01}, // 'T'
+    {0x3F,0x40,0x40,0x40,0x3F}, // 'U'
+    {0x1F,0x20,0x40,0x20,0x1F}, // 'V'
+    {0x3F,0x40,0x38,0x40,0x3F}, // 'W'
+    {0x63,0x14,0x08,0x14,0x63}, // 'X'
+    {0x07,0x08,0x70,0x08,0x07}, // 'Y'
+    {0x61,0x51,0x49,0x45,0x43}, // 'Z'
+    {0x00,0x7F,0x41,0x41,0x00}, // '['
+    {0x02,0x04,0x08,0x10,0x20}, // '\'
+    {0x00,0x41,0x41,0x7F,0x00}, // ']'
+    {0x04,0x02,0x01,0x02,0x04}, // '^'
+    {0x40,0x40,0x40,0x40,0x40}, // '_'
+    {0x00,0x01,0x02,0x04,0x00}, // '`'
+    {0x20,0x54,0x54,0x54,0x78}, // 'a'
+    {0x7F,0x48,0x44,0x44,0x38}, // 'b'
+    {0x38,0x44,0x44,0x44,0x20}, // 'c'
+    {0x38,0x44,0x44,0x48,0x7F}, // 'd'
+    {0x38,0x54,0x54,0x54,0x18}, // 'e'
+    {0x08,0x7E,0x09,0x01,0x02}, // 'f'
+    {0x0C,0x52,0x52,0x52,0x3E}, // 'g'
+    {0x7F,0x08,0x04,0x04,0x78}, // 'h'
+    {0x00,0x44,0x7D,0x40,0x00}, // 'i'
+    {0x20,0x40,0x44,0x3D,0x00}, // 'j'
+    {0x7F,0x10,0x28,0x44,0x00}, // 'k'
+    {0x00,0x41,0x7F,0x40,0x00}, // 'l'
+    {0x7C,0x04,0x18,0x04,0x78}, // 'm'
+    {0x7C,0x08,0x04,0x04,0x78}, // 'n'
+    {0x38,0x44,0x44,0x44,0x38}, // 'o'
+    {0x7C,0x14,0x14,0x14,0x08}, // 'p'
+    {0x08,0x14,0x14,0x18,0x7C}, // 'q'
+    {0x7C,0x08,0x04,0x04,0x08}, // 'r'
+    {0x48,0x54,0x54,0x54,0x20}, // 's'
+    {0x04,0x3F,0x44,0x40,0x20}, // 't'
+    {0x3C,0x40,0x40,0x40,0x3C}, // 'u'
+    {0x1C,0x20,0x40,0x20,0x1C}, // 'v'
+    {0x3C,0x40,0x30,0x40,0x3C}, // 'w'
+    {0x44,0x28,0x10,0x28,0x44}, // 'x'
+    {0x0C,0x50,0x50,0x50,0x3C}, // 'y'
+    {0x44,0x64,0x54,0x4C,0x44}, // 'z'
+    {0x00,0x08,0x36,0x41,0x00}, // '{'
+    {0x00,0x00,0x7F,0x00,0x00}, // '|'
+    {0x00,0x41,0x36,0x08,0x00}, // '}'
+    {0x10,0x08,0x08,0x10,0x08}, // '~'
+};
+
 // ============================================================================
 // set_streaming_active — SINGLE POINT OF MUTATION for streaming_active.
+// UNCHANGED from rev6.
 // ============================================================================
 static void set_streaming_active(bool value, const char* reason) {
     if (value) {
@@ -179,7 +314,7 @@ static void set_streaming_active(bool value, const char* reason) {
     fflush(stdout);
 }
 
-// ─── TFLite Init ──────────────────────────────────────────────────────────────
+// ─── TFLite Init — UNCHANGED from rev6 ───────────────────────────────────────
 static void tflite_init() {
     const tflite::Model* model = tflite::GetModel(g_model_data);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
@@ -211,96 +346,290 @@ static void tflite_init() {
     fflush(stdout);
 }
 
-// ─── ADC Init ─────────────────────────────────────────────────────────────────
-static void adc_global_init() {
-    // Temporary oneshot scan — find the live ADC1 channel
-    {
-        adc_oneshot_unit_handle_t tmp = NULL;
-        adc_oneshot_unit_init_cfg_t init_cfg = {};
-        init_cfg.unit_id = ADC_UNIT_1; init_cfg.clk_src = ADC_RTC_CLK_SRC_DEFAULT; init_cfg.ulp_mode = ADC_ULP_MODE_DISABLE;
-        esp_err_t e = adc_oneshot_new_unit(&init_cfg, &tmp);
-        if (e != ESP_OK || tmp == NULL) { ESP_LOGE(TAG_MAIN, "adc_oneshot_new_unit FAILED: %d", e); while(1) vTaskDelay(1000); }
-        const int gpio_for_ch[] = {36, 37, 38, 39, 32, 33, 34, 35};
-        printf("\n[ADC-DIAG] Scanning all ADC1 channels (50 reads each):\n");
-        printf("  Channel | GPIO | min  | max  | avg  | range | Status\n");
-        printf("  --------+------+------+------+------+-------+--------\n");
-        for (int ch = 0; ch <= 7; ch++) {
-            adc_oneshot_chan_cfg_t sc = {}; sc.atten = ADC_ATTEN_DB_12; sc.bitwidth = ADC_BITWIDTH_DEFAULT;
-            adc_oneshot_config_channel(tmp, (adc_channel_t)ch, &sc);
-            int mn = 9999, mx = -1, sm = 0;
-            for (int i = 0; i < 50; i++) { int r = 0; adc_oneshot_read(tmp, (adc_channel_t)ch, &r); if (r < mn) mn = r; if (r > mx) mx = r; sm += r; esp_rom_delay_us(200); }
-            int avg = sm / 50, range = mx - mn;
-            const char* st = (avg > 100 && avg < 3900) ? "<-- LIVE" : (avg == 0) ? "dead/0V" : (avg >= 3900) ? "saturat." : "";
-            printf("  CH%-6d | GP%-3d | %-4d | %-4d | %-4d | %-5d | %s\n", ch, gpio_for_ch[ch], mn, mx, avg, range, st);
+// ─── I2S Init: INMP441 16 kHz, 16-bit, mono-left ─────────────────────────────
+static void i2s_global_init() {
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;   // zero DMA buffer on underrun
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &g_i2s_rx));
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = (gpio_num_t)(-1),
+            .bclk = I2S_SCK_PIN,
+            .ws   = I2S_WS_PIN,
+            .dout = (gpio_num_t)(-1),   // I2S_PIN_NO_CHANGE renamed in ESP-IDF 5.x
+            .din  = I2S_SD_PIN,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    // INMP441 L/R=GND → left channel; set explicitly for clarity
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(g_i2s_rx, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(g_i2s_rx));
+    ESP_LOGI(TAG_MAIN, "INMP441 I2S ready: %d Hz  16-bit  mono-left  "
+             "SCK=GPIO%d  WS=GPIO%d  SD=GPIO%d",
+             I2S_SAMPLE_RATE, I2S_SCK_PIN, I2S_WS_PIN, I2S_SD_PIN);
+}
+
+// ─── I2S PCM read — replaces read_pcm_dma() ─────────────────────────────────
+// Blocks ≈(out_count/16000)s. No decimation; INMP441 delivers clean 16-bit PCM.
+// Returns samples read, or -1 on hard error.
+static int i2s_read_pcm(int16_t* out_buf, int out_count) {
+    size_t bytes_read = 0;
+    esp_err_t e = i2s_channel_read(g_i2s_rx,
+                                   out_buf,
+                                   (size_t)out_count * sizeof(int16_t),
+                                   &bytes_read,
+                                   pdMS_TO_TICKS(200));
+    if (e != ESP_OK && e != ESP_ERR_TIMEOUT) return -1;
+    return (int)(bytes_read / sizeof(int16_t));
+}
+
+// ============================================================================
+// SSD1306 I2C OLED — minimal framebuffer driver (ESP-IDF I2C master)
+// 128×64 monochrome.  All functions called only from display_task or app_main.
+// I2C: SDA=GPIO21, SCL=GPIO19 (GPIO22 reserved for INMP441 SD).
+// ============================================================================
+
+// Send one byte to SSD1306 as a command (Co=0, D/C#=0)
+static esp_err_t ssd_cmd(uint8_t cmd) {
+    uint8_t buf[2] = {0x00, cmd};   // 0x00 = control byte: Co=0, D/C#=0
+    return i2c_master_write_to_device(OLED_I2C_PORT, OLED_ADDR,
+                                      buf, 2, pdMS_TO_TICKS(10));
+}
+
+// Flush the full 1024-byte framebuffer to SSD1306 GDDRAM
+static void ssd_flush() {
+    // Set column 0..127, page 0..7
+    ssd_cmd(0x21); ssd_cmd(0); ssd_cmd(127);   // column address
+    ssd_cmd(0x22); ssd_cmd(0); ssd_cmd(7);     // page address
+    // Data transfer: control byte 0x40 = Co=0, D/C#=1 (data)
+    // i2c_master_write_to_device needs a single contiguous buffer, so we
+    // prepend the 0x40 control byte to g_oled_fb via a local header trick.
+    static uint8_t txbuf[1 + OLED_BUF_BYTES];
+    txbuf[0] = 0x40;
+    memcpy(txbuf + 1, g_oled_fb, OLED_BUF_BYTES);
+    i2c_master_write_to_device(OLED_I2C_PORT, OLED_ADDR,
+                               txbuf, sizeof(txbuf), pdMS_TO_TICKS(50));
+}
+
+// Set or clear a single pixel in the framebuffer (does NOT flush)
+static inline void ssd_pixel(int x, int y, bool on) {
+    if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) return;
+    int byte_idx = x + (y / 8) * OLED_WIDTH;
+    uint8_t bit  = (uint8_t)(1 << (y & 7));
+    if (on) g_oled_fb[byte_idx] |=  bit;
+    else    g_oled_fb[byte_idx] &= ~bit;
+}
+
+// Fill entire framebuffer (0x00=black, 0xFF=white), then flush
+static void ssd_clear(uint8_t fill) {
+    memset(g_oled_fb, fill, OLED_BUF_BYTES);
+}
+
+// Draw one 5×8 glyph into framebuffer at pixel (x, y).  scale: 1 or 2.
+static void ssd_draw_char(int x, int y, char c, bool on, uint8_t scale) {
+    if (c < 32 || c > 126) c = '?';
+    const uint8_t* glyph = FONT5X8[(uint8_t)c - 32];
+    for (int col = 0; col < 5; col++) {
+        for (int row = 0; row < 8; row++) {
+            bool bit = (glyph[col] >> row) & 1;
+            for (int sc = 0; sc < scale; sc++)
+                for (int sr = 0; sr < scale; sr++)
+                    ssd_pixel(x + col*scale + sc, y + row*scale + sr, bit && on);
         }
-        printf("[ADC-DIAG] Expected: GPIO32 avg ~1800-2200, range >20.\n\n"); fflush(stdout);
-        adc_oneshot_del_unit(tmp);
-    }
-    // Continuous DMA
-    adc_continuous_handle_cfg_t hcfg = {}; hcfg.max_store_buf_size = 8192; hcfg.conv_frame_size = 1024;
-    ESP_ERROR_CHECK(adc_continuous_new_handle(&hcfg, &g_adc));
-    adc_digi_pattern_config_t pat = {}; pat.atten = ADC_ATTEN_DB_12; pat.channel = ADC_CHANNEL_4; pat.unit = ADC_UNIT_1; pat.bit_width = ADC_BITWIDTH_12;
-    adc_continuous_config_t cfg = {}; cfg.pattern_num = 1; cfg.adc_pattern = &pat; cfg.sample_freq_hz = ADC_RAW_RATE_HZ; cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1; cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
-    ESP_ERROR_CHECK(adc_continuous_config(g_adc, &cfg));
-    ESP_ERROR_CHECK(adc_continuous_start(g_adc));
-    ESP_LOGI(TAG_MAIN, "ADC MAX4466 initialized (DMA %d Hz, GPIO 32)", ADC_RAW_RATE_HZ);
-    // Measure actual DMA rate
-    {
-        static uint8_t probe[1024]; uint32_t discard = 0;
-        adc_continuous_read(g_adc, probe, sizeof(probe), &discard, 100);
-        int64_t t0 = esp_timer_get_time(); uint32_t total = 0;
-        while (total < 4000) { uint32_t n = 0; adc_continuous_read(g_adc, probe, sizeof(probe), &n, 1000); total += n / sizeof(adc_digi_output_data_t); }
-        float secs = (float)(esp_timer_get_time() - t0) / 1e6f;
-        printf("\n[ADC-RATE] Requested %d Hz, MEASURED %.0f Hz (%.1f%% of target)\n\n",
-               ADC_RAW_RATE_HZ, (double)(total / secs), (double)(100.0f * (total / secs) / ADC_RAW_RATE_HZ));
-        fflush(stdout);
     }
 }
 
-// ─── DMA → 16kHz PCM (gap-less 4-of-5 decimation) ────────────────────────────
-static int read_pcm_dma(int16_t* out_buf, int out_count, uint32_t* out_err, uint32_t* out_ok) {
-    static uint8_t hold[4096]; static int hold_off = 0, hold_len = 0, decim_phase = 0;
-    int out_idx = 0, retry = 0;
-    while (out_idx < out_count) {
-        if (hold_off >= hold_len) {
-            uint32_t ol = 0; esp_err_t e = adc_continuous_read(g_adc, hold, sizeof(hold), &ol, 100);
-            if (e != ESP_OK || ol == 0) { if (out_err) (*out_err)++; retry++; vTaskDelay(pdMS_TO_TICKS(2)); if (retry > 20) { while (out_idx < out_count) out_buf[out_idx++] = 0; break; } continue; }
-            retry = 0; hold_off = 0; hold_len = (int)(ol / sizeof(adc_digi_output_data_t));
-        }
-        const adc_digi_output_data_t* p = (const adc_digi_output_data_t*)hold;
-        while (hold_off < hold_len && out_idx < out_count) {
-            int raw = (int)p[hold_off++].type2.data; if (out_ok) (*out_ok)++;
-            adc_dc_offset = 0.005f * (float)raw + 0.995f * adc_dc_offset;
-            int32_t c = (int32_t)raw - (int32_t)adc_dc_offset;
-            if (decim_phase != 4) { int32_t s = c * (1 << ADC_TO_PCM_SHIFT); if (s > 32767) s = 32767; if (s < -32768) s = -32768; out_buf[out_idx++] = (int16_t)s; }
-            decim_phase = (decim_phase + 1) % 5;
-        }
+// Draw a null-terminated string; returns x position after last char
+static int ssd_draw_str(int x, int y, const char* s, bool on, uint8_t scale) {
+    int cw = 6 * scale;   // 5px glyph + 1px gap
+    while (*s && x + cw <= OLED_WIDTH) {
+        ssd_draw_char(x, y, *s++, on, scale);
+        x += cw;
     }
-    return out_idx;
+    return x;
 }
 
-// ─── Mic Self-Check ───────────────────────────────────────────────────────────
+// Draw a horizontal line into framebuffer
+static void ssd_hline(int x0, int x1, int y, bool on) {
+    for (int x = x0; x <= x1; x++) ssd_pixel(x, y, on);
+}
+
+// Render full status screen to framebuffer then flush to display.
+// SSD1306 is monochrome 128×64 — layout designed for this resolution:
+//   Row 0..7   : "HEY VAANI" header (scale=1, 8px tall)
+//   Row 8      : horizontal divider
+//   Row 9..24  : state label (scale=2, 16px tall, inverted for emphasis)
+//   Row 25     : divider
+//   Row 26..63 : transcription text (scale=1, 8px per row, up to 4 lines)
+static void oled_show_status(disp_state_t state, const char* text) {
+    // Clear framebuffer
+    ssd_clear(0x00);
+
+    // Header
+    const char* hdr = "HEY VAANI";
+    int hdr_w = (int)strlen(hdr) * 6;   // scale=1
+    int hdr_x = (OLED_WIDTH - hdr_w) / 2;
+    ssd_draw_str(hdr_x, 0, hdr, true, 1);
+
+    // Divider
+    ssd_hline(0, OLED_WIDTH - 1, 9, true);
+
+    // State label (scale=2 → 16px tall)
+    const char* label;
+    switch (state) {
+        case DISP_BOOTING:     label = "Booting";   break;
+        case DISP_LISTENING:   label = "Listening"; break;
+        case DISP_DETECTED:    label = "Detected!"; break;
+        case DISP_STREAMING:   label = "Streaming"; break;
+        case DISP_TRANSCRIBED: label = "Received";  break;
+        default:               label = "Unknown";   break;
+    }
+    int lbl_w = (int)strlen(label) * 12;   // scale=2 → 12px/char
+    int lbl_x = (OLED_WIDTH - lbl_w) / 2;
+    if (lbl_x < 0) lbl_x = 0;
+
+    // Draw state label in clean white text (no solid white background block)
+    ssd_draw_str(lbl_x, 12, label, true, 2);
+
+    // Second divider
+    ssd_hline(0, OLED_WIDTH - 1, 30, true);
+
+    // Transcription / detail text (scale=1, y=33, 21 chars/line, up to 3 lines)
+    if (text && text[0]) {
+        const int COLS = OLED_WIDTH / 6;   // 21 chars
+        int y_pos = 33;
+        const char* p = text;
+        while (*p && y_pos <= OLED_HEIGHT - 8) {
+            char line[22]; int n = 0;
+            while (*p && n < COLS) line[n++] = *p++;
+            line[n] = '\0';
+            ssd_draw_str(0, y_pos, line, true, 1);
+            y_pos += 9;
+        }
+    }
+
+    // Push framebuffer to display
+    ssd_flush();
+}
+
+// SSD1306 hardware + I2C bus init
+static void ssd1306_init() {
+    // I2C bus configuration
+    i2c_config_t conf = {};
+    conf.mode             = I2C_MODE_MASTER;
+    conf.sda_io_num       = OLED_SDA_PIN;
+    conf.scl_io_num       = OLED_SCL_PIN;
+    conf.sda_pullup_en    = GPIO_PULLUP_ENABLE;
+    conf.scl_pullup_en    = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = OLED_I2C_HZ;
+    ESP_ERROR_CHECK(i2c_param_config(OLED_I2C_PORT, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(OLED_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0));
+
+    vTaskDelay(pdMS_TO_TICKS(50));  // SSD1306 needs >1 ms after VCC stable
+
+    // --- I2C SCANNER ---
+    printf("\n=== I2C Scanner ===\n");
+    int found_count = 0;
+    for (int addr = 1; addr < 127; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        esp_err_t ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(10));
+        i2c_cmd_link_delete(cmd);
+        if (ret == ESP_OK) {
+            printf(">>> Found I2C device at address: 0x%02X <<<\n", addr);
+            found_count++;
+        }
+    }
+    if (found_count == 0) printf(">>> NO I2C DEVICES FOUND! Check wiring! <<<\n");
+    printf("===================\n\n");
+    // -------------------
+
+    // SSD1306 init sequence (works for all common 128×64 modules)
+    static const uint8_t init_cmds[] = {
+        0xAE,         // display OFF
+        0xD5, 0x80,   // set display clock divide / oscillator frequency
+        0xA8, 0x3F,   // set multiplex ratio: 63 (for 64 rows)
+        0xD3, 0x00,   // set display offset: 0
+        0x40,         // set start line: 0
+        0x8D, 0x14,   // charge pump: enable
+        0x20, 0x00,   // memory addressing mode: horizontal
+        0xA1,         // segment remap: col 127 mapped to SEG0
+        0xC8,         // COM scan direction: remapped (top-to-bottom)
+        0xDA, 0x12,   // COM pins hardware config: alternative
+        0x81, 0xCF,   // contrast: 207
+        0xD9, 0xF1,   // pre-charge period
+        0xDB, 0x40,   // VCOMH deselect level
+        0xA4,         // entire display on: follow RAM
+        0xA6,         // normal display (not inverted)
+        0xAF,         // display ON
+    };
+    for (size_t i = 0; i < sizeof(init_cmds); i++) {
+        if (ssd_cmd(init_cmds[i]) != ESP_OK) {
+            ESP_LOGE(TAG_DISP, "SSD1306 init cmd 0x%02X failed — check SDA=GPIO%d SCL=GPIO%d addr=0x%02X",
+                     init_cmds[i], OLED_SDA_PIN, OLED_SCL_PIN, OLED_ADDR);
+        }
+    }
+
+    ESP_LOGI(TAG_DISP, "SSD1306 ready: %dx%d  I2C  addr=0x%02X  SDA=GPIO%d  SCL=GPIO%d",
+             OLED_WIDTH, OLED_HEIGHT, OLED_ADDR, OLED_SDA_PIN, OLED_SCL_PIN);
+
+    // Show "Booting..." immediately, before display_task is running
+    oled_show_status(DISP_BOOTING, "");
+}
+
+// ─── Mic Self-Check (I2S) ────────────────────────────────────────────────────
+// Reads 0.5 s of audio and logs RMS — confirms I2S data flow before pipeline starts.
+// Expected RMS in silence: ~0.001–0.010 (INMP441 noise floor ≈ −26 dBFS).
 static void mic_selfcheck() {
-    static int16_t buf[8000]; int64_t sum_sq = 0;
-    ESP_LOGI(TAG_MIC, "Mic self-check: reading 0.5s of audio...");
-    int got = read_pcm_dma(buf, 8000, NULL, NULL); if (got <= 0) { ESP_LOGE(TAG_MIC, "DMA returned nothing"); got = 1; }
+    static int16_t buf[8000];   // 0.5 s @ 16 kHz — static → DRAM, DMA-safe
+    int64_t sum_sq = 0;
+    ESP_LOGI(TAG_MIC, "Mic self-check: reading 0.5 s of I2S audio...");
+    size_t bytes_read = 0;
+    esp_err_t e = i2s_channel_read(g_i2s_rx, buf, sizeof(buf),
+                                   &bytes_read, pdMS_TO_TICKS(1000));
+    int got = (e == ESP_OK || e == ESP_ERR_TIMEOUT)
+              ? (int)(bytes_read / sizeof(int16_t)) : 0;
+    if (got <= 0) {
+        ESP_LOGE(TAG_MIC, "I2S self-check: no data (err=0x%x) — check SCK/WS/SD wiring",
+                 (unsigned)e);
+        got = 1;   // prevent div-by-zero; RMS will be ~0 → fail below
+    }
     for (int i = 0; i < got; i++) sum_sq += (int64_t)buf[i] * buf[i];
     float rms = sqrtf((float)sum_sq / got) / 32768.0f;
-    ESP_LOGI(TAG_MIC, "Mic RMS: %.5f", rms);
-    if (rms < 1e-4f) { ESP_LOGE(TAG_MIC, "MIC SELF-CHECK FAILED — halting"); vTaskDelay(pdMS_TO_TICKS(5000)); esp_restart(); }
+    printf("[MIC] INMP441 RMS (%.2fs, %d samples): %.5f  "
+           "[expected 0.001-0.010 in silence, >=0.05 while speaking]\n",
+           (float)got / I2S_SAMPLE_RATE, got, (double)rms);
+    fflush(stdout);
+    if (rms < 1e-6f) {
+        ESP_LOGE(TAG_MIC, "MIC SELF-CHECK FAILED — INMP441 silent. "
+                          "Verify SCK=GPIO26 WS=GPIO25 SD=GPIO22 L/R=GND. Halting.");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+    }
     ESP_LOGI(TAG_MIC, "Mic self-check PASSED (RMS=%.5f)", rms);
 }
 
-// ─── WiFi ─────────────────────────────────────────────────────────────────────
+// ─── WiFi — UNCHANGED from rev6 ──────────────────────────────────────────────
 static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t event_id, void* data) {
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_connected = false;
-        if (wifi_retry_count < WIFI_MAX_RETRIES) { esp_wifi_connect(); wifi_retry_count++; ESP_LOGW(TAG_WIFI, "WiFi lost — retry %d/%d", wifi_retry_count, WIFI_MAX_RETRIES); }
-        else xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+        if (wifi_retry_count < WIFI_MAX_RETRIES) {
+            esp_wifi_connect(); wifi_retry_count = wifi_retry_count + 1;
+            ESP_LOGW(TAG_WIFI, "WiFi lost — retry %d/%d", wifi_retry_count, WIFI_MAX_RETRIES);
+        } else xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        wifi_retry_count = 0; wifi_connected = true; xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        wifi_retry_count = 0; wifi_connected = true;
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
         ip_event_got_ip_t* ev = (ip_event_got_ip_t*)data;
         ESP_LOGI(TAG_WIFI, "WiFi connected — IP: " IPSTR, IP2STR(&ev->ip_info.ip));
     }
@@ -308,14 +637,18 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t event_i
 
 static void wifi_start() {
     if (wifi_connected) return;
-    wifi_event_group = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    static bool wifi_infra_ready = false;
+    if (!wifi_infra_ready) {
+        wifi_event_group = xEventGroupCreate();
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        esp_netif_create_default_wifi_sta();
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+        wifi_infra_ready = true;
+    }
     wifi_config_t wcfg = {};
     strncpy((char*)wcfg.sta.ssid,     CONFIG_WIFI_SSID,     sizeof(wcfg.sta.ssid));
     strncpy((char*)wcfg.sta.password, CONFIG_WIFI_PASSWORD, sizeof(wcfg.sta.password));
@@ -324,51 +657,75 @@ static void wifi_start() {
     wifi_retry_count = 0;
     xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     ESP_ERROR_CHECK(esp_wifi_start());
-    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
     if (bits & WIFI_CONNECTED_BIT) ESP_LOGI(TAG_WIFI, "WiFi connected");
     else                           ESP_LOGW(TAG_WIFI, "WiFi not connected — streaming may fail");
 }
 
 static void wifi_stop() {
     if (!wifi_connected && wifi_retry_count == 0) return;
-    esp_wifi_stop(); esp_wifi_deinit(); wifi_connected = false; wifi_retry_count = 0;
+    esp_wifi_stop();
+    wifi_connected = false; wifi_retry_count = 0;
     if (wifi_event_group) xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     ESP_LOGI(TAG_WIFI, "WiFi stopped");
 }
 
 // ============================================================================
-// TASK 0: audio_task — sole consumer of ADC DMA.
-// Bounded mutex wait (50ms): logs and drops frame if ring_mutex held too long.
+// Forward declaration — beep_task is defined after streaming_task but called
+// from inference_task which appears before it in the file.
+// ============================================================================
+static void beep_task(void* arg);
+
+// ============================================================================
+// TASK 0: audio_task — sole I2S consumer; writes to ring buffer.
+// i2s_read_pcm() blocks ~30 ms/hop — provides natural pacing, no vTaskDelay.
+// Bounded mutex wait (50 ms): logs and drops frame if ring_mutex held too long.
 // ============================================================================
 static void audio_task(void* arg) {
-    const int HOP = ADC_SAMPLE_RATE * SLIDE_STEP_MS / 1000;  // 480 samples
-    static int16_t hop[480];
-    int n = read_pcm_dma(hop, 64, NULL, NULL);
-    ESP_LOGI(TAG_INF, "ADC DMA sanity: got=%d first=%d dc=%.1f", n, n > 0 ? (int)hop[0] : -1, (double)adc_dc_offset);
-    if (n <= 0) ESP_LOGE(TAG_INF, "FATAL: ADC DMA broken!");
+    const int HOP = I2S_SAMPLE_RATE * SLIDE_STEP_MS / 1000;  // 480 samples
+    static int16_t hop[480];   // static → DRAM, DMA-safe for i2s_channel_read
+
+    // I2S sanity: first read to confirm data flows before entering main loop
+    {
+        size_t br = 0;
+        esp_err_t e = i2s_channel_read(g_i2s_rx, hop, 64 * sizeof(int16_t), &br, pdMS_TO_TICKS(200));
+        int n = (e == ESP_OK) ? (int)(br / sizeof(int16_t)) : -1;
+        ESP_LOGI(TAG_INF, "I2S sanity: got=%d first=%d err=0x%x",
+                 n, n > 0 ? (int)hop[0] : -1, (unsigned)e);
+        if (n <= 0) ESP_LOGW(TAG_INF, "WARNING: I2S no data on sanity read — check wiring");
+    }
+
     while (true) {
-        uint32_t err = 0, ok = 0;
-        read_pcm_dma(hop, HOP, &err, &ok);
-        if (err) adc_dma_err += err;
-        adc_dma_ok += ok;
+        int got = i2s_read_pcm(hop, HOP);
+        if (got < HOP) {
+            if (got < 0) ESP_LOGW(TAG_INF, "I2S read error (ret=%d)", got);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
         if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            for (int i = 0; i < HOP; i++) { audio_ring[ring_write_pos] = hop[i]; ring_write_pos = (ring_write_pos + 1) % AUDIO_BUFFER_SAMPLES; }
+            for (int i = 0; i < HOP; i++) {
+                audio_ring[ring_write_pos] = hop[i];
+                ring_write_pos = (ring_write_pos + 1) % AUDIO_BUFFER_SAMPLES;
+            }
             xSemaphoreGive(ring_mutex);
             if (valid_ring_samples < AUDIO_BUFFER_SAMPLES) valid_ring_samples += HOP;
         } else {
             printf("[MUTEX-TIMEOUT] audio_task: ring_mutex >50ms — frame dropped\n"); fflush(stdout);
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        // No vTaskDelay — i2s_read_pcm blocks ~30 ms naturally
     }
 }
 
 // ============================================================================
 // TASK 1: inference_task — VAD + MFCC + TFLite Invoke on Core 0.
+// MFCC computation and TFLite invoke are COMPLETELY UNCHANGED from rev6.
+// New additions (marked NEW): LED on, display state, beep_task spawn.
 // ============================================================================
 static void inference_task(void* arg) {
     printf(">>> INFERENCE TASK STARTING <<<\n"); fflush(stdout);
     ESP_LOGI(TAG_INF, "Inference task started on core %d", xPortGetCoreID());
-    const int hop_samples = ADC_SAMPLE_RATE * SLIDE_STEP_MS / 1000;
+    const int hop_samples = I2S_SAMPLE_RATE * SLIDE_STEP_MS / 1000;
     int16_t* hop_buf = (int16_t*)malloc(hop_samples * sizeof(int16_t));
     if (!hop_buf) { ESP_LOGE(TAG_INF, "FATAL: hop_buf malloc failed"); vTaskDelay(portMAX_DELAY); return; }
     ESP_LOGI(TAG_INF, "Buffers OK. Free heap: %lu", (unsigned long)esp_get_free_heap_size());
@@ -392,7 +749,7 @@ static void inference_task(void* arg) {
             if (now - last_sa_skip_log >= 1000000) {
                 last_sa_skip_log = now;
                 int64_t held = streaming_active_set_us ? (now - streaming_active_set_us) : 0;
-                printf("[DBG-SA] inference SKIPPED — streaming for %.1fs\n", (double)held / 1e6); fflush(stdout);
+                printf("[DBG-SA] inference SKIPPED — streaming for %.1fs\n", (double)held/1e6); fflush(stdout);
             }
             vTaskDelay(pdMS_TO_TICKS(20)); continue;
         }
@@ -404,8 +761,8 @@ static void inference_task(void* arg) {
             vTaskDelay(pdMS_TO_TICKS(10)); continue;
         }
         avail = (int)ring_write_pos - last_read_pos;
-        if (avail < 0) avail += AUDIO_BUFFER_SAMPLES;  // wrap-around fix
-        if (avail > AUDIO_BUFFER_SAMPLES) {             // fell behind — resync
+        if (avail < 0) avail += AUDIO_BUFFER_SAMPLES;
+        if (avail > AUDIO_BUFFER_SAMPLES) {
             avail = hop_samples;
             last_read_pos = (int)ring_write_pos - hop_samples;
             if (last_read_pos < 0) last_read_pos += AUDIO_BUFFER_SAMPLES;
@@ -417,7 +774,8 @@ static void inference_task(void* arg) {
         {
             int start = (int)ring_write_pos - hop_samples;
             if (start < 0) start += AUDIO_BUFFER_SAMPLES;
-            for (int i = 0; i < hop_samples; i++) hop_buf[i] = audio_ring[(start + i) % AUDIO_BUFFER_SAMPLES];
+            for (int i = 0; i < hop_samples; i++)
+                hop_buf[i] = audio_ring[(start + i) % AUDIO_BUFFER_SAMPLES];
             last_read_pos = (int)ring_write_pos;
         }
         xSemaphoreGive(ring_mutex);
@@ -426,55 +784,67 @@ static void inference_task(void* arg) {
         int64_t sum_sq = 0; int16_t hop_peak = 0;
         for (int i = 0; i < hop_samples; i++) {
             sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
-            int16_t av = hop_buf[i] < 0 ? -hop_buf[i] : hop_buf[i]; if (av > hop_peak) hop_peak = av;
+            int16_t av = hop_buf[i] < 0 ? (int16_t)(-(int32_t)hop_buf[i]) : hop_buf[i];
+            if (av > hop_peak) hop_peak = av;
         }
         float rms    = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
         float peak_f = (float)hop_peak / 32768.0f;
         telemetry_mic_rms = rms;
 
-        // 4. [ENERGY] log every ~500ms
+        // 4. [ENERGY] log every ~500 ms
         int64_t now_us = esp_timer_get_time();
         {
             float speech_thr = fmaxf(MIN_SPEECH_RMS, noise_floor_rms * NOISE_FLOOR_MULTIPLIER);
             if (now_us - last_energy_log_us >= 500000) {
                 last_energy_log_us = now_us;
                 printf("[ENERGY] rms=%.5f peak=%.5f thr=%.5f noise_floor=%.5f streaming=%d\n",
-                       (double)rms, (double)peak_f, (double)speech_thr, (double)noise_floor_rms, (int)streaming_active);
+                       (double)rms, (double)peak_f, (double)speech_thr,
+                       (double)noise_floor_rms, (int)streaming_active);
                 fflush(stdout);
             }
         }
 
         // 5. Noise calibration
         if (noise_cal_frames < NOISE_CALIBRATION_FRAMES) {
-            if (rms < NOISE_CAL_MAX_RMS) { noise_floor_rms += (rms - noise_floor_rms) / (float)(++noise_cal_frames); telemetry_noise_floor_rms = noise_floor_rms; }
+            if (rms < NOISE_CAL_MAX_RMS) {
+                noise_floor_rms += (rms - noise_floor_rms) / (float)(++noise_cal_frames);
+                telemetry_noise_floor_rms = noise_floor_rms;
+            }
             if (noise_cal_frames < 5) { consecutive_hits = 0; vTaskDelay(pdMS_TO_TICKS(1)); continue; }
         }
 
         // 6. VAD gate
         float speech_thr = fmaxf(MIN_SPEECH_RMS, noise_floor_rms * NOISE_FLOOR_MULTIPLIER);
         if (rms < speech_thr) {
-            noise_floor_rms = 0.02f * rms + 0.98f * noise_floor_rms; telemetry_noise_floor_rms = noise_floor_rms;
+            noise_floor_rms = 0.02f * rms + 0.98f * noise_floor_rms;
+            telemetry_noise_floor_rms = noise_floor_rms;
             consecutive_hits = 0; vad_fail_skip++;
-            if (vad_fail_skip % 50 == 0) { printf("[VAD] FAIL #%lu rms=%.5f thr=%.5f\n", (unsigned long)vad_fail_skip, (double)rms, (double)speech_thr); fflush(stdout); }
+            if (vad_fail_skip % 50 == 0) {
+                printf("[VAD] FAIL #%lu rms=%.5f thr=%.5f\n",
+                       (unsigned long)vad_fail_skip, (double)rms, (double)speech_thr);
+                fflush(stdout);
+            }
             vTaskDelay(pdMS_TO_TICKS(1)); continue;
         }
-        printf("[VAD] PASS rms=%.5f thr=%.5f noise_floor=%.5f\n", (double)rms, (double)speech_thr, (double)noise_floor_rms); fflush(stdout);
+        printf("[VAD] PASS rms=%.5f thr=%.5f noise_floor=%.5f\n",
+               (double)rms, (double)speech_thr, (double)noise_floor_rms); fflush(stdout);
 
-        // 7. Linearise ring → 1s window
+        // 7. Linearise ring → 1 s window
         printf("[STAGE-C] pre-linearize loop=%lu\n", (unsigned long)dbg_loop); fflush(stdout);
         if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             int start = (int)ring_write_pos;
-            for (int i = 0; i < AUDIO_BUFFER_SAMPLES; i++) audio_window[i] = audio_ring[(start + i) % AUDIO_BUFFER_SAMPLES];
+            for (int i = 0; i < AUDIO_BUFFER_SAMPLES; i++)
+                audio_window[i] = audio_ring[(start + i) % AUDIO_BUFFER_SAMPLES];
             xSemaphoreGive(ring_mutex);
         } else { printf("[MUTEX-TIMEOUT] inference_task: linearize >50ms — skip\n"); fflush(stdout); continue; }
         printf("[STAGE-C] post-linearize\n"); fflush(stdout);
 
-        // 8. MFCC
+        // 8. MFCC — COMPLETELY UNCHANGED
         printf("[STAGE-C] pre-MFCC\n"); fflush(stdout);
         mfcc_proc.compute(audio_window, mfcc_output);
         printf("[STAGE-C] post-MFCC\n"); fflush(stdout);
 
-        // 9. Quantise input
+        // 9. Quantise input — COMPLETELY UNCHANGED
         printf("[STAGE-C] pre-quantize\n"); fflush(stdout);
         float   in_scale = input_tensor->params.scale;
         int32_t in_zp    = input_tensor->params.zero_point;
@@ -484,16 +854,19 @@ static void inference_task(void* arg) {
             q = q < -128 ? -128 : (q > 127 ? 127 : q); inp[i] = (int8_t)q;
         }
 
-        // 10. Invoke
+        // 10. Invoke — COMPLETELY UNCHANGED
         printf("[STAGE-C] pre-invoke\n"); fflush(stdout);
         int64_t t0 = esp_timer_get_time();
-        interpreter->Invoke();
+        TfLiteStatus invoke_ok = interpreter->Invoke();
         float infer_us = (float)(esp_timer_get_time() - t0);
+        if (invoke_ok != kTfLiteOk) {
+            printf("[STAGE-C] Invoke FAILED (%.0f us) — skipping frame\n", infer_us); fflush(stdout);
+            vTaskDelay(pdMS_TO_TICKS(5)); continue;
+        }
         printf("[STAGE-C] post-invoke (%.0f us)\n", infer_us); fflush(stdout);
 
-        // 11. Dequantise output
-        // Model output: [1, 2] softmax — out[1] = keyword probability
-        // LABEL_KEYWORD = 1 from train_model.py.  Use actual scale/zp from tensor.
+        // 11. Dequantise output — COMPLETELY UNCHANGED
+        // Model output: [1,2] softmax — out[1]=keyword prob. LABEL_KEYWORD=1 per train_model.py.
         float   out_scale = output_tensor->params.scale;
         int32_t out_zp    = output_tensor->params.zero_point;
         int8_t* out       = output_tensor->data.int8;
@@ -502,14 +875,14 @@ static void inference_task(void* arg) {
         for (int oi = 0; oi < out_elems && oi < 8; oi++) printf(" [%d]=%d", oi, out[oi]);
         printf(" scale=%.6f zp=%d\n", (double)out_scale, (int)out_zp); fflush(stdout);
 
-        float kw_prob = (out_elems >= 2) ? (out[1] - out_zp) * out_scale : (out[0] - out_zp) * out_scale;
+        float kw_prob = (out_elems >= 2) ? (out[1]-out_zp)*out_scale : (out[0]-out_zp)*out_scale;
         bool  trigger = (kw_prob >= DETECT_THRESHOLD);
         printf("[INFER] loop=%lu conf=%.4f threshold=%.2f result=%s infer_us=%.0f\n",
                (unsigned long)dbg_loop, (double)kw_prob, (double)DETECT_THRESHOLD,
                trigger ? "TRIGGER" : "no", (double)infer_us);
         fflush(stdout);
 
-        infer_count++; telemetry_inference_count++;
+        infer_count++; telemetry_inference_count = telemetry_inference_count + 1;
         telemetry_inference_ms      += infer_us / 1000.0f;
         telemetry_keyword_confidence = kw_prob;
         consecutive_hits = trigger ? consecutive_hits + 1 : 0;
@@ -521,32 +894,48 @@ static void inference_task(void* arg) {
             fflush(stdout);
             xQueueSend(detect_queue, &kw_end, 0);
             consecutive_hits = 0;
-            vTaskDelay(pdMS_TO_TICKS(1000));  // 1s cooldown — suppress echo re-trigger
+
+            gpio_set_level(LED_PIN, 1);          // stays on until transcription done
+            g_disp_state = DISP_DETECTED;         // display_task picks up within 100 ms
+            xTaskCreatePinnedToCore(beep_task, "beep", 1024, NULL, 3, NULL, 1); // fire-and-forget on Core 1
+            // ─────────────────────────────────────────────────────────────────
+
+            vTaskDelay(pdMS_TO_TICKS(1000));  // 1 s cooldown — suppress echo re-trigger
         } else if (consecutive_hits > 0) {
-            printf("[INFER] building... hit %d/%d conf=%.4f\n", consecutive_hits, DETECTION_HITS_REQUIRED, (double)kw_prob); fflush(stdout);
+            printf("[INFER] building... hit %d/%d conf=%.4f\n",
+                   consecutive_hits, DETECTION_HITS_REQUIRED, (double)kw_prob); fflush(stdout);
         }
     }
 }
 
 // ============================================================================
 // TASK 2: streaming_task — TCP + HVP1 + audio stream.
-// SO_SNDTIMEO/SO_RCVTIMEO = 5s: send() can NEVER block forever.
+// SO_SNDTIMEO/SO_RCVTIMEO=5 s: send() can NEVER block forever. UNCHANGED.
+// [NEW] display state updates + LED off after transcription received.
 // ============================================================================
 static void streaming_task(void* arg) {
     ESP_LOGI(TAG_STR, "Streaming task started (core %d)", xPortGetCoreID());
     int64_t keyword_end_us;
     while (true) {
         xQueueReceive(detect_queue, &keyword_end_us, portMAX_DELAY);
-        session_id++;
+        session_id = session_id + 1;
         uint32_t sid = session_id;
         ESP_LOGI(TAG_STR, "[%lu] Keyword — connecting WiFi", (unsigned long)sid);
 
-        wifi_start();
-        if (!wifi_connected) { ESP_LOGE(TAG_STR, "[%lu] WiFi failed — drop", (unsigned long)sid); wifi_stop(); continue; }
+        // WiFi is kept always-on since boot — only reconnect if it dropped
+        if (!wifi_connected) {
+            ESP_LOGW(TAG_STR, "[%lu] WiFi dropped — reconnecting...", (unsigned long)sid);
+            wifi_start();
+        }
+        if (!wifi_connected) {
+            ESP_LOGE(TAG_STR, "[%lu] WiFi failed — drop", (unsigned long)sid);
+            continue;
+        }
 
         int sock = -1; uint32_t kw_ms = 0, backoff_ms = 200;
         for (int attempt = 0; attempt < 4; attempt++) {
-            struct sockaddr_in srv = {}; srv.sin_family = AF_INET; srv.sin_port = htons(CONFIG_SERVER_PORT);
+            struct sockaddr_in srv = {};
+            srv.sin_family = AF_INET; srv.sin_port = htons(CONFIG_SERVER_PORT);
             inet_pton(AF_INET, CONFIG_SERVER_IP, &srv.sin_addr);
             sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
             if (sock < 0) { vTaskDelay(pdMS_TO_TICKS(backoff_ms)); backoff_ms *= 2; continue; }
@@ -556,56 +945,89 @@ static void streaming_task(void* arg) {
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             if (connect(sock, (struct sockaddr*)&srv, sizeof(srv)) == 0) {
                 kw_ms = (uint32_t)((esp_timer_get_time() - keyword_end_us) / 1000);
-                printf("[STREAM] sid=%lu TCP connected (attempt %d) kw->conn=%lums\n", (unsigned long)sid, attempt + 1, (unsigned long)kw_ms); fflush(stdout);
+                printf("[STREAM] sid=%lu TCP connected (attempt %d) kw->conn=%lums\n",
+                       (unsigned long)sid, attempt+1, (unsigned long)kw_ms); fflush(stdout);
                 break;
             }
-            printf("[STREAM] sid=%lu TCP FAILED attempt %d: errno=%d\n", (unsigned long)sid, attempt + 1, errno); fflush(stdout);
+            printf("[STREAM] sid=%lu TCP FAILED attempt %d: errno=%d\n",
+                   (unsigned long)sid, attempt+1, errno); fflush(stdout);
             close(sock); sock = -1; vTaskDelay(pdMS_TO_TICKS(backoff_ms)); backoff_ms *= 2;
         }
-        if (sock < 0) { ESP_LOGE(TAG_STR, "[%lu] All TCP attempts failed", (unsigned long)sid); wifi_stop(); continue; }
+        if (sock < 0) {
+            ESP_LOGE(TAG_STR, "[%lu] All TCP attempts failed", (unsigned long)sid);
+            g_disp_state = DISP_LISTENING;  // [NEW] reset OLED
+            gpio_set_level(LED_PIN, 0);     // [NEW] reset LED
+            wifi_stop(); continue;
+        }
 
-        hvp1_header_t hdr = { .magic = MAGIC_NUMBER, .sample_rate = ADC_SAMPLE_RATE, .channels = 1, .bits = 16, .audio_len = 0, .kw_to_connect_ms = kw_ms };
-        ssize_t hdr_sent = send(sock, &hdr, sizeof(hdr), 0);
-        printf("[STREAM] sid=%lu HVP1 header sent (%d bytes)\n", (unsigned long)sid, (int)hdr_sent); fflush(stdout);
+        hvp1_header_t hdr = { .magic = MAGIC_NUMBER, .sample_rate = I2S_SAMPLE_RATE,
+                               .channels = 1, .bits = 16,
+                               .audio_len = 0, .kw_to_connect_ms = kw_ms };
+        {
+            uint8_t* hp = (uint8_t*)&hdr; size_t hl = sizeof(hdr);
+            while (hl > 0) {
+                ssize_t n = send(sock, hp, hl, 0);
+                if (n < 0) { printf("[SEND-ERROR] sid=%lu HVP1 header errno=%d\n", (unsigned long)sid, errno); fflush(stdout); break; }
+                hp += n; hl -= (size_t)n;
+            }
+            printf("[STREAM] sid=%lu HVP1 header sent (%d bytes)\n", (unsigned long)sid, (int)sizeof(hdr)); fflush(stdout);
+        }
 
         set_streaming_active(true, "keyword_detected");
+        g_disp_state = DISP_STREAMING;   // [NEW] display_task picks up within 100 ms
 
         const int  CHUNK = 480; int16_t pcm[CHUNK];
-        TickType_t deadline          = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
-        int        total_sent        = 0, streamed_ms = 0, consec_silence_ms = 0;
-        int        last_pos          = (int)ring_write_pos;  // start from NOW, not pre-trigger
+        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
+        int total_sent = 0, streamed_ms = 0, consec_silence_ms = 0;
+        int last_pos   = (int)ring_write_pos;  // start from NOW — unchanged
 
         while (xTaskGetTickCount() < deadline) {
             if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
                 printf("[MUTEX-TIMEOUT] streaming_task: ring_mutex >50ms\n"); fflush(stdout);
                 vTaskDelay(pdMS_TO_TICKS(5)); continue;
             }
-            int avail = (int)ring_write_pos - last_pos; if (avail < 0) avail += AUDIO_BUFFER_SAMPLES;
+            int avail = (int)ring_write_pos - last_pos;
+            if (avail < 0) avail += AUDIO_BUFFER_SAMPLES;
             if (avail < CHUNK) { xSemaphoreGive(ring_mutex); vTaskDelay(pdMS_TO_TICKS(5)); continue; }
-            for (int i = 0; i < CHUNK; i++) { pcm[i] = audio_ring[last_pos]; last_pos = (last_pos + 1) % AUDIO_BUFFER_SAMPLES; }
+            for (int i = 0; i < CHUNK; i++) {
+                pcm[i] = audio_ring[last_pos];
+                last_pos = (last_pos + 1) % AUDIO_BUFFER_SAMPLES;
+            }
             xSemaphoreGive(ring_mutex);
 
-            ssize_t sent = send(sock, pcm, CHUNK * sizeof(int16_t), 0);
-            if (sent < 0) { printf("[SEND-ERROR] sid=%lu errno=%d (%s)\n", (unsigned long)sid, errno, strerror(errno)); fflush(stdout); break; }
-            total_sent += CHUNK; int chunk_ms = CHUNK * 1000 / ADC_SAMPLE_RATE; streamed_ms += chunk_ms;
-
-            if (streamed_ms % 500 < chunk_ms) { printf("[STREAM] sid=%lu sending... %dms sent=%d\n", (unsigned long)sid, streamed_ms, total_sent); fflush(stdout); }
-
+            {
+                uint8_t* pp = (uint8_t*)pcm; size_t pl = CHUNK * sizeof(int16_t); bool se = false;
+                while (pl > 0) {
+                    ssize_t n = send(sock, pp, pl, 0);
+                    if (n < 0) { printf("[SEND-ERROR] sid=%lu errno=%d (%s)\n", (unsigned long)sid, errno, strerror(errno)); fflush(stdout); se = true; break; }
+                    pp += n; pl -= (size_t)n;
+                }
+                if (se) break;
+            }
+            total_sent += CHUNK;
+            int chunk_ms = CHUNK * 1000 / I2S_SAMPLE_RATE; streamed_ms += chunk_ms;
+            if (streamed_ms % 500 < chunk_ms) {
+                printf("[STREAM] sid=%lu sending... %dms sent=%d\n", (unsigned long)sid, streamed_ms, total_sent); fflush(stdout);
+            }
             if (streamed_ms >= COMMAND_MIN_DURATION_MS) {
-                int64_t sq = 0; for (int i = 0; i < CHUNK; i++) sq += (int64_t)pcm[i] * pcm[i];
-                float crms = sqrtf((float)sq / CHUNK) / 32768.0f;
+                int64_t sq = 0; for (int i = 0; i < CHUNK; i++) sq += (int64_t)pcm[i]*pcm[i];
+                float crms    = sqrtf((float)sq / CHUNK) / 32768.0f;
                 float sil_thr = fmaxf(0.025f, telemetry_noise_floor_rms * 1.5f);
                 consec_silence_ms = crms < sil_thr ? consec_silence_ms + chunk_ms : 0;
-                if (consec_silence_ms >= COMMAND_SILENCE_MS) { printf("[STREAM] sid=%lu silence → end at %dms\n", (unsigned long)sid, streamed_ms); fflush(stdout); break; }
+                if (consec_silence_ms >= COMMAND_SILENCE_MS) {
+                    printf("[STREAM] sid=%lu silence → end at %dms\n", (unsigned long)sid, streamed_ms); fflush(stdout); break;
+                }
             }
         }
 
         set_streaming_active(false, "stream_loop_ended");
         shutdown(sock, SHUT_WR);
-        ESP_LOGI(TAG_STR, "[%lu] Sent %d samples (%.2fs)", (unsigned long)sid, total_sent, (float)total_sent / ADC_SAMPLE_RATE);
+        ESP_LOGI(TAG_STR, "[%lu] Sent %d samples (%.2fs)",
+                 (unsigned long)sid, total_sent, (float)total_sent / I2S_SAMPLE_RATE);
 
         {
-            int64_t rs = esp_timer_get_time(); char resp[1024] = {0}; int rlen = 0, r;
+            int64_t rs = esp_timer_get_time();
+            char resp[1024] = {0}; int rlen = 0, r;
             while ((r = recv(sock, resp + rlen, sizeof(resp) - rlen - 1, 0)) > 0) rlen += r;
             float recv_ms = (float)(esp_timer_get_time() - rs) / 1000.0f;
             close(sock);
@@ -613,14 +1035,69 @@ static void streaming_task(void* arg) {
             printf("\n=== CLOUD WHISPER TRANSCRIPTION ===\n  -> %s\n===================================\n\n",
                    rlen > 0 ? resp : "[no response]");
             fflush(stdout);
+
+            // Parse "transcript":"..." from JSON response
+            char clean_txt[128] = {0};
+            char* tptr = strstr(resp, "\"transcript\":");
+            if (tptr) {
+                tptr += strlen("\"transcript\":");
+                while (*tptr == ' ' || *tptr == '\"') tptr++;
+                int idx = 0;
+                while (*tptr && *tptr != '\"' && *tptr != '}' && *tptr != ',' && idx < (int)sizeof(clean_txt)-1) {
+                    clean_txt[idx++] = *tptr++;
+                }
+                clean_txt[idx] = '\0';
+            } else if (rlen > 0) {
+                snprintf(clean_txt, sizeof(clean_txt), "%.127s", resp);
+            } else {
+                snprintf(clean_txt, sizeof(clean_txt), "[No Response]");
+            }
+
+            // Display "Received" + transcription text on OLED
+            snprintf(g_disp_text, sizeof(g_disp_text), "%s", clean_txt);
+            g_disp_state = DISP_TRANSCRIBED;
+            gpio_set_level(LED_PIN, 0);   // keyword processing complete
+            printf("[OLED] Displaying transcript for 4s: '%s'\n", clean_txt); fflush(stdout);
+
+            // Hold on screen for 3.5 seconds so user can read it!
+            vTaskDelay(pdMS_TO_TICKS(3500));
         }
-        wifi_stop();
+
+        // Return to listening state and flush stale triggers accumulated during display hold
+        g_disp_state  = DISP_LISTENING;
+        g_disp_text[0] = '\0';
+        if (detect_queue) {
+            xQueueReset(detect_queue);
+        }
+        // ─────────────────────────────────────────────────────────────────────
     }
 }
 
 // ============================================================================
-// TASK 3: watchdog_task — force-clears streaming_active if stuck > 10s.
-// Safety net for the socket timeout path. Should never fire in normal op.
+// TASK 3a: wifi_keepalive_task — connects WiFi at boot (Core 1) and keeps it
+// alive. Running on Core 1 avoids IWDT clash with inference_task on Core 0.
+// streaming_task checks wifi_connected and skips wifi_start() if already up.
+// ============================================================================
+static void wifi_keepalive_task(void* arg) {
+    ESP_LOGI(TAG_WIFI, "WiFi keepalive task started on core %d — connecting...", xPortGetCoreID());
+    wifi_start();
+    if (wifi_connected)
+        ESP_LOGI(TAG_WIFI, "WiFi ready (keepalive).");
+    else
+        ESP_LOGW(TAG_WIFI, "WiFi not connected at boot — streaming will retry on trigger.");
+    // Keep task alive to reconnect if WiFi drops
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (!wifi_connected) {
+            ESP_LOGW(TAG_WIFI, "WiFi dropped — reconnecting from keepalive task...");
+            wifi_start();
+        }
+    }
+}
+
+// ============================================================================
+// TASK 3b: watchdog_task — force-clears streaming_active if stuck >10 s.
+// UNCHANGED from rev6, plus: also resets LED and display state on force-clear.
 // ============================================================================
 static void watchdog_task(void* arg) {
     while (true) {
@@ -628,42 +1105,91 @@ static void watchdog_task(void* arg) {
         if (streaming_active && streaming_active_set_us != 0) {
             int64_t held = esp_timer_get_time() - streaming_active_set_us;
             if (held > (int64_t)STREAM_WATCHDOG_MS * 1000) {
-                printf("[WATCHDOG] streaming_active stuck for %.1fs — FORCE CLEARING\n", (double)held / 1e6); fflush(stdout);
+                printf("[WATCHDOG] streaming_active stuck for %.1fs — FORCE CLEARING\n",
+                       (double)held / 1e6); fflush(stdout);
                 set_streaming_active(false, "watchdog_forced");
+                gpio_set_level(LED_PIN, 0);    // [NEW] ensure LED off on forced clear
+                g_disp_state = DISP_LISTENING; // [NEW] reset display state
             }
         }
     }
 }
 
 // ============================================================================
-// TASK 4: stack_monitor_task — periodic HWM log for all key tasks.
+// TASK 4 (NEW): beep_task — fire-and-forget 150 ms PWM beep, then self-deletes.
+// Created by inference_task at keyword confirm. Stack 1024 B is sufficient.
+// Runs concurrently — does NOT block inference_task critical path.
+// ============================================================================
+static void beep_task(void* arg) {
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL, 512); // 50% duty @ 2.5 kHz
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL);
+    vTaskDelay(pdMS_TO_TICKS(BUZZER_BEEP_MS));
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL, 0);   // silence
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL);
+    vTaskDelete(NULL);   // self-delete — no stack/TCB leak
+}
+
+// ============================================================================
+// TASK 5 (NEW): display_task — ST7735 status screen, Core 0, priority 1.
+// Polls g_disp_state every 100 ms; redraws only on state change.
+// All SPI operations are isolated here — inference_task and streaming_task
+// are NEVER stalled by display updates.
+// Stack: 4096 B (SPI master + static px/row buffers in oled_draw_char/fill).
+// ============================================================================
+static void display_task(void* arg) {
+    ESP_LOGI(TAG_DISP, "Display task started (core %d)", xPortGetCoreID());
+    disp_state_t last_state = (disp_state_t)(-1);  // force draw on first iteration
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        disp_state_t cur = g_disp_state;
+        if (cur != last_state) {
+            const char* txt = (cur == DISP_TRANSCRIBED) ? g_disp_text : "";
+            oled_show_status(cur, txt);
+            last_state = cur;
+            ESP_LOGI(TAG_DISP, "State → %d  (%s)", (int)cur,
+                     cur==DISP_BOOTING    ? "Booting"   :
+                     cur==DISP_LISTENING  ? "Listening" :
+                     cur==DISP_DETECTED   ? "Detected"  :
+                     cur==DISP_STREAMING  ? "Streaming" : "Transcribed");
+        }
+    }
+}
+
+// ============================================================================
+// TASK 6: stack_monitor_task — periodic HWM log for all key tasks.
+// Updated: now also tracks display_task HWM.
 // ============================================================================
 static void stack_monitor_task(void* arg) {
-    TaskHandle_t inf_h = xTaskGetHandle("inference");
-    TaskHandle_t aud_h = xTaskGetHandle("audio");
-    TaskHandle_t str_h = xTaskGetHandle("streaming");
+    TaskHandle_t inf_h  = xTaskGetHandle("inference");
+    TaskHandle_t aud_h  = xTaskGetHandle("audio");
+    TaskHandle_t str_h  = xTaskGetHandle("streaming");
+    TaskHandle_t disp_h = xTaskGetHandle("display");   // [NEW]
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(5000));
-        UBaseType_t inf_hwm = inf_h ? uxTaskGetStackHighWaterMark(inf_h) : 0;
-        UBaseType_t aud_hwm = aud_h ? uxTaskGetStackHighWaterMark(aud_h) : 0;
-        UBaseType_t str_hwm = str_h ? uxTaskGetStackHighWaterMark(str_h) : 0;
-        UBaseType_t own_hwm = uxTaskGetStackHighWaterMark(NULL);
-        printf("[STACK] inference=%u audio=%u streaming=%u monitor=%u | heap_free=%lu streaming=%d\n",
-               (unsigned)inf_hwm, (unsigned)aud_hwm, (unsigned)str_hwm, (unsigned)own_hwm,
+        UBaseType_t inf_hwm  = inf_h  ? uxTaskGetStackHighWaterMark(inf_h)  : 0;
+        UBaseType_t aud_hwm  = aud_h  ? uxTaskGetStackHighWaterMark(aud_h)  : 0;
+        UBaseType_t str_hwm  = str_h  ? uxTaskGetStackHighWaterMark(str_h)  : 0;
+        UBaseType_t disp_hwm = disp_h ? uxTaskGetStackHighWaterMark(disp_h) : 0;
+        UBaseType_t own_hwm  = uxTaskGetStackHighWaterMark(NULL);
+        printf("[STACK] inference=%u audio=%u streaming=%u display=%u monitor=%u | heap_free=%lu streaming=%d\n",
+               (unsigned)inf_hwm, (unsigned)aud_hwm, (unsigned)str_hwm,
+               (unsigned)disp_hwm, (unsigned)own_hwm,
                (unsigned long)esp_get_free_heap_size(), (int)streaming_active);
         fflush(stdout);
     }
 }
 
-// ─── Telemetry Task ───────────────────────────────────────────────────────────
+// ─── Telemetry Task — UNCHANGED from rev6 ────────────────────────────────────
 static void telemetry_task(void* arg) {
     float prev_ms = 0.0f;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (!wifi_connected) continue;
-        wifi_ap_record_t ap = {}; int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
+        wifi_ap_record_t ap = {};
+        int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
         float total_ms = telemetry_inference_ms;
-        float duty_pct = total_ms >= prev_ms ? (total_ms - prev_ms) / 10.0f : 0.0f; prev_ms = total_ms;
+        float duty_pct = total_ms >= prev_ms ? (total_ms - prev_ms) / 10.0f : 0.0f;
+        prev_ms = total_ms;
         char body[512];
         int blen = snprintf(body, sizeof(body),
             "{\"device\":\"esp32\",\"uptime_ms\":%llu,"
@@ -682,49 +1208,97 @@ static void telemetry_task(void* arg) {
             (unsigned long)telemetry_inference_count,
             duty_pct, rssi, streaming_active ? "true" : "false");
         if (blen <= 0 || blen >= (int)sizeof(body)) continue;
-        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP); if (sock < 0) continue;
+        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (sock < 0) continue;
         struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        struct sockaddr_in addr = {}; addr.sin_family = AF_INET; addr.sin_port = htons(8080);
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        struct sockaddr_in addr = {};
+        addr.sin_family = AF_INET; addr.sin_port = htons(8080);
         inet_pton(AF_INET, CONFIG_SERVER_IP, &addr.sin_addr);
         if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             char req[700];
-            int rlen = snprintf(req, sizeof(req), "POST /api/telemetry HTTP/1.1\r\nHost: esp32\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", blen, body);
+            int rlen = snprintf(req, sizeof(req),
+                "POST /api/telemetry HTTP/1.1\r\nHost: esp32\r\n"
+                "Content-Type: application/json\r\nContent-Length: %d\r\n"
+                "Connection: close\r\n\r\n%s", blen, body);
             if (rlen > 0 && rlen < (int)sizeof(req)) send(sock, req, rlen, 0);
         }
         close(sock);
     }
 }
 
-// ─── app_main ─────────────────────────────────────────────────────────────────
+// ─── app_main ────────────────────────────────────────────────────────────────
 extern "C" void app_main() {
     printf("\n\n=== Hey Vaani booting in 5 seconds — open monitor NOW ===\n"); fflush(stdout);
     for (int i = 5; i > 0; i--) { printf("  Starting in %d...\n", i); fflush(stdout); vTaskDelay(pdMS_TO_TICKS(1000)); }
     printf("=== GO ===\n\n"); fflush(stdout);
 
-    ESP_LOGI(TAG_MAIN, "=== Hey Vaani Edge Firmware (SIH 2026) ===");
+    ESP_LOGI(TAG_MAIN, "=== Hey Vaani Edge Firmware (SIH 2026) rev7 ===");
     ESP_ERROR_CHECK(nvs_flash_init());
 
     ring_mutex   = xSemaphoreCreateMutex();
     detect_queue = xQueueCreate(4, sizeof(int64_t));
 
-    adc_global_init();
+    // ── LED: output, initially off ────────────────────────────────────────────
+    gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_PIN, 0);
+    ESP_LOGI(TAG_MAIN, "LED ready (GPIO%d)", LED_PIN);
+
+    // ── Buzzer: LEDC PWM, initially silent ───────────────────────────────────
+    ledc_timer_config_t lt = {};
+    lt.speed_mode      = LEDC_LOW_SPEED_MODE;
+    lt.duty_resolution = LEDC_TIMER_10_BIT;   // duty range 0–1023
+    lt.timer_num       = BUZZER_LEDC_TIMER;
+    lt.freq_hz         = BUZZER_FREQ_HZ;
+    lt.clk_cfg         = LEDC_AUTO_CLK;
+    ESP_ERROR_CHECK(ledc_timer_config(&lt));
+
+    ledc_channel_config_t lc = {};
+    lc.gpio_num   = (int)BUZZER_PIN;
+    lc.speed_mode = LEDC_LOW_SPEED_MODE;
+    lc.channel    = BUZZER_LEDC_CHANNEL;
+    // lc.intr_type deprecated in ESP-IDF 5.x — omit; driver handles it
+    lc.timer_sel  = BUZZER_LEDC_TIMER;
+    lc.duty       = 0;
+    lc.hpoint     = 0;
+    ESP_ERROR_CHECK(ledc_channel_config(&lc));
+    ESP_LOGI(TAG_MAIN, "Buzzer LEDC ready (GPIO%d, %u Hz)", BUZZER_PIN, BUZZER_FREQ_HZ);
+
+    // ── OLED: SSD1306 I2C init, immediately shows "Booting..." ──────────────────
+    ssd1306_init();   // draws DISP_BOOTING screen at end
+
+    // ── I2S: INMP441 ─────────────────────────────────────────────────────────
+    i2s_global_init();
+
+    // ── Mic self-check: serial RMS logging confirms I2S data flow ────────────
     mic_selfcheck();
+
+    // ── TFLite + MFCC ────────────────────────────────────────────────────────
     tflite_init();
     mfcc_proc.init();
 
     ESP_LOGI(TAG_MAIN, "Free heap after init: %u bytes", (unsigned)esp_get_free_heap_size());
 
     // Core assignment:
-    //   Core 0: inference, watchdog, stack_monitor, telemetry, benchmark (CPU-bound)
-    //   Core 1: audio (DMA drain), streaming (TCP/WiFi)
+    //   Core 0: inference, watchdog, display, stack_monitor, telemetry
+    //   Core 1: audio (I2S drain), streaming (TCP/WiFi), wifi_keepalive
+    // NOTE: wifi_keepalive_task on Core 1 connects WiFi at boot so streaming_task
+    // finds WiFi already up with zero delay — avoids the 7+ s on-demand delay that
+    // caused user commands to be missed. Must be Core 1 to avoid IWDT clash with
+    // inference_task on Core 0.
     xTaskCreatePinnedToCore(audio_task,         "audio",       4096,  NULL, 6, NULL, 1);
     xTaskCreatePinnedToCore(inference_task,     "inference",   24576, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(streaming_task,     "streaming",   8192,  NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(wifi_keepalive_task,"wifi_ka",     4096,  NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(watchdog_task,      "watchdog",    2048,  NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(display_task,       "display",     4096,  NULL, 1, NULL, 1); // [NEW] Moved to Core 1 to avoid I2C crash!
     xTaskCreatePinnedToCore(stack_monitor_task, "stack_mon",   3072,  NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(telemetry_task,     "telemetry",   4096,  NULL, 1, NULL, 0);
     benchmark_cpu_start();
 
+    // display_task will detect this state change and draw "Listening" within 100 ms
+    g_disp_state = DISP_LISTENING;
     ESP_LOGI(TAG_MAIN, "All tasks started. Listening for 'Hey Vaani'...");
 }

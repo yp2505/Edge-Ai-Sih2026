@@ -47,7 +47,7 @@ static inline void benchmark_cpu_start() {
         NULL,
         1,         // lowest priority
         NULL,
-        0          // run on core 0 (core 1 used for inference)
+        0          // run on core 0 (same as inference)
     );
     ESP_LOGI(BENCHMARK_TAG, "CPU benchmark task started (logs every %d sec)",
              BENCHMARK_INTERVAL_MS / 1000);

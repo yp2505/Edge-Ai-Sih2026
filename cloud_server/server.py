@@ -38,6 +38,7 @@ import socket
 import wave
 import argparse
 import threading
+from datetime import datetime
 import re
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -406,13 +407,6 @@ class ASRServer:
                     if stage == "ring_buffer":
                         ring_buffer_audio += chunk
                         if len(ring_buffer_audio) >= sr * 2:  # 1s = sr * 2 bytes
-                            # Send this before the user has finished the command.
-                            # The newline separates it from final ASR JSON.
-                            client_socket.sendall(json.dumps({
-                                "event": "edge_wake_word_accepted",
-                                "session_id": session_id,
-                                "wake_word_confirmed": True,
-                            }).encode("utf-8") + b"\n")
                             edge_wake_word_accepted = True
                             stage = "live_stream"
                             print(f"  ✅ [{session_id}] Edge wake-word accepted — receiving command")
