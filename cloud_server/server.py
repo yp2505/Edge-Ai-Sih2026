@@ -3,23 +3,32 @@
 cloud_server/server.py — CANONICAL Cloud ASR Server for Hey Vaani
 
 Pipeline:
-  ESP32 (main.cpp) → TCP socket → HVP1 header → raw PCM (live-streamed) → THIS SERVER
-  → faster-whisper (INT8, CPU) → transcript → JSON response → ESP32 display
+  ESP32 → TCP socket → HVP1 header → raw PCM (live-streamed) → THIS SERVER
+  → ASR (Vosk offline OR faster-whisper) → transcript
+  → Intent Engine (Ollama SLM, optional) → JSON response → ESP32
 
 Protocol: 20-byte HVP1 header (magic 0x48565031).
   audio_len = 0  →  live-streaming mode (ESP32 sends 30ms chunks until TCP close)
   audio_len > 0  →  batch mode (legacy / --test mode)
 
-ASR Engine: faster-whisper only (open-source, fully offline, no API key).
+ASR Engines (all open-source, fully offline):
+  --asr whisper  (default) — faster-whisper INT8, no account needed.
+  --asr vosk               — Vosk offline ASR, lighter weight.
+
+Intent Engine (optional, requires Ollama running locally):
+  --intent                 — Enable Ollama SLM intent extraction after ASR.
 
 Usage:
-    python server.py                        # port 5000, Whisper tiny
-    python server.py --whisper-model base   # larger model, better accuracy
+    python server.py                          # Whisper, no intent engine
+    python server.py --asr vosk               # Vosk ASR
+    python server.py --asr vosk --intent      # Vosk + SLM intent
+    python server.py --whisper-model base     # larger Whisper model
     python server.py --port 8080
-    python server.py --test audio.wav       # send a WAV as if from ESP32
+    python server.py --test audio.wav
 
 Install:
-    pip install faster-whisper numpy soundfile
+    pip install faster-whisper vosk numpy soundfile requests
+    # For intent: install Ollama + pull qwen2.5:0.5b
 """
 
 import os
@@ -114,22 +123,25 @@ WHISPER_VAD_PARAMETERS = {
 WHISPER_REPETITION_PENALTY = 1.1
 
 # ─── ASR backend imports ──────────────────────────────────────────────────────
-# The server supports two ASR backends, selected via --asr flag:
+# The server supports two open-source, fully-offline ASR backends:
 #
-#   --asr whisper  (default) — faster-whisper running locally on the laptop.
+#   --asr whisper  (default) — faster-whisper running locally.
 #                              Free, offline, no account needed.
-#                              ~200ms for 'tiny', ~450ms for 'base'.
+#                              pip install faster-whisper
 #
-#   --asr aws      ————————— Amazon Transcribe Streaming API.
-#                              AWS Free Tier: 60 min/month for 12 months.
-#                              At ~2s per detection → 1,800 free detections/month.
-#                              Requires: pip install "amazon-transcribe[awscrt]"
-#                                        aws configure  (one-time setup)
-#                              Uses region ap-south-1 (Mumbai — lowest latency
-#                              from India) with language code en-IN.
+#   --asr vosk               — Vosk offline ASR engine.
+#                              Lighter weight, lower latency on CPU.
+#                              pip install vosk
+#                              Download model: https://alphacephei.com/vosk/models
+#                              Place in: cloud_server/vosk_model/
 #
-# Both backends plug into the same _transcribe() dispatcher, so all other
-# server logic (HVP1 protocol, VAD, verification gate, dashboard) is unchanged.
+# Intent Engine (--intent flag):
+#   After ASR transcription, optionally call a local Ollama SLM to extract
+#   structured intent (action, target, value) from the user's command.
+#   Requires: ollama running on localhost:11434
+#             ollama pull qwen2.5:0.5b
+#
+# All backends are open-source and run 100% offline — no cloud services needed.
 
 try:
     from faster_whisper import WhisperModel  # type: ignore
@@ -138,17 +150,23 @@ except ImportError:
     _WHISPER_AVAILABLE = False
 
 try:
-    import asyncio
-    from amazon_transcribe.client import TranscribeStreamingClient  # type: ignore
-    from amazon_transcribe.handlers import TranscriptResultStreamHandler  # type: ignore
-    from amazon_transcribe.model import TranscriptEvent  # type: ignore
-    _AWS_AVAILABLE = True
+    import vosk  # type: ignore
+    _VOSK_AVAILABLE = True
 except ImportError:
-    _AWS_AVAILABLE = False
+    _VOSK_AVAILABLE = False
 
-# ─── ASR backend selection ────────────────────────────────────────────────────
-# Set by --asr CLI flag. Validated at startup in main().
-ASR_ENGINE = "whisper"   # overridden to "aws" when --asr aws is passed
+try:
+    import requests as _requests  # used for Ollama intent API
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
+
+# ─── ASR backend + intent selection ──────────────────────────────────────────
+# Set by CLI flags in main().
+ASR_ENGINE    = "whisper"   # overridden by --asr flag
+INTENT_ENABLE = False       # overridden by --intent flag
+OLLAMA_MODEL  = "qwen2.5:0.5b"   # small, fast, ~400MB RAM
+OLLAMA_URL    = "http://localhost:11434/api/generate"
 
 
 # ─── Configuration ─────────────────────────────────────────────────────────
@@ -268,13 +286,16 @@ class ASRServer:
       end_to_end_ms                     = sum of the three above
     """
 
-    def __init__(self, port: int = DEFAULT_PORT, whisper_model: str = "tiny",
+    def __init__(self, port: int = DEFAULT_PORT,
+                 whisper_model: str = "tiny",
                  dashboard_port: int = DASHBOARD_API_PORT,
-                 asr_engine: str = "whisper"):
+                 asr_engine: str = "whisper",
+                 intent_enable: bool = False):
         self.port          = port
         self.dashboard_port = dashboard_port
         self.whisper_model  = whisper_model
-        self.asr_engine     = asr_engine   # "whisper" | "aws"
+        self.asr_engine    = asr_engine
+        self.intent_enable = intent_enable
         self.transcriber    = None
         self.session_count  = 0
         self.start_time     = time.time()
@@ -505,7 +526,7 @@ class ASRServer:
                 transcribe_ms = 0
                 print(f"  ⚠️  [{session_id}] SKIPPED transcription — {skip_reason}")
             else:
-                engine_label = "Amazon Transcribe" if self.asr_engine == "aws" else f"faster-whisper '{self.whisper_model}'"
+                engine_label = f"Vosk" if self.asr_engine == "vosk" else f"faster-whisper '{self.whisper_model}'"
                 print(f"  🗣️  [{session_id}] Transcribing with {engine_label}...")
                 t_t0 = time.time()
                 transcript, avg_log_prob = self._transcribe(audio_data, wav_path, session_id, sr)
@@ -515,21 +536,33 @@ class ASRServer:
             is_confirmed, match_score, matched_var = self._verify_keyword_transcript(transcript)
             verification_status = "CONFIRMED" if is_confirmed else "REJECTED"
 
+            # ── Step 3b: Intent extraction via Ollama SLM (optional) ──────
+            intent_data = None
+            intent_ms   = 0
+            if self.intent_enable and not transcript.startswith("["):
+                t_intent = time.time()
+                intent_data = self._extract_intent(transcript, session_id)
+                intent_ms = int((time.time() - t_intent) * 1000)
+
             total_server_ms = int(time.time() * 1000) - connection_accepted_ms
             end_to_end_ms   = kw_to_connect_ms + total_server_ms
 
+            asr_label = "Vosk" if self.asr_engine == "vosk" else f"Whisper '{self.whisper_model}'"
             print(f"\n  {'─' * 58}")
             print(f"  📝 [{session_id}] RAW TRANSCRIPT:  \"{transcript}\"")
+            if intent_data:
+                print(f"  🤖 [{session_id}] INTENT:          {json.dumps(intent_data)}")
             print(f"  🛡️  [{session_id}] VERIFICATION GATE: {verification_status} (score={match_score:.2f}, match='{matched_var}')")
-            engine_label = "Amazon Transcribe" if self.asr_engine == "aws" else f"Whisper '{self.whisper_model}'"
             print(f"  ⏱️  [{session_id}] kw→connect   (ESP32):   {kw_to_connect_ms}ms")
             print(f"  ⏱️  [{session_id}] connect→1st byte:        {receive_gap_ms}ms")
-            print(f"  ⏱️  [{session_id}] {engine_label}:   {transcribe_ms}ms")
+            print(f"  ⏱️  [{session_id}] {asr_label}:            {transcribe_ms}ms")
+            if intent_ms:
+                print(f"  ⏱️  [{session_id}] Intent (Ollama):         {intent_ms}ms")
             print(f"  ⏱️  [{session_id}] END-TO-END:              {end_to_end_ms}ms")
             print(f"  {'─' * 58}\n")
 
             # ── Step 4: Send JSON response to ESP32 ───────────────────────
-            response = json.dumps({
+            response_dict = {
                 "transcript":          transcript,
                 "verification_status": verification_status,
                 "verified":            is_confirmed,
@@ -538,9 +571,12 @@ class ASRServer:
                 "end_to_end_ms":       end_to_end_ms,
                 "transcribe_ms":       transcribe_ms,
                 "session_id":          session_id,
-                "asr_engine":          f"faster-whisper-{self.whisper_model}",
+                "asr_engine":          self.asr_engine,
                 "wake_word_confirmed": is_confirmed,
-            }).encode("utf-8")
+            }
+            if intent_data:
+                response_dict["intent"] = intent_data
+            response = json.dumps(response_dict).encode("utf-8")
             try:
                 client_socket.sendall(response)
             except Exception:
@@ -565,7 +601,7 @@ class ASRServer:
                 "avg_log_prob":           round(avg_log_prob, 4) if avg_log_prob else None,
                 "skipped":                skip_reason is not None,
                 "skip_reason":            skip_reason,
-                "asr_engine":             f"faster-whisper-{self.whisper_model}",
+                "asr_engine":             self.asr_engine,
                 # Single-clock latency (no NTP needed)
                 "kw_to_connect_ms":       kw_to_connect_ms,
                 "connection_accepted_ms": connection_accepted_ms,
@@ -697,73 +733,112 @@ class ASRServer:
     def _transcribe(self, audio_data: bytes, wav_path: str,
                     session_id: int = 0, sample_rate: int = 16000) -> tuple:
         """
-        Dispatcher: routes to _transcribe_aws() or _transcribe_whisper()
+        Dispatcher: routes to _transcribe_vosk() or _transcribe_whisper()
         depending on self.asr_engine.  Returns (transcript, avg_log_prob).
         """
-        if self.asr_engine == "aws":
-            return self._transcribe_aws(audio_data, session_id, sample_rate)
+        if self.asr_engine == "vosk":
+            return self._transcribe_vosk(audio_data, session_id, sample_rate)
         return self._transcribe_whisper(wav_path, session_id)
 
-    # ── Backend A: Amazon Transcribe Streaming ─────────────────────────────
-    def _transcribe_aws(self, audio_data: bytes, session_id: int,
-                        sample_rate: int = 16000) -> tuple:
+    # ── Backend A: Vosk (local, offline, open-source) ──────────────────────
+    def _transcribe_vosk(self, audio_data: bytes, session_id: int,
+                         sample_rate: int = 16000) -> tuple:
         """
-        Stream raw 16-bit PCM to Amazon Transcribe Streaming API and collect
-        the final (non-partial) transcript.
+        Transcribe raw 16-bit PCM using Vosk offline ASR.
+        Vosk runs 100% locally — no cloud, no API key, no internet required.
 
-        AWS Free Tier: 60 minutes/month for 12 months.
-        Region: ap-south-1 (Mumbai) — lowest latency from India.
-        Language: en-IN (Indian English).
-
-        avg_log_prob is not available from Transcribe, so always returns None.
+        Setup:
+          pip install vosk
+          Download model from https://alphacephei.com/vosk/models
+          e.g. vosk-model-en-us-0.22 (40MB) or vosk-model-small-en-us-0.15 (40MB)
+          Place in cloud_server/vosk_model/
         """
         try:
-            final_parts: list = []
+            if not _VOSK_AVAILABLE:
+                raise RuntimeError("vosk not installed — run: pip install vosk")
 
-            class _Handler(TranscriptResultStreamHandler):  # type: ignore
-                async def handle_transcript_event(self, event: TranscriptEvent):  # type: ignore
-                    for result in event.transcript.results:
-                        if not result.is_partial:          # only take final results
-                            for alt in result.alternatives:
-                                text = alt.transcript.strip()
-                                if text:
-                                    final_parts.append(text)
-
-            async def _run():
-                client = TranscribeStreamingClient(region="ap-south-1")
-                stream = await client.start_stream_transcription(
-                    language_code="en-IN",
-                    media_sample_rate_hz=sample_rate,
-                    media_encoding="pcm",
-                    # Stabilise partial results before they are finalized
-                    enable_partial_results_stabilization=True,
-                    partial_results_stability="high",
+            model_path = os.path.join(os.path.dirname(__file__), "vosk_model")
+            if not os.path.isdir(model_path):
+                raise RuntimeError(
+                    f"Vosk model not found at {model_path}\n"
+                    "  Download from https://alphacephei.com/vosk/models\n"
+                    "  Unzip into cloud_server/vosk_model/"
                 )
-                handler = _Handler(stream.output_stream)
 
-                async def _feed():
-                    # Stream in 100ms chunks (3200 bytes at 16kHz int16)
-                    chunk_size = sample_rate * 2 // 10
-                    for i in range(0, len(audio_data), chunk_size):
-                        await stream.input_stream.send_audio_event(
-                            audio_chunk=audio_data[i:i + chunk_size]
-                        )
-                    await stream.input_stream.end_stream()
+            model = vosk.Model(model_path)
+            rec   = vosk.KaldiRecognizer(model, sample_rate)
+            rec.SetWords(True)
 
-                await asyncio.gather(_feed(), handler.handle_events())
+            # Feed audio in 4KB chunks
+            chunk_size = 8000  # 250ms at 16kHz int16
+            for i in range(0, len(audio_data), chunk_size):
+                rec.AcceptWaveform(audio_data[i:i + chunk_size])
 
-            asyncio.run(_run())
-
-            transcript = " ".join(final_parts).strip() or "[silence]"
-            print(f"  ☁️  [{session_id}] AWS Transcribe result: {repr(transcript)}")
-            return transcript, None   # Transcribe doesn't give log-probs
+            result = json.loads(rec.FinalResult())
+            transcript = result.get("text", "").strip() or "[silence]"
+            print(f"  🟢 [{session_id}] Vosk result: {repr(transcript)}")
+            return transcript, None   # Vosk doesn't give log-probs
 
         except Exception as e:
-            print(f"  ❌ [{session_id}] AWS Transcribe error: {e}")
-            print(f"  ℹ️  Check: aws configure (key/secret/region=ap-south-1)")
-            return f"[aws transcribe error: {e}]", None
+            print(f"  ❌ [{session_id}] Vosk error: {e}")
+            return f"[vosk error: {e}]", None
 
-    # ── Backend B: faster-whisper (local, offline) ─────────────────────────
+    # ── Intent Extraction: Ollama SLM (local, fully offline) ───────────────
+    def _extract_intent(self, transcript: str, session_id: int) -> dict | None:
+        """
+        Send transcribed text to a locally running Ollama SLM to extract
+        structured intent. Ollama runs 100% offline — no internet required.
+
+        Setup:
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama pull qwen2.5:0.5b   # ~400MB, fast on CPU
+          ollama serve                # runs on localhost:11434
+
+        The SLM maps natural language → structured JSON:
+          "turn on the lights" → {"intent": "LIGHTS", "action": "ON", "target": "lights"}
+          "it's getting dark" → {"intent": "LIGHTS", "action": "ON", "target": "ambient"}
+          "oxygen level low" → {"intent": "OXYGEN", "action": "INCREASE", "target": "flow"}
+        """
+        if not _REQUESTS_AVAILABLE:
+            print(f"  ⚠️  [{session_id}] requests not installed — skipping intent")
+            return None
+
+        prompt = (
+            "You are an AI assistant embedded in a space habitat voice control system. "
+            "Extract the intent from the astronaut's voice command below.\n"
+            "Reply ONLY with a single JSON object — no explanation, no markdown.\n"
+            "JSON keys: intent (string), action (string), target (string), value (string or null).\n"
+            "Examples:\n"
+            "  Command: 'turn on the lights' → {\"intent\": \"LIGHTS\", \"action\": \"ON\", \"target\": \"lights\", \"value\": null}\n"
+            "  Command: 'increase oxygen to section 2' → {\"intent\": \"OXYGEN\", \"action\": \"INCREASE\", \"target\": \"section_2\", \"value\": null}\n"
+            "  Command: 'set temperature to 22 degrees' → {\"intent\": \"TEMPERATURE\", \"action\": \"SET\", \"target\": \"habitat\", \"value\": \"22\"}\n"
+            "  Command: 'send status report' → {\"intent\": \"REPORT\", \"action\": \"SEND\", \"target\": \"status\", \"value\": null}\n"
+            f"\nCommand: '{transcript}'\nJSON:"
+        )
+        try:
+            resp = _requests.post(
+                OLLAMA_URL,
+                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("response", "").strip()
+            # Strip markdown code blocks if model wrapped the JSON
+            raw = raw.strip("` \n").removeprefix("json").strip()
+            intent = json.loads(raw)
+            print(f"  🤖 [{session_id}] Ollama intent: {intent}")
+            return intent
+        except _requests.exceptions.ConnectionError:
+            print(f"  ⚠️  [{session_id}] Ollama not running — start with: ollama serve")
+            return None
+        except json.JSONDecodeError as e:
+            print(f"  ⚠️  [{session_id}] Ollama returned non-JSON: {raw!r} — {e}")
+            return None
+        except Exception as e:
+            print(f"  ❌ [{session_id}] Intent extraction error: {e}")
+            return None
+
+    # ── Backend B: faster-whisper (local, offline, open-source) ───────────
     def _transcribe_whisper(self, wav_path: str, session_id: int = 0) -> tuple:
         """
         Run faster-whisper with hallucination-suppression parameters.
@@ -910,28 +985,31 @@ def test_with_file(filepath: str, port: int = DEFAULT_PORT):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Hey Vaani — Cloud ASR Server",
+        description="Hey Vaani — Offline Cloud ASR + Intent Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+All ASR backends are open-source and run fully offline — no cloud, no API key.
+
 ASR backends:
-  --asr whisper  (default) — faster-whisper runs locally. Free, no account.
+  --asr whisper  (default) — faster-whisper INT8, runs locally.
                              pip install faster-whisper
-  --asr aws      ————————— Amazon Transcribe Streaming API. AWS Free Tier:
-                             60 min/month for 12 months (~1800 detections).
-                             pip install "amazon-transcribe[awscrt]"
-                             aws configure  (enter key + secret + ap-south-1)
+  --asr vosk               — Vosk offline ASR, lighter weight.
+                             pip install vosk
+                             Download model: https://alphacephei.com/vosk/models
+                             Unzip into: cloud_server/vosk_model/
+
+Intent engine (--intent flag):
+  Calls a local Ollama SLM to extract structured intent from the transcript.
+  Setup:
+    curl -fsSL https://ollama.com/install.sh | sh
+    ollama pull qwen2.5:0.5b
+    ollama serve
+  Then run: python server.py --asr vosk --intent
 
 Whisper model tradeoffs (i5 laptop CPU, 2s audio):
   tiny   ~200ms — recommended for live demos
   base   ~450ms — better accuracy on noisy audio
   small  ~1200ms — too slow without GPU
-
-AWS setup (one-time):
-  1. Create free account: https://aws.amazon.com/free
-  2. IAM → Create user → Attach policy: AmazonTranscribeFullAccess
-  3. Create access key → run: aws configure
-     Region: ap-south-1   Output: json
-  4. python server.py --asr aws
         """,
     )
     parser.add_argument("--port",          type=int, default=DEFAULT_PORT,
@@ -940,14 +1018,20 @@ AWS setup (one-time):
                         choices=["tiny", "base", "small", "medium"],
                         help="Whisper model size (default: base, only used with --asr whisper)")
     parser.add_argument("--asr",           type=str, default="whisper",
-                        choices=["whisper", "aws"],
-                        help="ASR backend: 'whisper' (local, default) or 'aws' (Amazon Transcribe)")
+                        choices=["whisper", "vosk"],
+                        help="ASR backend: 'whisper' (default, local) or 'vosk' (offline, lighter)")
+    parser.add_argument("--intent",        action="store_true",
+                        help="Enable Ollama SLM intent extraction after ASR (requires ollama serve)")
+    parser.add_argument("--ollama-model",  type=str, default="qwen2.5:0.5b",
+                        help="Ollama model to use for intent (default: qwen2.5:0.5b)")
     parser.add_argument("--test",          type=str, metavar="WAV_FILE",
                         help="Test by streaming a WAV file as if from ESP32")
     args = parser.parse_args()
 
-    global ASR_ENGINE
-    ASR_ENGINE = args.asr
+    global ASR_ENGINE, INTENT_ENABLE, OLLAMA_MODEL
+    ASR_ENGINE    = args.asr
+    INTENT_ENABLE = args.intent
+    OLLAMA_MODEL  = args.ollama_model
 
     if args.test:
         test_with_file(args.test, args.port)
@@ -957,6 +1041,7 @@ AWS setup (one-time):
             whisper_model=args.whisper_model,
             dashboard_port=DASHBOARD_API_PORT,
             asr_engine=args.asr,
+            intent_enable=args.intent,
         )
         server.start()
 

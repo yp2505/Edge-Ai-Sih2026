@@ -1,27 +1,38 @@
 # ── Active Cloud Server (server.py) ──────────────────────────────────────────
-# Run: python server.py                       (local Whisper, ~200ms, no account needed)
-# Run: python server.py --asr aws             (Amazon Transcribe, AWS Free Tier)
+# All backends are open-source and run 100% offline — no API key, no cloud.
+#
+# Run: python server.py                       (Whisper ASR, no intent)
+# Run: python server.py --asr vosk            (Vosk ASR, lighter)
+# Run: python server.py --asr vosk --intent   (Vosk ASR + Ollama SLM intent)
 
-# ── Backend A: faster-whisper (default, offline, free) ────────────────────────
-faster-whisper>=0.10.0       # Open-source Whisper INT8 on CPU ✅
+# ── Core (always required) ────────────────────────────────────────────────────
 numpy>=1.23.0
-soundfile>=0.12.0            # WAV read/write for --test mode
+soundfile>=0.12.0           # WAV read/write for --test mode
+requests>=2.31.0            # Ollama intent API (localhost, no internet used)
 
-# ── Backend B: Amazon Transcribe Streaming (AWS Free Tier) ────────────────────
-# AWS Free Tier: 60 minutes/month for first 12 months.
-# At ~2s per detection = 1,800 free detections/month.
+# ── Backend A: faster-whisper (default, offline, open-source) ────────────────
+faster-whisper>=0.10.0      # Open-source Whisper INT8 on CPU ✅
+
+# ── Backend B: Vosk (offline, lighter weight, open-source) ───────────────────
+# Lower RAM and CPU usage than Whisper. Good for low-spec EC2.
 #
 # Setup (one-time):
-#   pip install "amazon-transcribe[awscrt]" boto3 awscli
-#   aws configure   ← enter Access Key, Secret Key, region: ap-south-1, output: json
-#   python server.py --asr aws
+#   pip install vosk
+#   Download model: https://alphacephei.com/vosk/models
+#   Recommended: vosk-model-small-en-us-0.15 (40MB) for EC2 t3.micro
+#   Unzip into: cloud_server/vosk_model/
 #
-# IAM permission needed: AmazonTranscribeFullAccess
-amazon-transcribe[awscrt]>=0.6.0  # Amazon Transcribe Streaming SDK
-boto3>=1.35.0                     # AWS SDK (used for credentials/config)
-awscli>=1.33.0                    # aws configure command
+vosk>=0.3.45                # Open-source offline ASR ✅
+
+# ── Intent Engine: Ollama (open-source, local SLM) ───────────────────────────
+# Ollama is installed as a system service (not a pip package).
+# Install: curl -fsSL https://ollama.com/install.sh | sh
+# Pull model: ollama pull qwen2.5:0.5b  (~400MB, runs on t3.micro)
+# Start: ollama serve  (runs on localhost:11434)
+#
+# server.py calls localhost:11434 — no internet required after model download.
 
 # ── Edge Inference (edge_inference.py on RPi/laptop for testing) ──────────────
-sounddevice>=0.4.6           # Microphone capture
-# tflite-runtime>=2.14.0       # Lightweight TFLite (no full TensorFlow needed)
-tensorflow>=2.13.0    # Full TensorFlow (if tflite-runtime unavailable)
+sounddevice>=0.4.6          # Microphone capture
+# tflite-runtime>=2.14.0    # Lightweight TFLite (no full TensorFlow needed)
+tensorflow>=2.13.0          # Full TensorFlow (if tflite-runtime unavailable)
