@@ -1,10 +1,25 @@
 # ── Active Cloud Server (server.py) ──────────────────────────────────────────
-# Run: python server.py                       (tiny model, ~200ms)
-# Run: python server.py --whisper-model base  (better accuracy, ~450ms)
+# Run: python server.py                       (local Whisper, ~200ms, no account needed)
+# Run: python server.py --asr aws             (Amazon Transcribe, AWS Free Tier)
 
+# ── Backend A: faster-whisper (default, offline, free) ────────────────────────
 faster-whisper>=0.10.0       # Open-source Whisper INT8 on CPU ✅
 numpy>=1.23.0
 soundfile>=0.12.0            # WAV read/write for --test mode
+
+# ── Backend B: Amazon Transcribe Streaming (AWS Free Tier) ────────────────────
+# AWS Free Tier: 60 minutes/month for first 12 months.
+# At ~2s per detection = 1,800 free detections/month.
+#
+# Setup (one-time):
+#   pip install "amazon-transcribe[awscrt]" boto3 awscli
+#   aws configure   ← enter Access Key, Secret Key, region: ap-south-1, output: json
+#   python server.py --asr aws
+#
+# IAM permission needed: AmazonTranscribeFullAccess
+amazon-transcribe[awscrt]>=0.6.0  # Amazon Transcribe Streaming SDK
+boto3>=1.35.0                     # AWS SDK (used for credentials/config)
+awscli>=1.33.0                    # aws configure command
 
 # ── Edge Inference (edge_inference.py on RPi/laptop for testing) ──────────────
 sounddevice>=0.4.6           # Microphone capture

@@ -113,25 +113,42 @@ WHISPER_VAD_PARAMETERS = {
 #   Decoder-level penalty for repeated n-grams. 1.0 = disabled. 1.1 recommended.
 WHISPER_REPETITION_PENALTY = 1.1
 
-# ─── Startup check — FAIL LOUDLY if faster-whisper missing ──────────────────
+# ─── ASR backend imports ──────────────────────────────────────────────────────
+# The server supports two ASR backends, selected via --asr flag:
+#
+#   --asr whisper  (default) — faster-whisper running locally on the laptop.
+#                              Free, offline, no account needed.
+#                              ~200ms for 'tiny', ~450ms for 'base'.
+#
+#   --asr aws      ————————— Amazon Transcribe Streaming API.
+#                              AWS Free Tier: 60 min/month for 12 months.
+#                              At ~2s per detection → 1,800 free detections/month.
+#                              Requires: pip install "amazon-transcribe[awscrt]"
+#                                        aws configure  (one-time setup)
+#                              Uses region ap-south-1 (Mumbai — lowest latency
+#                              from India) with language code en-IN.
+#
+# Both backends plug into the same _transcribe() dispatcher, so all other
+# server logic (HVP1 protocol, VAD, verification gate, dashboard) is unchanged.
+
 try:
     from faster_whisper import WhisperModel  # type: ignore
+    _WHISPER_AVAILABLE = True
 except ImportError:
-    print(
-        "\n"
-        "╔══════════════════════════════════════════════════════════════╗\n"
-        "║   ❌  FATAL: faster-whisper NOT INSTALLED                    ║\n"
-        "║                                                              ║\n"
-        "║   The server CANNOT transcribe audio without it.            ║\n"
-        "║   Running without it gives silent mock output —             ║\n"
-        "║   NEVER acceptable in a live demo.                          ║\n"
-        "║                                                              ║\n"
-        "║   FIX:  pip install faster-whisper                          ║\n"
-        "║         (or: uv pip install faster-whisper)                 ║\n"
-        "╚══════════════════════════════════════════════════════════════╝\n",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+    _WHISPER_AVAILABLE = False
+
+try:
+    import asyncio
+    from amazon_transcribe.client import TranscribeStreamingClient  # type: ignore
+    from amazon_transcribe.handlers import TranscriptResultStreamHandler  # type: ignore
+    from amazon_transcribe.model import TranscriptEvent  # type: ignore
+    _AWS_AVAILABLE = True
+except ImportError:
+    _AWS_AVAILABLE = False
+
+# ─── ASR backend selection ────────────────────────────────────────────────────
+# Set by --asr CLI flag. Validated at startup in main().
+ASR_ENGINE = "whisper"   # overridden to "aws" when --asr aws is passed
 
 
 # ─── Configuration ─────────────────────────────────────────────────────────
@@ -252,10 +269,12 @@ class ASRServer:
     """
 
     def __init__(self, port: int = DEFAULT_PORT, whisper_model: str = "tiny",
-                 dashboard_port: int = DASHBOARD_API_PORT):
+                 dashboard_port: int = DASHBOARD_API_PORT,
+                 asr_engine: str = "whisper"):
         self.port          = port
         self.dashboard_port = dashboard_port
         self.whisper_model  = whisper_model
+        self.asr_engine     = asr_engine   # "whisper" | "aws"
         self.transcriber    = None
         self.session_count  = 0
         self.start_time     = time.time()
@@ -264,7 +283,7 @@ class ASRServer:
         self.telemetry: dict = {}
 
     def start(self):
-        self._load_whisper()
+        self._load_asr()
         os.makedirs(AUDIO_DIR, exist_ok=True)
         DashboardHTTPServer(self, port=self.dashboard_port).start_in_thread()
 
@@ -280,14 +299,18 @@ class ASRServer:
         print("=" * 62)
         print(f"  Status:          🟢 RUNNING")
         print(f"  Address:         {local_ip}:{self.port}")
-        print(f"  ASR engine:      faster-whisper '{self.whisper_model}' (INT8, CPU)")
+        if self.asr_engine == "aws":
+            print(f"  ASR engine:      ☁️  Amazon Transcribe Streaming (en-IN, ap-south-1)")
+            print(f"  AWS free tier:   60 min/month — ~1,800 free detections/month")
+        else:
+            print(f"  ASR engine:      faster-whisper '{self.whisper_model}' (INT8, CPU)")
         print("  Wake word:       custom TFLite Micro model on ESP32 (edge-authoritative)")
         print(f"  Protocol:        HVP1 v1 — 20-byte header, live-stream mode")
         print(f"  Log:             {LOG_FILE}")
         print("=" * 62)
         print(f"\n  ⚙️  Configure ESP32 with:")
-        print(f"      CONFIG_SERVER_IP   = \"{local_ip}\"")
-        print(f"      CONFIG_SERVER_PORT = {self.port}\n")
+        print(f"      Server IP   = \"{local_ip}\"  (enter this in HeyVaani-Setup portal)")
+        print(f"      Server Port = {self.port}\n")
         print(f"  Waiting for ESP32 connections...\n")
 
         try:
@@ -316,8 +339,39 @@ class ASRServer:
             self._save_log()
             server_socket.close()
 
-    # ── Whisper ────────────────────────────────────────────────────────────
-    def _load_whisper(self):
+    # ── ASR backend loader ─────────────────────────────────────────────────
+    def _load_asr(self):
+        if self.asr_engine == "aws":
+            if not _AWS_AVAILABLE:
+                print(
+                    "\n"
+                    "╔══════════════════════════════════════════════════════════════╗\n"
+                    "║   ❌  amazon-transcribe SDK NOT INSTALLED                    ║\n"
+                    "║                                                              ║\n"
+                    "║   FIX:  pip install \"amazon-transcribe[awscrt]\"             ║\n"
+                    "║   Then: aws configure  (enter your AWS key + ap-south-1)   ║\n"
+                    "╚══════════════════════════════════════════════════════════════╝\n",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print("  ☁️  ASR backend: Amazon Transcribe Streaming (en-IN, ap-south-1)")
+            print("  ℹ️  AWS free tier: 60 min/month for 12 months.")
+            self.transcriber = None   # no local model needed
+            return
+
+        # Default: faster-whisper
+        if not _WHISPER_AVAILABLE:
+            print(
+                "\n"
+                "╔══════════════════════════════════════════════════════════════╗\n"
+                "║   ❌  FATAL: faster-whisper NOT INSTALLED                    ║\n"
+                "║                                                              ║\n"
+                "║   FIX:  pip install faster-whisper                          ║\n"
+                "║   OR use --asr aws to switch to Amazon Transcribe            ║\n"
+                "╚══════════════════════════════════════════════════════════════╝\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print(f"  Loading faster-whisper model '{self.whisper_model}' (INT8)...")
         t0 = time.time()
         self.transcriber = WhisperModel(
@@ -451,9 +505,10 @@ class ASRServer:
                 transcribe_ms = 0
                 print(f"  ⚠️  [{session_id}] SKIPPED transcription — {skip_reason}")
             else:
-                print(f"  🗣️  [{session_id}] Transcribing with faster-whisper '{self.whisper_model}'...")
+                engine_label = "Amazon Transcribe" if self.asr_engine == "aws" else f"faster-whisper '{self.whisper_model}'"
+                print(f"  🗣️  [{session_id}] Transcribing with {engine_label}...")
                 t_t0 = time.time()
-                transcript, avg_log_prob = self._transcribe(wav_path, session_id)
+                transcript, avg_log_prob = self._transcribe(audio_data, wav_path, session_id, sr)
                 transcribe_ms = int((time.time() - t_t0) * 1000)
 
             # Step 3: Two-step Verification Gate evaluation
@@ -466,9 +521,10 @@ class ASRServer:
             print(f"\n  {'─' * 58}")
             print(f"  📝 [{session_id}] RAW TRANSCRIPT:  \"{transcript}\"")
             print(f"  🛡️  [{session_id}] VERIFICATION GATE: {verification_status} (score={match_score:.2f}, match='{matched_var}')")
+            engine_label = "Amazon Transcribe" if self.asr_engine == "aws" else f"Whisper '{self.whisper_model}'"
             print(f"  ⏱️  [{session_id}] kw→connect   (ESP32):   {kw_to_connect_ms}ms")
             print(f"  ⏱️  [{session_id}] connect→1st byte:        {receive_gap_ms}ms")
-            print(f"  ⏱️  [{session_id}] Whisper '{self.whisper_model}':   {transcribe_ms}ms")
+            print(f"  ⏱️  [{session_id}] {engine_label}:   {transcribe_ms}ms")
             print(f"  ⏱️  [{session_id}] END-TO-END:              {end_to_end_ms}ms")
             print(f"  {'─' * 58}\n")
 
@@ -638,7 +694,77 @@ class ASRServer:
         return is_confirmed, best_score, best_variant
 
     # ── Transcription ──────────────────────────────────────────────────────
-    def _transcribe(self, wav_path: str, session_id: int = 0) -> tuple:
+    def _transcribe(self, audio_data: bytes, wav_path: str,
+                    session_id: int = 0, sample_rate: int = 16000) -> tuple:
+        """
+        Dispatcher: routes to _transcribe_aws() or _transcribe_whisper()
+        depending on self.asr_engine.  Returns (transcript, avg_log_prob).
+        """
+        if self.asr_engine == "aws":
+            return self._transcribe_aws(audio_data, session_id, sample_rate)
+        return self._transcribe_whisper(wav_path, session_id)
+
+    # ── Backend A: Amazon Transcribe Streaming ─────────────────────────────
+    def _transcribe_aws(self, audio_data: bytes, session_id: int,
+                        sample_rate: int = 16000) -> tuple:
+        """
+        Stream raw 16-bit PCM to Amazon Transcribe Streaming API and collect
+        the final (non-partial) transcript.
+
+        AWS Free Tier: 60 minutes/month for 12 months.
+        Region: ap-south-1 (Mumbai) — lowest latency from India.
+        Language: en-IN (Indian English).
+
+        avg_log_prob is not available from Transcribe, so always returns None.
+        """
+        try:
+            final_parts: list = []
+
+            class _Handler(TranscriptResultStreamHandler):  # type: ignore
+                async def handle_transcript_event(self, event: TranscriptEvent):  # type: ignore
+                    for result in event.transcript.results:
+                        if not result.is_partial:          # only take final results
+                            for alt in result.alternatives:
+                                text = alt.transcript.strip()
+                                if text:
+                                    final_parts.append(text)
+
+            async def _run():
+                client = TranscribeStreamingClient(region="ap-south-1")
+                stream = await client.start_stream_transcription(
+                    language_code="en-IN",
+                    media_sample_rate_hz=sample_rate,
+                    media_encoding="pcm",
+                    # Stabilise partial results before they are finalized
+                    enable_partial_results_stabilization=True,
+                    partial_results_stability="high",
+                )
+                handler = _Handler(stream.output_stream)
+
+                async def _feed():
+                    # Stream in 100ms chunks (3200 bytes at 16kHz int16)
+                    chunk_size = sample_rate * 2 // 10
+                    for i in range(0, len(audio_data), chunk_size):
+                        await stream.input_stream.send_audio_event(
+                            audio_chunk=audio_data[i:i + chunk_size]
+                        )
+                    await stream.input_stream.end_stream()
+
+                await asyncio.gather(_feed(), handler.handle_events())
+
+            asyncio.run(_run())
+
+            transcript = " ".join(final_parts).strip() or "[silence]"
+            print(f"  ☁️  [{session_id}] AWS Transcribe result: {repr(transcript)}")
+            return transcript, None   # Transcribe doesn't give log-probs
+
+        except Exception as e:
+            print(f"  ❌ [{session_id}] AWS Transcribe error: {e}")
+            print(f"  ℹ️  Check: aws configure (key/secret/region=ap-south-1)")
+            return f"[aws transcribe error: {e}]", None
+
+    # ── Backend B: faster-whisper (local, offline) ─────────────────────────
+    def _transcribe_whisper(self, wav_path: str, session_id: int = 0) -> tuple:
         """
         Run faster-whisper with hallucination-suppression parameters.
         Returns (transcript, avg_log_prob).
@@ -784,29 +910,44 @@ def test_with_file(filepath: str, port: int = DEFAULT_PORT):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Hey Vaani — Cloud ASR Server (faster-whisper, firmware-compatible)",
+        description="Hey Vaani — Cloud ASR Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+ASR backends:
+  --asr whisper  (default) — faster-whisper runs locally. Free, no account.
+                             pip install faster-whisper
+  --asr aws      ————————— Amazon Transcribe Streaming API. AWS Free Tier:
+                             60 min/month for 12 months (~1800 detections).
+                             pip install "amazon-transcribe[awscrt]"
+                             aws configure  (enter key + secret + ap-south-1)
+
 Whisper model tradeoffs (i5 laptop CPU, 2s audio):
   tiny   ~200ms — recommended for live demos
   base   ~450ms — better accuracy on noisy audio
   small  ~1200ms — too slow without GPU
 
-Deploy to Oracle Cloud:
-  1. SSH into your OCI instance
-  2. pip install faster-whisper numpy soundfile
-  3. python server.py --whisper-model tiny
-  4. Set CONFIG_SERVER_IP in ESP32 firmware to the OCI public IP
+AWS setup (one-time):
+  1. Create free account: https://aws.amazon.com/free
+  2. IAM → Create user → Attach policy: AmazonTranscribeFullAccess
+  3. Create access key → run: aws configure
+     Region: ap-south-1   Output: json
+  4. python server.py --asr aws
         """,
     )
     parser.add_argument("--port",          type=int, default=DEFAULT_PORT,
                         help=f"TCP port for ESP32 audio stream (default {DEFAULT_PORT})")
     parser.add_argument("--whisper-model", type=str, default="base",
                         choices=["tiny", "base", "small", "medium"],
-                        help="Whisper model size (default: base)")
+                        help="Whisper model size (default: base, only used with --asr whisper)")
+    parser.add_argument("--asr",           type=str, default="whisper",
+                        choices=["whisper", "aws"],
+                        help="ASR backend: 'whisper' (local, default) or 'aws' (Amazon Transcribe)")
     parser.add_argument("--test",          type=str, metavar="WAV_FILE",
                         help="Test by streaming a WAV file as if from ESP32")
     args = parser.parse_args()
+
+    global ASR_ENGINE
+    ASR_ENGINE = args.asr
 
     if args.test:
         test_with_file(args.test, args.port)
@@ -815,6 +956,7 @@ Deploy to Oracle Cloud:
             port=args.port,
             whisper_model=args.whisper_model,
             dashboard_port=DASHBOARD_API_PORT,
+            asr_engine=args.asr,
         )
         server.start()
 

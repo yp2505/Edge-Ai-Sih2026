@@ -60,17 +60,16 @@
 #include "model_data.h"
 #include "mfcc.h"
 #include "benchmark_cpu.h"
+#include "wifi_provision.h"   // NVS-backed WiFi credentials + captive portal
 
 // ─── User Config ─────────────────────────────────────────────────────────────
-#ifndef CONFIG_WIFI_SSID
-#define CONFIG_WIFI_SSID       "Yug"
-#endif
-#ifndef CONFIG_WIFI_PASSWORD
-#define CONFIG_WIFI_PASSWORD   "saanvi2013"
-#endif
-#ifndef CONFIG_SERVER_IP
-#define CONFIG_SERVER_IP       "192.168.1.18"
-#endif
+// WiFi SSID, password and server IP are now stored in NVS (non-volatile flash)
+// and loaded at boot by wifi_provision_init() into:
+//   g_wifi_ssid / g_wifi_pass / g_server_ip   (declared in wifi_provision.h)
+// On first boot (or after wifi_provision_clear()), the device starts the
+// "HeyVaani-Setup" captive portal so credentials can be entered via browser.
+//
+// Only the server PORT remains hardcoded here — it never changes per-network.
 #ifndef CONFIG_SERVER_PORT
 #define CONFIG_SERVER_PORT     5000
 #endif
@@ -83,7 +82,10 @@
 #define I2S_SD_PIN         GPIO_NUM_22   // DATA  (INMP441 SD)
 
 // ─── KWS / Inference ─────────────────────────────────────────────────────────
-static const float DETECT_THRESHOLD         = 0.05f;
+// DETECT_THRESHOLD: sigmoid decision boundary from optimal_threshold.txt.
+// Model output: [1,1] sigmoid (0.0–1.0). Calibrated at 0.51 on test set.
+// Lower toward 0.40 if "Hey Vaani" misses; raise toward 0.65 to cut false triggers.
+static const float DETECT_THRESHOLD         = 0.51f;
 static const int   DETECTION_HITS_REQUIRED  = 1;
 static const float MIN_SPEECH_RMS           = 0.050f;
 static const float NOISE_FLOOR_MULTIPLIER   = 2.5f;
@@ -532,25 +534,8 @@ static void ssd1306_init() {
     ESP_ERROR_CHECK(i2c_driver_install(OLED_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0));
 
     vTaskDelay(pdMS_TO_TICKS(50));  // SSD1306 needs >1 ms after VCC stable
-
-    // --- I2C SCANNER ---
-    printf("\n=== I2C Scanner ===\n");
-    int found_count = 0;
-    for (int addr = 1; addr < 127; addr++) {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
-        i2c_master_stop(cmd);
-        esp_err_t ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(10));
-        i2c_cmd_link_delete(cmd);
-        if (ret == ESP_OK) {
-            printf(">>> Found I2C device at address: 0x%02X <<<\n", addr);
-            found_count++;
-        }
-    }
-    if (found_count == 0) printf(">>> NO I2C DEVICES FOUND! Check wiring! <<<\n");
-    printf("===================\n\n");
-    // -------------------
+    // I2C scanner removed — it blocked Core 0 for ~1.26s (126 addrs × 10ms timeout)
+    // causing IWDT crash. OLED address is hardcoded as 0x3C.
 
     // SSD1306 init sequence (works for all common 128×64 modules)
     static const uint8_t init_cmds[] = {
@@ -650,8 +635,11 @@ static void wifi_start() {
         wifi_infra_ready = true;
     }
     wifi_config_t wcfg = {};
-    strncpy((char*)wcfg.sta.ssid,     CONFIG_WIFI_SSID,     sizeof(wcfg.sta.ssid));
-    strncpy((char*)wcfg.sta.password, CONFIG_WIFI_PASSWORD, sizeof(wcfg.sta.password));
+    // Use credentials loaded from NVS by wifi_provision_init() at boot.
+    // On first boot these are set via the "HeyVaani-Setup" captive portal.
+    strncpy((char*)wcfg.sta.ssid,     g_wifi_ssid, sizeof(wcfg.sta.ssid));
+    strncpy((char*)wcfg.sta.password, g_wifi_pass, sizeof(wcfg.sta.password));
+    wcfg.sta.threshold.authmode = WIFI_AUTH_OPEN;  // allow open networks too
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
     wifi_retry_count = 0;
@@ -865,8 +853,11 @@ static void inference_task(void* arg) {
         }
         printf("[STAGE-C] post-invoke (%.0f us)\n", infer_us); fflush(stdout);
 
-        // 11. Dequantise output — COMPLETELY UNCHANGED
-        // Model output: [1,2] softmax — out[1]=keyword prob. LABEL_KEYWORD=1 per train_model.py.
+        // 11. Dequantise output
+        // Model output: [1,1] sigmoid — single node, value = P(keyword).
+        // Binary BCE model (new_dataset/new_model/). out[0] is the keyword probability.
+        // If someone switches back to a 2-class softmax model, out_elems will be 2
+        // and we fall back to reading index 1 (keyword class).
         float   out_scale = output_tensor->params.scale;
         int32_t out_zp    = output_tensor->params.zero_point;
         int8_t* out       = output_tensor->data.int8;
@@ -875,6 +866,7 @@ static void inference_task(void* arg) {
         for (int oi = 0; oi < out_elems && oi < 8; oi++) printf(" [%d]=%d", oi, out[oi]);
         printf(" scale=%.6f zp=%d\n", (double)out_scale, (int)out_zp); fflush(stdout);
 
+        // Sigmoid model → 1 elem; softmax model → 2 elems (read index 1 = keyword)
         float kw_prob = (out_elems >= 2) ? (out[1]-out_zp)*out_scale : (out[0]-out_zp)*out_scale;
         bool  trigger = (kw_prob >= DETECT_THRESHOLD);
         printf("[INFER] loop=%lu conf=%.4f threshold=%.2f result=%s infer_us=%.0f\n",
@@ -889,16 +881,14 @@ static void inference_task(void* arg) {
 
         if (consecutive_hits >= DETECTION_HITS_REQUIRED && !streaming_active) {
             int64_t kw_end = esp_timer_get_time();
-            printf("[TRIGGER->STREAM] KEYWORD CONFIRMED conf=%.4f (%.1f%%) — posting to queue\n",
+            printf("[TRIGGER->STREAM] EDGE KWS FIRED conf=%.4f (%.1f%%) — streaming to cloud for verification\n",
                    (double)kw_prob, (double)(kw_prob * 100.0f));
             fflush(stdout);
             xQueueSend(detect_queue, &kw_end, 0);
             consecutive_hits = 0;
-
-            gpio_set_level(LED_PIN, 1);          // stays on until transcription done
-            g_disp_state = DISP_DETECTED;         // display_task picks up within 100 ms
-            xTaskCreatePinnedToCore(beep_task, "beep", 1024, NULL, 3, NULL, 1); // fire-and-forget on Core 1
-            // ─────────────────────────────────────────────────────────────────
+            // ── LED/buzzer/OLED deliberately NOT fired here ─────────────────
+            // Cloud verification result drives those — see streaming_task below.
+            // ────────────────────────────────────────────────────────────────
 
             vTaskDelay(pdMS_TO_TICKS(1000));  // 1 s cooldown — suppress echo re-trigger
         } else if (consecutive_hits > 0) {
@@ -936,7 +926,7 @@ static void streaming_task(void* arg) {
         for (int attempt = 0; attempt < 4; attempt++) {
             struct sockaddr_in srv = {};
             srv.sin_family = AF_INET; srv.sin_port = htons(CONFIG_SERVER_PORT);
-            inet_pton(AF_INET, CONFIG_SERVER_IP, &srv.sin_addr);
+            inet_pton(AF_INET, g_server_ip, &srv.sin_addr);  // from NVS / portal
             sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
             if (sock < 0) { vTaskDelay(pdMS_TO_TICKS(backoff_ms)); backoff_ms *= 2; continue; }
             int f = 1; setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
@@ -1032,35 +1022,65 @@ static void streaming_task(void* arg) {
             float recv_ms = (float)(esp_timer_get_time() - rs) / 1000.0f;
             close(sock);
             printf("[STREAM] sid=%lu recv: %d bytes in %.0fms\n", (unsigned long)sid, rlen, (double)recv_ms);
-            printf("\n=== CLOUD WHISPER TRANSCRIPTION ===\n  -> %s\n===================================\n\n",
+            printf("\n=== CLOUD RESPONSE ===\n  -> %s\n======================\n\n",
                    rlen > 0 ? resp : "[no response]");
             fflush(stdout);
 
-            // Parse "transcript":"..." from JSON response
-            char clean_txt[128] = {0};
-            char* tptr = strstr(resp, "\"transcript\":");
-            if (tptr) {
-                tptr += strlen("\"transcript\":");
-                while (*tptr == ' ' || *tptr == '\"') tptr++;
-                int idx = 0;
-                while (*tptr && *tptr != '\"' && *tptr != '}' && *tptr != ',' && idx < (int)sizeof(clean_txt)-1) {
-                    clean_txt[idx++] = *tptr++;
+            // ── Parse "verified": true/false from cloud JSON ─────────────
+            // Cloud sends: {"verified": true/false, "transcript": "...", ...}
+            // Only fire LED + buzzer + OLED if cloud confirmed the keyword.
+            bool cloud_verified = false;
+            {
+                char* vptr = strstr(resp, "\"verified\":");
+                if (vptr) {
+                    vptr += strlen("\"verified\":");
+                    while (*vptr == ' ') vptr++;
+                    cloud_verified = (strncmp(vptr, "true", 4) == 0);
                 }
-                clean_txt[idx] = '\0';
-            } else if (rlen > 0) {
-                snprintf(clean_txt, sizeof(clean_txt), "%.127s", resp);
-            } else {
-                snprintf(clean_txt, sizeof(clean_txt), "[No Response]");
             }
 
-            // Display "Received" + transcription text on OLED
-            snprintf(g_disp_text, sizeof(g_disp_text), "%s", clean_txt);
-            g_disp_state = DISP_TRANSCRIBED;
-            gpio_set_level(LED_PIN, 0);   // keyword processing complete
-            printf("[OLED] Displaying transcript for 4s: '%s'\n", clean_txt); fflush(stdout);
+            // ── Parse "transcript":"..." from JSON response ──────────────
+            char clean_txt[128] = {0};
+            {
+                char* tptr = strstr(resp, "\"transcript\":");
+                if (tptr) {
+                    tptr += strlen("\"transcript\":");
+                    while (*tptr == ' ' || *tptr == '\"') tptr++;
+                    int idx = 0;
+                    while (*tptr && *tptr != '\"' && *tptr != '}' && *tptr != ',' && idx < (int)sizeof(clean_txt)-1)
+                        clean_txt[idx++] = *tptr++;
+                    clean_txt[idx] = '\0';
+                } else if (rlen > 0) {
+                    snprintf(clean_txt, sizeof(clean_txt), "%.127s", resp);
+                } else {
+                    snprintf(clean_txt, sizeof(clean_txt), "[No Response]");
+                }
+            }
 
-            // Hold on screen for 3.5 seconds so user can read it!
-            vTaskDelay(pdMS_TO_TICKS(3500));
+            if (cloud_verified) {
+                // ── CONFIRMED: Cloud matched "Hey Vaani" ─────────────────
+                // Only NOW fire LED + buzzer + update OLED
+                printf("[VERIFIED] Cloud CONFIRMED keyword — transcript: '%s'\n", clean_txt);
+                fflush(stdout);
+
+                gpio_set_level(LED_PIN, 1);
+                g_disp_state = DISP_DETECTED;   // brief "Detected!" flash
+                xTaskCreatePinnedToCore(beep_task, "beep", 1024, NULL, 3, NULL, 1);
+                vTaskDelay(pdMS_TO_TICKS(300));  // hold "Detected!" for 300ms
+
+                // Transition to showing transcript
+                snprintf(g_disp_text, sizeof(g_disp_text), "%s", clean_txt);
+                g_disp_state = DISP_TRANSCRIBED;
+                gpio_set_level(LED_PIN, 0);      // LED off — processing done
+                printf("[OLED] Transcript: '%s'\n", clean_txt); fflush(stdout);
+                vTaskDelay(pdMS_TO_TICKS(3500)); // hold transcript on screen
+            } else {
+                // ── REJECTED: Cloud did not match "Hey Vaani" ────────────
+                // No LED. No buzzer. No OLED change. Silent fallback.
+                printf("[REJECTED] Cloud REJECTED — transcript: '%s' — no user feedback\n",
+                       clean_txt); fflush(stdout);
+                // g_disp_state remains DISP_LISTENING (set below)
+            }
         }
 
         // Return to listening state and flush stale triggers accumulated during display hold
@@ -1085,12 +1105,29 @@ static void wifi_keepalive_task(void* arg) {
         ESP_LOGI(TAG_WIFI, "WiFi ready (keepalive).");
     else
         ESP_LOGW(TAG_WIFI, "WiFi not connected at boot — streaming will retry on trigger.");
-    // Keep task alive to reconnect if WiFi drops
+
+    // ── Reconnection loop + 3-strike portal fallback ──────────────────────
+    // If WiFi fails 3 times in a row (e.g. wrong password, IP change),
+    // clear NVS credentials and restart into the captive portal so the
+    // user can update them without needing a reflash.
+    int fail_streak = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         if (!wifi_connected) {
-            ESP_LOGW(TAG_WIFI, "WiFi dropped — reconnecting from keepalive task...");
+            fail_streak++;
+            ESP_LOGW(TAG_WIFI, "WiFi dropped — reconnecting (strike %d/3)...", fail_streak);
             wifi_start();
+            if (wifi_connected) {
+                fail_streak = 0;
+            } else if (fail_streak >= 3) {
+                ESP_LOGE(TAG_WIFI, "3 consecutive WiFi failures — clearing NVS and"
+                                   " restarting into setup portal");
+                wifi_provision_clear();
+                vTaskDelay(pdMS_TO_TICKS(300));
+                esp_restart();
+            }
+        } else {
+            fail_streak = 0;
         }
     }
 }
@@ -1215,7 +1252,7 @@ static void telemetry_task(void* arg) {
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         struct sockaddr_in addr = {};
         addr.sin_family = AF_INET; addr.sin_port = htons(8080);
-        inet_pton(AF_INET, CONFIG_SERVER_IP, &addr.sin_addr);
+        inet_pton(AF_INET, g_server_ip, &addr.sin_addr);  // from NVS / portal
         if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             char req[700];
             int rlen = snprintf(req, sizeof(req),
@@ -1261,6 +1298,8 @@ extern "C" void app_main() {
     lc.channel    = BUZZER_LEDC_CHANNEL;
     // lc.intr_type deprecated in ESP-IDF 5.x — omit; driver handles it
     lc.timer_sel  = BUZZER_LEDC_TIMER;
+
+
     lc.duty       = 0;
     lc.hpoint     = 0;
     ESP_ERROR_CHECK(ledc_channel_config(&lc));
@@ -1268,6 +1307,13 @@ extern "C" void app_main() {
 
     // ── OLED: SSD1306 I2C init, immediately shows "Booting..." ──────────────────
     ssd1306_init();   // draws DISP_BOOTING screen at end
+
+    // ── WiFi provisioning ────────────────────────────────────────────────────
+    // Loads SSID/password/server-IP from NVS into g_wifi_ssid/pass/ip.
+    // If NVS is empty (first boot / factory reset): starts "HeyVaani-Setup"
+    // AP + captive portal, blocks here until credentials are saved, then
+    // calls esp_restart(). Normal boots return instantly.
+    wifi_provision_init();
 
     // ── I2S: INMP441 ─────────────────────────────────────────────────────────
     i2s_global_init();
