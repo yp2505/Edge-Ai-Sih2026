@@ -647,54 +647,73 @@ extern "C" void display_show_provisioning(void) {
 }
 
 // ─── Mic Self-Check (I2S) ────────────────────────────────────────────────────
-// Reads 0.5 s of audio and logs RMS — confirms I2S data flow before pipeline starts.
+// Reads 0.5 s of audio, de-interleaves L/R channels, and logs diagnostics.
 // Expected RMS in silence: ~0.001–0.010 (INMP441 noise floor ≈ −26 dBFS).
 //
-// NOTE on "8.4.1/" crash loop:
-//   If you see "8.4.1/" repeating in the serial monitor at extremely high rate
-//   (thousands of lines/sec), this is the ESP32 ROM bootloader printing its
-//   crash/reset reason code — it means the firmware is crashing BEFORE or
-//   immediately AFTER app_main() starts.
+// DIAGNOSTIC GUIDE — interpret [MIC] log output:
+//   L_rms > 0.001, R_rms ≈ 0    → Mic working, correct wiring (L/R=GND)
+//   L_rms ≈ 0,    R_rms > 0.001 → L/R PIN CONNECTED TO VDD — swap to GND!
+//   L_rms ≈ 0,    R_rms ≈ 0     → Hardware issue: check wiring/power/defective mic
+//   No data (got=0)              → I2S not reading: check SCK/WS/SD wiring
 //
-//   Root causes to check IN ORDER:
-//   1. esp_restart() called in this function (previously — now NON-FATAL below).
-//   2. I2C bus hung at ssd1306_init() — pull SDA/SCL HIGH with 4.7kΩ resistors.
-//   3. TENSOR_ARENA_SIZE or static buffers exceeding available DRAM (check
-//      [STACK] printout — if never printed, crash is pre-task-create).
-//   4. Baud rate mismatch — monitor must be 115200 baud.
-//   5. Try: pio run -t erase (full flash erase) then reflash.
-//
-//   This function is now NON-FATAL: a silent INMP441 is logged as an error
-//   but does NOT call esp_restart(), so the 5 s delay + reboot loop is gone.
+// This function is NON-FATAL — does NOT call esp_restart().
 static void mic_selfcheck() {
-    static int16_t buf[8000];   // 0.5 s @ 16 kHz — static → DRAM, DMA-safe
-    int64_t sum_sq = 0;
-    ESP_LOGI(TAG_MIC, "Mic self-check: reading 0.5 s of I2S audio...");
+    static int16_t buf[8000];   // 0.5 s stereo @ 16 kHz — static → DRAM, DMA-safe
+    ESP_LOGI(TAG_MIC, "Mic self-check: reading 0.5s of I2S stereo audio...");
     size_t bytes_read = 0;
     esp_err_t e = i2s_channel_read(g_i2s_rx, buf, sizeof(buf),
                                    &bytes_read, pdMS_TO_TICKS(1000));
     int got = (e == ESP_OK || e == ESP_ERR_TIMEOUT)
               ? (int)(bytes_read / sizeof(int16_t)) : 0;
     if (got <= 0) {
-        ESP_LOGE(TAG_MIC, "I2S self-check: no data (err=0x%x) — check SCK=GPIO26 WS=GPIO25 SD=GPIO22",
-                 (unsigned)e);
-        ESP_LOGW(TAG_MIC, "Continuing anyway — mic may still work. Check [ENERGY] log.");
-        return;   // NON-FATAL: was esp_restart() — removed to stop crash loop
+        ESP_LOGE(TAG_MIC, "I2S self-check: NO DATA (err=0x%x, bytes=%d)",
+                 (unsigned)e, (int)bytes_read);
+        ESP_LOGE(TAG_MIC, "  → Check wiring: SCK=GPIO26  WS=GPIO25  SD=GPIO22");
+        ESP_LOGE(TAG_MIC, "  → Check INMP441 power: VCC=3.3V, GND=GND");
+        ESP_LOGW(TAG_MIC, "  Continuing anyway — check [ENERGY] log after boot.");
+        return;
     }
-    for (int i = 0; i < got; i++) sum_sq += (int64_t)buf[i] * buf[i];
-    float rms = sqrtf((float)sum_sq / got) / 32768.0f;
-    printf("[MIC] INMP441 RMS (%.2fs, %d samples): %.5f  "
-           "[expected 0.001-0.010 in silence, >=0.05 while speaking]\n",
-           (float)got / I2S_SAMPLE_RATE, got, (double)rms);
+
+    // De-interleave stereo: even indices = LEFT (mic if L/R=GND), odd = RIGHT
+    int64_t sum_sq_l = 0, sum_sq_r = 0;
+    int mono_count = got / 2;   // number of L-R pairs
+    for (int i = 0; i + 1 < got; i += 2) {
+        sum_sq_l += (int64_t)buf[i]     * buf[i];      // LEFT
+        sum_sq_r += (int64_t)buf[i + 1] * buf[i + 1];  // RIGHT
+    }
+    float rms_l = mono_count > 0 ? sqrtf((float)sum_sq_l / mono_count) / 32768.0f : 0.0f;
+    float rms_r = mono_count > 0 ? sqrtf((float)sum_sq_r / mono_count) / 32768.0f : 0.0f;
+
+    // Also compute raw (non-deinterleaved) RMS for backward compat
+    int64_t sum_sq_all = 0;
+    for (int i = 0; i < got; i++) sum_sq_all += (int64_t)buf[i] * buf[i];
+    float rms_all = got > 0 ? sqrtf((float)sum_sq_all / got) / 32768.0f : 0.0f;
+
+    printf("[MIC] INMP441 stereo check (%.2fs, %d stereo pairs):\n",
+           (float)got / I2S_SAMPLE_RATE / 2.0f, mono_count);
+    printf("[MIC]   L_rms=%.5f  R_rms=%.5f  combined=%.5f\n",
+           (double)rms_l, (double)rms_r, (double)rms_all);
+
+    // Show first 8 raw samples (4 L-R pairs) for debugging
+    printf("[MIC]   raw[0..7]:");
+    for (int i = 0; i < 8 && i < got; i++) printf(" %d", (int)buf[i]);
+    printf("\n");
     fflush(stdout);
-    if (rms < 1e-6f) {
-        // NON-FATAL: log clearly but do NOT restart — the crash loop was caused
-        // by this restart being hit repeatedly when INMP441 was not responding.
-        ESP_LOGE(TAG_MIC, "MIC SELF-CHECK WARNING — INMP441 appears silent.");
-        ESP_LOGE(TAG_MIC, "  Check: SCK=GPIO26  WS=GPIO25  SD=GPIO22  L/R=GND");
+
+    // Diagnostic verdict
+    if (rms_l > 0.001f && rms_r < 0.001f) {
+        ESP_LOGI(TAG_MIC, "Mic OK — data on LEFT channel (L/R=GND correct)");
+    } else if (rms_l < 0.001f && rms_r > 0.001f) {
+        ESP_LOGE(TAG_MIC, "WRONG CHANNEL! Data is on RIGHT — L/R pin is wired to VDD!");
+        ESP_LOGE(TAG_MIC, "  FIX: Connect INMP441 L/R pin to GND (not VCC)");
+        ESP_LOGE(TAG_MIC, "  Current: L_rms=%.5f R_rms=%.5f (data on wrong side)", rms_l, rms_r);
+    } else if (rms_l < 1e-6f && rms_r < 1e-6f) {
+        ESP_LOGE(TAG_MIC, "MIC SILENT — no signal on either channel!");
+        ESP_LOGE(TAG_MIC, "  Check: 1) INMP441 VCC=3.3V?  2) SCK/WS/SD wired correctly?");
+        ESP_LOGE(TAG_MIC, "          3) L/R=GND?  4) Module defective?");
         ESP_LOGW(TAG_MIC, "  Continuing. Inference will likely get no triggers.");
     } else {
-        ESP_LOGI(TAG_MIC, "Mic self-check PASSED (RMS=%.5f)", rms);
+        ESP_LOGI(TAG_MIC, "Mic self-check PASSED (L=%.5f R=%.5f)", rms_l, rms_r);
     }
 }
 
@@ -774,12 +793,20 @@ static void audio_task(void* arg) {
 
     // I2S sanity: first read to confirm data flows before entering main loop
     {
+        static int16_t sanity_stereo[128];   // 32 stereo frames
         size_t br = 0;
-        esp_err_t e = i2s_channel_read(g_i2s_rx, hop, 64 * sizeof(int16_t), &br, pdMS_TO_TICKS(200));
+        esp_err_t e = i2s_channel_read(g_i2s_rx, sanity_stereo, sizeof(sanity_stereo),
+                                       &br, pdMS_TO_TICKS(200));
         int n = (e == ESP_OK) ? (int)(br / sizeof(int16_t)) : -1;
-        ESP_LOGI(TAG_INF, "I2S sanity: got=%d first=%d err=0x%x",
-                 n, n > 0 ? (int)hop[0] : -1, (unsigned)e);
-        if (n <= 0) ESP_LOGW(TAG_INF, "WARNING: I2S no data on sanity read — check wiring");
+        int16_t first_l = (n > 0) ? sanity_stereo[0] : -1;
+        int16_t first_r = (n > 1) ? sanity_stereo[1] : -1;
+        ESP_LOGI(TAG_INF, "I2S sanity: got=%d stereo_frames=%d L_first=%d R_first=%d err=0x%x",
+                 n, n / 2, (int)first_l, (int)first_r, (unsigned)e);
+        if (n <= 0) {
+            ESP_LOGW(TAG_INF, "WARNING: I2S no data on sanity read — check SCK/WS/SD wiring");
+        } else if (first_l == 0 && first_r == 0) {
+            ESP_LOGW(TAG_INF, "WARNING: I2S returned all zeros — INMP441 may not be responding");
+        }
     }
 
     while (true) {
