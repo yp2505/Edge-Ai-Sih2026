@@ -1,155 +1,117 @@
 import { useMemo } from 'react'
-import { IconCpu, IconWifi, IconSatellite, IconSearch, IconTrendChart } from './Icons.jsx'
+import { IconCpu, IconWifi, IconSatellite, IconTrendChart } from './Icons.jsx'
 
 const STEPS = [
-  { key: 'tx', label: 'Wake to Server', sub: 'ESP32 Wi-Fi', color: 'var(--sky)', icon: IconWifi },
-  { key: 'rx', label: 'First Audio Byte', sub: 'Server receive', color: 'var(--primary)', icon: IconSatellite },
-  { key: 'asr', label: 'Whisper ASR', sub: 'Server CPU', color: 'var(--pink)', icon: IconCpu },
+  { key: 'tx',  label: 'Wake to Server', sub: 'ESP32 → Wi-Fi', color: 'var(--cyan)', icon: IconWifi },
+  { key: 'rx',  label: 'First Audio Byte', sub: 'Server receive',  color: 'var(--ice)',  icon: IconSatellite },
+  { key: 'asr', label: 'Whisper ASR',     sub: 'Server CPU',       color: 'var(--teal)', icon: IconCpu },
 ]
 
-function LatencyMiniChart({ events }) {
-  const data = useMemo(() => {
-    return events.slice(-20).map(e =>
+function Sparkline({ events }) {
+  const data = useMemo(() =>
+    events.slice(-24).map(e =>
       (e.kw_to_connect_ms ?? 0) + (e.receive_gap_ms ?? 0) + (e.transcribe_ms ?? 0)
     )
-  }, [events])
+  , [events])
 
   if (data.length < 2) return null
 
   const max = Math.max(...data, 1)
-  const w = 100, h = 36
+  const W = 100, H = 34
   const pts = data.map((v, i) => [
-    (i / (data.length - 1)) * w,
-    h - (v / max) * h * 0.85 - 4,
+    (i / (data.length - 1)) * W,
+    H - (v / max) * H * 0.85 - 3,
   ])
-  const path = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p[0]},${p[1]}`).join(' ')
-  const fill = `${path} L${w},${h} L0,${h} Z`
+  const path = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ')
+  const area = `${path} L${W},${H} L0,${H} Z`
 
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} style={{ width: '100%', height: 36, overflow: 'visible' }}>
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 34, overflow: 'visible' }}>
       <defs>
-        <linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="var(--primary)" stopOpacity="0.3" />
-          <stop offset="100%" stopColor="var(--primary)" stopOpacity="0" />
+        <linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="var(--cyan)" stopOpacity="0.25" />
+          <stop offset="100%" stopColor="var(--cyan)" stopOpacity="0" />
         </linearGradient>
       </defs>
-      <path d={fill} fill="url(#chartGrad)" />
-      <path d={path} fill="none" stroke="var(--primary)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-      <circle cx={pts[pts.length-1][0]} cy={pts[pts.length-1][1]} r="2.5" fill="var(--primary)" />
+      <path d={area} fill="url(#sparkGrad)" />
+      <path d={path} fill="none" stroke="var(--cyan)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx={pts[pts.length - 1][0]} cy={pts[pts.length - 1][1]} r="2.5" fill="var(--cyan)" />
     </svg>
   )
 }
 
 export default function PipelinePanel({ latestEvent, events }) {
-  const active = latestEvent && (Date.now() - new Date(latestEvent.timestamp).getTime() < 3500)
+  const active = latestEvent && (Date.now() - new Date(latestEvent.timestamp).getTime() < 4000)
 
-  const values = {
-    mic:  active ? 12 : 0,
-    mfcc: active ? 28 : 0,
-    tx:   active ? (latestEvent?.kw_to_connect_ms ?? 0) : 0,
-    rx:   active ? (latestEvent?.receive_gap_ms    ?? 0) : 0,
-    asr:  active ? (latestEvent?.transcribe_ms     ?? 0) : 0,
+  const vals = {
+    tx:  active ? (latestEvent?.kw_to_connect_ms ?? 0) : 0,
+    rx:  active ? (latestEvent?.receive_gap_ms    ?? 0) : 0,
+    asr: active ? (latestEvent?.transcribe_ms     ?? 0) : 0,
   }
-  const total = active ? (latestEvent?.end_to_end_ms ?? values.tx + values.rx + values.asr) : 0
-  const totalColor = total < 400 ? 'var(--green)' : total < 800 ? 'var(--yellow)' : 'var(--red)'
+  const total = active ? (latestEvent?.end_to_end_ms ?? vals.tx + vals.rx + vals.asr) : 0
+  const totalColor = total > 0 ? (total < 400 ? 'var(--green)' : total < 800 ? 'var(--amber)' : 'var(--red)') : 'var(--t4)'
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 8 }}>
-
+    <>
       {/* E2E Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <div className="pipeline-e2e">
         <div>
-          <div style={{ fontSize: 10, color: 'var(--t2)', fontWeight: 600, letterSpacing: '1px', textTransform: 'uppercase', marginBottom: 2 }}>End-to-End Latency</div>
-          <div style={{ fontSize: 11, color: 'var(--t2)' }}>Measured: wake to Wi-Fi to audio to Whisper</div>
+          <div className="pipeline-e2e-label">End-to-End Latency</div>
+          <div className="pipeline-e2e-sub">Wake → Wi-Fi → Audio → Whisper</div>
         </div>
-        <div style={{
-          fontFamily: 'var(--font-mono)', fontSize: 32, fontWeight: 800,
-          color: active ? totalColor : 'var(--t2)', transition: 'color 0.4s', lineHeight: 1,
-          textShadow: active ? `0 0 16px ${totalColor}44` : 'none',
+        <div className="pipeline-e2e-value" style={{
+          color: active ? totalColor : 'var(--t4)',
+          textShadow: active ? `0 0 20px ${totalColor}55` : 'none',
         }}>
           {active ? total : '—'}
-          <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--t2)', marginLeft: 4 }}>ms</span>
+          <span className="pipeline-e2e-unit">ms</span>
         </div>
       </div>
 
-      {/* Pipeline steps */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1, justifyContent: 'center' }}>
-        {STEPS.map((s, i) => {
-          const val = values[s.key]
-          const max = 500
-          const pct = Math.min(100, (val / max) * 100)
-          const col = s.color || 'var(--sky)'
+      {/* Steps */}
+      <div className="pipeline-steps">
+        {STEPS.map((s) => {
+          const val = vals[s.key]
+          const pct = Math.min(100, (val / 500) * 100)
+          const isActive = active && val > 0
 
           return (
-            <div key={s.key} style={{ display: 'flex', alignItems: 'center', gap: 10, position: 'relative' }}>
-              {/* Connector line (drawn behind dots) */}
-              {i < STEPS.length - 1 && (
-                <div style={{
-                  position: 'absolute', left: 11, top: 14, width: 2, height: 20,
-                  background: 'rgba(255,255,255,0.08)', zIndex: 0,
-                }} />
-              )}
-              
-              {/* Icon / Dot Container */}
-              <div style={{
-                width: 24, height: 24, borderRadius: '50%', flexShrink: 0,
-                background: active && val > 0 ? `rgba(255,255,255,0.08)` : 'rgba(255,255,255,0.04)',
-                border: `1px solid ${active && val > 0 ? 'rgba(255,255,255,0.15)' : 'rgba(255,255,255,0.02)'}`,
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                zIndex: 1,
-                boxShadow: active && val > 0 ? `0 0 10px ${col}33` : 'none',
-                transition: 'all 0.3s',
-              }}>
-                <s.icon size={12} color={active && val > 0 ? col : 'var(--t2)'} />
+            <div key={s.key} className="pipeline-step">
+              <div className={`pipeline-step-icon ${isActive ? 'active' : ''}`}
+                style={{ borderColor: isActive ? `${s.color}40` : undefined,
+                         boxShadow: isActive ? `0 0 10px ${s.color}30` : undefined }}>
+                <s.icon size={12} color={isActive ? s.color : 'var(--t3)'} />
               </div>
-
-              {/* Text */}
-              <div style={{ width: 70 }}>
-                <div style={{ fontSize: 11, fontWeight: 600, color: active && val > 0 ? 'var(--t1)' : 'var(--t2)' }}>{s.label}</div>
-                <div style={{ fontSize: 9, color: active && val > 0 ? 'var(--t2)' : 'var(--t3)' }}>{s.sub}</div>
+              <div className="pipeline-step-text">
+                <div className={`pipeline-step-name ${isActive ? 'active' : ''}`}>{s.label}</div>
+                <div className={`pipeline-step-sub ${isActive ? 'active' : ''}`}>{s.sub}</div>
               </div>
-
-              {/* Progress Bar */}
-              <div style={{ flex: 1, height: 5, background: 'rgba(255,255,255,0.08)', borderRadius: 4, overflow: 'hidden' }}>
-                <div style={{
-                  height: '100%', width: `${active ? pct : 0}%`,
-                  background: col, borderRadius: 4, transition: 'width 0.5s ease',
-                  boxShadow: active ? `0 0 8px ${col}99` : 'none',
+              <div className="pipeline-step-bar">
+                <div className="pipeline-step-fill" style={{
+                  width: `${active ? pct : 0}%`,
+                  background: s.color,
+                  boxShadow: isActive ? `0 0 8px ${s.color}80` : 'none',
                 }} />
               </div>
-
-              {/* Metric Text */}
-              <div style={{
-                width: 44, textAlign: 'right',
-                fontFamily: 'var(--font-mono)', fontSize: 12, fontWeight: 700,
-                color: active && val > 0 ? col : 'var(--t2)',
-                transition: 'color 0.3s',
-              }}>
-                {active && val > 0 ? `${val}ms` : '—'}
+              <div className={`pipeline-step-val ${isActive ? 'active' : ''}`}
+                style={{ color: isActive ? s.color : undefined }}>
+                {isActive ? `${val}ms` : '—'}
               </div>
             </div>
           )
         })}
       </div>
 
-      {/* Mini sparkline chart */}
+      {/* Sparkline */}
       {events.length > 1 && (
-        <div style={{
-          marginTop: 'auto',
-          background: 'rgba(255,255,255,0.03)',
-          border: '1px solid rgba(255,255,255,0.08)',
-          borderRadius: 8, padding: '8px 10px',
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
-            <IconTrendChart size={12} color="var(--t2)" />
-            <div style={{ fontSize: 9, color: 'var(--t2)', letterSpacing: '1px', textTransform: 'uppercase', fontWeight: 600 }}>
-              Trend (Last {Math.min(events.length, 20)})
-            </div>
+        <div className="pipeline-chart">
+          <div className="pipeline-chart-label">
+            <IconTrendChart size={10} color="var(--t3)" />
+            Trend · Last {Math.min(events.length, 24)} detections
           </div>
-          <LatencyMiniChart events={events} />
+          <Sparkline events={events} />
         </div>
       )}
-
-    </div>
+    </>
   )
 }
