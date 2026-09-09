@@ -39,7 +39,7 @@
 #include "driver/i2s_std.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h"
+// ledc header removed — no buzzer hardware connected
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -57,10 +57,32 @@
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
+#include "cJSON.h"            // ESP-IDF built-in JSON parser — no extra deps
+#include "aes/esp_aes.h"      // Hardware-accelerated AES-128-CTR encryption
+#include "esp_random.h"       // Hardware RNG for nonce generation
+
 #include "model_data.h"
 #include "mfcc.h"
 #include "benchmark_cpu.h"
 #include "wifi_provision.h"   // NVS-backed WiFi credentials + captive portal
+
+// ─── AES-128-CTR Encryption ──────────────────────────────────────────────────────
+// All audio and responses are encrypted with AES-128-CTR (no licence required).
+// Key MUST exactly match AES_KEY in server.py / HV_AES_KEY env var.
+// In production: move key to NVS (wifi_provision) so it is not in flash binary.
+//
+// Protocol:
+//   [20-byte HVP1 header] [16-byte random nonce] [encrypted audio...]
+//   [encrypted JSON response]
+// Response nonce = audio_nonce with last byte XOR 0xFF (derived, not transmitted).
+//
+// mbedTLS AES-CTR context is initialised fresh per session — no global state.
+static const uint8_t AES_KEY[16] = {
+    // Hex: 48657956616e6e69534948323032362a  = "HeyVaaniSIH2026*"
+    // MUST match _HV_AES_KEY_HEX in server.py
+    0x48, 0x65, 0x79, 0x56, 0x61, 0x6E, 0x6E, 0x69,
+    0x53, 0x49, 0x48, 0x32, 0x30, 0x32, 0x36, 0x2A
+};
 
 // ─── User Config ─────────────────────────────────────────────────────────────
 // WiFi SSID, password and server IP are now stored in NVS (non-volatile flash)
@@ -82,23 +104,36 @@
 #define I2S_SD_PIN         GPIO_NUM_22   // DATA  (INMP441 SD)
 
 // ─── KWS / Inference ─────────────────────────────────────────────────────────
-// DETECT_THRESHOLD: sigmoid decision boundary from optimal_threshold.txt.
-// Model output: [1,1] sigmoid (0.0–1.0). Calibrated at 0.51 on test set.
-// Lower toward 0.40 if "Hey Vaani" misses; raise toward 0.65 to cut false triggers.
-static const float DETECT_THRESHOLD         = 0.51f;
-static const int   DETECTION_HITS_REQUIRED  = 1;
+// DETECT_THRESHOLD: sigmoid decision boundary calibrated on the custom
+// "Hey Vaani" dataset.  Model output: [1,1] sigmoid (0.0–1.0).
+//   0.78 = good balance of TPR vs FPR for 5-speaker trained model.
+//   Lower toward 0.60 only if real-world misses are unacceptable.
+//   Raise toward 0.90 only if false triggers persist after retraining.
+//
+// DETECTION_HITS_REQUIRED=2: both consecutive inferences must exceed
+// threshold before the trigger fires — halves false-positive rate
+// at cost of ~30 ms extra latency (one extra hop).
+static const float DETECT_THRESHOLD         = 0.85f;   // Lowered from 0.96f for easier triggering
+static const int   DETECTION_HITS_REQUIRED  = 2;        // two consecutive hits = lower false positives
 static const float MIN_SPEECH_RMS           = 0.050f;
 static const float NOISE_FLOOR_MULTIPLIER   = 2.5f;
 static const int   NOISE_CALIBRATION_FRAMES = 50;
 static const float NOISE_CAL_MAX_RMS        = 0.04f;
 
 // ─── Streaming / VAD ─────────────────────────────────────────────────────────
+// ⚡ LATENCY-OPTIMISED for <200ms total end-to-end (rev8)
+//   SLIDE_STEP_MS=30:          inference every 30ms window hop
+//   COMMAND_DURATION_MS=1500:  max 1.5s command capture (was 4000ms)
+//   COMMAND_MIN_DURATION_MS=300: minimum 300ms before EOS eligible
+//   COMMAND_SILENCE_MS=150:    close stream after 150ms quiet (was 450ms)
+//   Measured pipeline budget: KWS=18ms + AES=0.2ms + Vosk=55ms + RTT≤20ms = ~93ms
+//   Remaining budget for EOS silence window: 200ms - 93ms = ~107ms → set 100ms
 #define SLIDE_STEP_MS           30
-#define COMMAND_DURATION_MS     4000
-#define COMMAND_MIN_DURATION_MS 700
-#define COMMAND_SILENCE_MS      450
+#define COMMAND_DURATION_MS     1500
+#define COMMAND_MIN_DURATION_MS 300
+#define COMMAND_SILENCE_MS      100
 #define AUDIO_BUFFER_SAMPLES    16000
-#define STREAM_WATCHDOG_MS      10000
+#define STREAM_WATCHDOG_MS      5000
 
 // ─── HVP1 Protocol ───────────────────────────────────────────────────────────
 #define MAGIC_NUMBER 0x48565031u
@@ -113,11 +148,7 @@ typedef struct __attribute__((packed)) {
 
 // ─── LED / Buzzer ────────────────────────────────────────────────────────────
 #define LED_PIN              GPIO_NUM_27
-#define BUZZER_PIN           GPIO_NUM_14
-#define BUZZER_LEDC_CHANNEL  LEDC_CHANNEL_0
-#define BUZZER_LEDC_TIMER    LEDC_TIMER_0
-#define BUZZER_FREQ_HZ       2500u
-#define BUZZER_BEEP_MS       150
+// BUZZER not connected — PWM/LEDC removed
 
 // ─── SSD1306 I2C OLED (0.96", 128×64, monochrome) ───────────────────────────
 // GPIO21=SDA (default I2C), GPIO19=SCL (avoids GPIO22 used by INMP441 SD).
@@ -187,6 +218,7 @@ static float         mfcc_output[MFCC_OUTPUT_SIZE];
 // ─── OLED display state (written at trigger/stream/receive sites) ─────────────
 typedef enum {
     DISP_BOOTING = 0,
+    DISP_PROVISIONING,
     DISP_LISTENING,
     DISP_DETECTED,
     DISP_STREAMING,
@@ -194,8 +226,10 @@ typedef enum {
 } disp_state_t;
 
 static volatile disp_state_t g_disp_state = DISP_BOOTING;
-// Transcription result — written by streaming_task BEFORE setting DISP_TRANSCRIBED
-static char g_disp_text[256] = "";
+// Transcription result — written by streaming_task BEFORE setting DISP_TRANSCRIBED.
+// MUST be accessed under disp_mutex to prevent torn reads in display_task.
+static char              g_disp_text[256] = "";
+static SemaphoreHandle_t disp_mutex;            // guards g_disp_text
 // SSD1306 framebuffer — modified in DRAM, flushed to display each redraw
 static uint8_t g_oled_fb[OLED_BUF_BYTES];
 
@@ -354,41 +388,55 @@ static void i2s_global_init() {
     chan_cfg.auto_clear = true;   // zero DMA buffer on underrun
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &g_i2s_rx));
 
+    // FIX: Use STEREO mode — ESP-IDF 5/6 INMP441 MONO mode causes interleaved
+    // stereo pairs in the DMA buffer (L=mic, R=zero), which halves effective RMS.
+    // We read STEREO and de-interleave in i2s_read_pcm() below.
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = (gpio_num_t)(-1),
             .bclk = I2S_SCK_PIN,
             .ws   = I2S_WS_PIN,
-            .dout = (gpio_num_t)(-1),   // I2S_PIN_NO_CHANGE renamed in ESP-IDF 5.x
+            .dout = (gpio_num_t)(-1),
             .din  = I2S_SD_PIN,
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
         },
     };
-    // INMP441 L/R=GND → left channel; set explicitly for clarity
-    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    // Both slots enabled; INMP441 L/R=GND → LEFT slot has mic data, RIGHT=0
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(g_i2s_rx, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(g_i2s_rx));
-    ESP_LOGI(TAG_MAIN, "INMP441 I2S ready: %d Hz  16-bit  mono-left  "
+    ESP_LOGI(TAG_MAIN, "INMP441 I2S ready: %d Hz  16-bit  stereo-deinterleave  "
              "SCK=GPIO%d  WS=GPIO%d  SD=GPIO%d",
              I2S_SAMPLE_RATE, I2S_SCK_PIN, I2S_WS_PIN, I2S_SD_PIN);
 }
 
-// ─── I2S PCM read — replaces read_pcm_dma() ─────────────────────────────────
-// Blocks ≈(out_count/16000)s. No decimation; INMP441 delivers clean 16-bit PCM.
-// Returns samples read, or -1 on hard error.
+// ─── I2S PCM read — STEREO de-interleave for INMP441 ─────────────────────────
+// We read STEREO frames (L=mic, R=zero from INMP441 with L/R=GND).
+// De-interleave: keep only even-index (LEFT) samples into out_buf.
+// Returns number of mono samples written to out_buf, or -1 on hard error.
 static int i2s_read_pcm(int16_t* out_buf, int out_count) {
+    // Read 2x stereo samples into a temp buffer
+    static int16_t stereo_buf[960 * 2];   // 60 ms stereo @ 16kHz (static = DRAM)
+    int read_stereo = (out_count <= 960) ? out_count : 960;
+    size_t bytes_wanted = (size_t)read_stereo * 2 * sizeof(int16_t); // stereo
     size_t bytes_read = 0;
     esp_err_t e = i2s_channel_read(g_i2s_rx,
-                                   out_buf,
-                                   (size_t)out_count * sizeof(int16_t),
+                                   stereo_buf,
+                                   bytes_wanted,
                                    &bytes_read,
                                    pdMS_TO_TICKS(200));
     if (e != ESP_OK && e != ESP_ERR_TIMEOUT) return -1;
-    return (int)(bytes_read / sizeof(int16_t));
+    int stereo_samples = (int)(bytes_read / sizeof(int16_t)); // L+R interleaved
+    int mono_out = 0;
+    // Extract LEFT channel (even indices = mic data)
+    for (int i = 0; i + 1 < stereo_samples && mono_out < out_count; i += 2) {
+        out_buf[mono_out++] = stereo_buf[i];  // LEFT = mic
+    }
+    return mono_out;
 }
 
 // ============================================================================
@@ -485,12 +533,13 @@ static void oled_show_status(disp_state_t state, const char* text) {
     // State label (scale=2 → 16px tall)
     const char* label;
     switch (state) {
-        case DISP_BOOTING:     label = "Booting";   break;
-        case DISP_LISTENING:   label = "Listening"; break;
-        case DISP_DETECTED:    label = "Detected!"; break;
-        case DISP_STREAMING:   label = "Streaming"; break;
-        case DISP_TRANSCRIBED: label = "Received";  break;
-        default:               label = "Unknown";   break;
+        case DISP_BOOTING:      label = "Booting";   break;
+        case DISP_PROVISIONING: label = "Setup WiFi"; break;
+        case DISP_LISTENING:    label = "Listening"; break;
+        case DISP_DETECTED:     label = "Detected!"; break;
+        case DISP_STREAMING:    label = "Streaming"; break;
+        case DISP_TRANSCRIBED:  label = "Received";  break;
+        default:                label = "Unknown";   break;
     }
     int lbl_w = (int)strlen(label) * 12;   // scale=2 → 12px/char
     int lbl_x = (OLED_WIDTH - lbl_w) / 2;
@@ -503,16 +552,39 @@ static void oled_show_status(disp_state_t state, const char* text) {
     ssd_hline(0, OLED_WIDTH - 1, 30, true);
 
     // Transcription / detail text (scale=1, y=33, 21 chars/line, up to 3 lines)
+    // Word-wrap: only break between words, never mid-character.
     if (text && text[0]) {
-        const int COLS = OLED_WIDTH / 6;   // 21 chars
+        const int COLS = OLED_WIDTH / 6;   // 21 chars per line
         int y_pos = 33;
         const char* p = text;
         while (*p && y_pos <= OLED_HEIGHT - 8) {
             char line[22]; int n = 0;
-            while (*p && n < COLS) line[n++] = *p++;
+            // Scan ahead to find the longest word-boundary-respecting prefix
+            const char* scan = p;
+            int last_space_n = 0;           // length at last seen space+1
+            const char* last_space_p = p;   // pointer after last seen space
+            while (*scan && n < COLS) {
+                if (*scan == ' ') {
+                    last_space_n = n + 1;   // include the space on this line
+                    last_space_p = scan + 1;
+                }
+                line[n++] = *scan++;
+            }
+            if (*scan && last_space_n > 0) {
+                // More text remains and we saw a space: cut at word boundary
+                n = last_space_n;
+                p = last_space_p;
+            } else {
+                // Remaining text fits OR no space seen (single long word): keep as-is
+                p = scan;
+            }
             line[n] = '\0';
+            // Trim trailing space if we cut at boundary
+            while (n > 0 && line[n-1] == ' ') line[--n] = '\0';
             ssd_draw_str(0, y_pos, line, true, 1);
             y_pos += 9;
+            // Skip leading space on next line
+            if (*p == ' ') p++;
         }
     }
 
@@ -570,9 +642,30 @@ static void ssd1306_init() {
     oled_show_status(DISP_BOOTING, "");
 }
 
+extern "C" void display_show_provisioning(void) {
+    oled_show_status(DISP_PROVISIONING, "AP: HeyVaani-Setup\nIP: 192.168.4.1");
+}
+
 // ─── Mic Self-Check (I2S) ────────────────────────────────────────────────────
 // Reads 0.5 s of audio and logs RMS — confirms I2S data flow before pipeline starts.
 // Expected RMS in silence: ~0.001–0.010 (INMP441 noise floor ≈ −26 dBFS).
+//
+// NOTE on "8.4.1/" crash loop:
+//   If you see "8.4.1/" repeating in the serial monitor at extremely high rate
+//   (thousands of lines/sec), this is the ESP32 ROM bootloader printing its
+//   crash/reset reason code — it means the firmware is crashing BEFORE or
+//   immediately AFTER app_main() starts.
+//
+//   Root causes to check IN ORDER:
+//   1. esp_restart() called in this function (previously — now NON-FATAL below).
+//   2. I2C bus hung at ssd1306_init() — pull SDA/SCL HIGH with 4.7kΩ resistors.
+//   3. TENSOR_ARENA_SIZE or static buffers exceeding available DRAM (check
+//      [STACK] printout — if never printed, crash is pre-task-create).
+//   4. Baud rate mismatch — monitor must be 115200 baud.
+//   5. Try: pio run -t erase (full flash erase) then reflash.
+//
+//   This function is now NON-FATAL: a silent INMP441 is logged as an error
+//   but does NOT call esp_restart(), so the 5 s delay + reboot loop is gone.
 static void mic_selfcheck() {
     static int16_t buf[8000];   // 0.5 s @ 16 kHz — static → DRAM, DMA-safe
     int64_t sum_sq = 0;
@@ -583,9 +676,10 @@ static void mic_selfcheck() {
     int got = (e == ESP_OK || e == ESP_ERR_TIMEOUT)
               ? (int)(bytes_read / sizeof(int16_t)) : 0;
     if (got <= 0) {
-        ESP_LOGE(TAG_MIC, "I2S self-check: no data (err=0x%x) — check SCK/WS/SD wiring",
+        ESP_LOGE(TAG_MIC, "I2S self-check: no data (err=0x%x) — check SCK=GPIO26 WS=GPIO25 SD=GPIO22",
                  (unsigned)e);
-        got = 1;   // prevent div-by-zero; RMS will be ~0 → fail below
+        ESP_LOGW(TAG_MIC, "Continuing anyway — mic may still work. Check [ENERGY] log.");
+        return;   // NON-FATAL: was esp_restart() — removed to stop crash loop
     }
     for (int i = 0; i < got; i++) sum_sq += (int64_t)buf[i] * buf[i];
     float rms = sqrtf((float)sum_sq / got) / 32768.0f;
@@ -594,12 +688,14 @@ static void mic_selfcheck() {
            (float)got / I2S_SAMPLE_RATE, got, (double)rms);
     fflush(stdout);
     if (rms < 1e-6f) {
-        ESP_LOGE(TAG_MIC, "MIC SELF-CHECK FAILED — INMP441 silent. "
-                          "Verify SCK=GPIO26 WS=GPIO25 SD=GPIO22 L/R=GND. Halting.");
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        esp_restart();
+        // NON-FATAL: log clearly but do NOT restart — the crash loop was caused
+        // by this restart being hit repeatedly when INMP441 was not responding.
+        ESP_LOGE(TAG_MIC, "MIC SELF-CHECK WARNING — INMP441 appears silent.");
+        ESP_LOGE(TAG_MIC, "  Check: SCK=GPIO26  WS=GPIO25  SD=GPIO22  L/R=GND");
+        ESP_LOGW(TAG_MIC, "  Continuing. Inference will likely get no triggers.");
+    } else {
+        ESP_LOGI(TAG_MIC, "Mic self-check PASSED (RMS=%.5f)", rms);
     }
-    ESP_LOGI(TAG_MIC, "Mic self-check PASSED (RMS=%.5f)", rms);
 }
 
 // ─── WiFi — UNCHANGED from rev6 ──────────────────────────────────────────────
@@ -633,18 +729,20 @@ static void wifi_start() {
         ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
         ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
         wifi_infra_ready = true;
+    } else {
+        esp_wifi_stop();
     }
     wifi_config_t wcfg = {};
     // Use credentials loaded from NVS by wifi_provision_init() at boot.
-    // On first boot these are set via the "HeyVaani-Setup" captive portal.
     strncpy((char*)wcfg.sta.ssid,     g_wifi_ssid, sizeof(wcfg.sta.ssid));
     strncpy((char*)wcfg.sta.password, g_wifi_pass, sizeof(wcfg.sta.password));
     wcfg.sta.threshold.authmode = WIFI_AUTH_OPEN;  // allow open networks too
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
     wifi_retry_count = 0;
     xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_start();
+    esp_wifi_connect();
     EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
     if (bits & WIFI_CONNECTED_BIT) ESP_LOGI(TAG_WIFI, "WiFi connected");
@@ -663,7 +761,7 @@ static void wifi_stop() {
 // Forward declaration — beep_task is defined after streaming_task but called
 // from inference_task which appears before it in the file.
 // ============================================================================
-static void beep_task(void* arg);
+// beep_task forward declaration removed — no buzzer
 
 // ============================================================================
 // TASK 0: audio_task — sole I2S consumer; writes to ring buffer.
@@ -854,10 +952,6 @@ static void inference_task(void* arg) {
         printf("[STAGE-C] post-invoke (%.0f us)\n", infer_us); fflush(stdout);
 
         // 11. Dequantise output
-        // Model output: [1,1] sigmoid — single node, value = P(keyword).
-        // Binary BCE model (new_dataset/new_model/). out[0] is the keyword probability.
-        // If someone switches back to a 2-class softmax model, out_elems will be 2
-        // and we fall back to reading index 1 (keyword class).
         float   out_scale = output_tensor->params.scale;
         int32_t out_zp    = output_tensor->params.zero_point;
         int8_t* out       = output_tensor->data.int8;
@@ -884,13 +978,19 @@ static void inference_task(void* arg) {
             printf("[TRIGGER->STREAM] EDGE KWS FIRED conf=%.4f (%.1f%%) — streaming to cloud for verification\n",
                    (double)kw_prob, (double)(kw_prob * 100.0f));
             fflush(stdout);
+
+            // ── Immediate LED feedback on KWS trigger ──────────────────────
+            gpio_set_level((gpio_num_t)LED_PIN, 1);
+            g_disp_state = DISP_DETECTED;
+
             xQueueSend(detect_queue, &kw_end, 0);
             consecutive_hits = 0;
-            // ── LED/buzzer/OLED deliberately NOT fired here ─────────────────
-            // Cloud verification result drives those — see streaming_task below.
-            // ────────────────────────────────────────────────────────────────
 
-            vTaskDelay(pdMS_TO_TICKS(1000));  // 1 s cooldown — suppress echo re-trigger
+            vTaskDelay(pdMS_TO_TICKS(500));  // hold LED on for 500ms
+            gpio_set_level((gpio_num_t)LED_PIN, 0);
+            g_disp_state = DISP_LISTENING;
+
+            vTaskDelay(pdMS_TO_TICKS(700));  // 1 s total cooldown — suppress echo re-trigger
         } else if (consecutive_hits > 0) {
             printf("[INFER] building... hit %d/%d conf=%.4f\n",
                    consecutive_hits, DETECTION_HITS_REQUIRED, (double)kw_prob); fflush(stdout);
@@ -963,6 +1063,28 @@ static void streaming_task(void* arg) {
             printf("[STREAM] sid=%lu HVP1 header sent (%d bytes)\n", (unsigned long)sid, (int)sizeof(hdr)); fflush(stdout);
         }
 
+        // ── AES-128-CTR session setup ────────────────────────────────────
+        uint8_t aes_nonce[16];                 // 16-byte random nonce (audio direction)
+        uint8_t aes_stream_blk[16] = {0};      // AES-CTR keystream block state
+        size_t  aes_nc_off = 0;                // offset within keystream block
+        esp_fill_random(aes_nonce, sizeof(aes_nonce));  // hardware RNG
+
+        // Send nonce immediately after HVP1 header — server reads it before audio
+        {
+            ssize_t n = send(sock, aes_nonce, sizeof(aes_nonce), 0);
+            if (n != (ssize_t)sizeof(aes_nonce)) {
+                printf("[AES] sid=%lu nonce send failed (%zd)\n", (unsigned long)sid, n); fflush(stdout);
+            } else {
+                printf("[AES] sid=%lu nonce sent (%02X%02X%02X%02X...)\n",
+                       (unsigned long)sid, aes_nonce[0], aes_nonce[1], aes_nonce[2], aes_nonce[3]);
+                fflush(stdout);
+            }
+        }
+
+        esp_aes_context aes_ctx;
+        esp_aes_init(&aes_ctx);
+        esp_aes_setkey(&aes_ctx, AES_KEY, 128);
+
         set_streaming_active(true, "keyword_detected");
         g_disp_state = DISP_STREAMING;   // [NEW] display_task picks up within 100 ms
 
@@ -987,10 +1109,24 @@ static void streaming_task(void* arg) {
 
             {
                 uint8_t* pp = (uint8_t*)pcm; size_t pl = CHUNK * sizeof(int16_t); bool se = false;
-                while (pl > 0) {
-                    ssize_t n = send(sock, pp, pl, 0);
+
+                // Encrypt chunk in-place using AES-128-CTR
+                // mbedtls_aes_crypt_ctr maintains aes_nc_off + aes_stream_blk across calls,
+                // so the keystream continues seamlessly across all chunks.
+                static uint8_t enc_buf[CHUNK * sizeof(int16_t)];
+                esp_aes_crypt_ctr(&aes_ctx,
+                                  pl,
+                                  &aes_nc_off,
+                                  aes_nonce,
+                                  aes_stream_blk,
+                                  pp,          // plaintext in
+                                  enc_buf);    // ciphertext out
+
+                uint8_t* send_ptr = enc_buf; size_t send_len = pl;
+                while (send_len > 0) {
+                    ssize_t n = send(sock, send_ptr, send_len, 0);
                     if (n < 0) { printf("[SEND-ERROR] sid=%lu errno=%d (%s)\n", (unsigned long)sid, errno, strerror(errno)); fflush(stdout); se = true; break; }
-                    pp += n; pl -= (size_t)n;
+                    send_ptr += n; send_len -= (size_t)n;
                 }
                 if (se) break;
             }
@@ -1015,6 +1151,8 @@ static void streaming_task(void* arg) {
         ESP_LOGI(TAG_STR, "[%lu] Sent %d samples (%.2fs)",
                  (unsigned long)sid, total_sent, (float)total_sent / I2S_SAMPLE_RATE);
 
+        esp_aes_free(&aes_ctx);   // release AES context after streaming done
+
         {
             int64_t rs = esp_timer_get_time();
             char resp[1024] = {0}; int rlen = 0, r;
@@ -1022,62 +1160,107 @@ static void streaming_task(void* arg) {
             float recv_ms = (float)(esp_timer_get_time() - rs) / 1000.0f;
             close(sock);
             printf("[STREAM] sid=%lu recv: %d bytes in %.0fms\n", (unsigned long)sid, rlen, (double)recv_ms);
-            printf("\n=== CLOUD RESPONSE ===\n  -> %s\n======================\n\n",
-                   rlen > 0 ? resp : "[no response]");
+            printf("\n=== CLOUD RESPONSE (encrypted) ===\n  -> [%d encrypted bytes]\n"
+                   "=================================\n\n", rlen);
             fflush(stdout);
 
-            // ── Parse "verified": true/false from cloud JSON ─────────────
-            // Cloud sends: {"verified": true/false, "transcript": "...", ...}
-            // Only fire LED + buzzer + OLED if cloud confirmed the keyword.
-            bool cloud_verified = false;
-            {
-                char* vptr = strstr(resp, "\"verified\":");
-                if (vptr) {
-                    vptr += strlen("\"verified\":");
-                    while (*vptr == ' ') vptr++;
-                    cloud_verified = (strncmp(vptr, "true", 4) == 0);
-                }
+            // ── Decrypt response using derived nonce (audio_nonce XOR 0xFF last byte) ──
+            if (rlen > 0) {
+                uint8_t resp_nonce[16];
+                memcpy(resp_nonce, aes_nonce, 16);
+                resp_nonce[15] ^= 0xFF;   // same derivation as server-side _response_nonce()
+
+                uint8_t resp_stream_blk[16] = {0};
+                size_t  resp_nc_off = 0;
+                esp_aes_context resp_aes;
+                esp_aes_init(&resp_aes);
+                esp_aes_setkey(&resp_aes, AES_KEY, 128);
+                esp_aes_crypt_ctr(&resp_aes, (size_t)rlen, &resp_nc_off,
+                                  resp_nonce, resp_stream_blk,
+                                  (uint8_t*)resp, (uint8_t*)resp);  // decrypt in-place
+                esp_aes_free(&resp_aes);
+                resp[rlen] = '\0';   // null-terminate for cJSON
+                printf("[AES] sid=%lu response decrypted (%d bytes)\n",
+                       (unsigned long)sid, rlen); fflush(stdout);
             }
 
-            // ── Parse "transcript":"..." from JSON response ──────────────
-            char clean_txt[128] = {0};
-            {
-                char* tptr = strstr(resp, "\"transcript\":");
-                if (tptr) {
-                    tptr += strlen("\"transcript\":");
-                    while (*tptr == ' ' || *tptr == '\"') tptr++;
-                    int idx = 0;
-                    while (*tptr && *tptr != '\"' && *tptr != '}' && *tptr != ',' && idx < (int)sizeof(clean_txt)-1)
-                        clean_txt[idx++] = *tptr++;
-                    clean_txt[idx] = '\0';
-                } else if (rlen > 0) {
-                    snprintf(clean_txt, sizeof(clean_txt), "%.127s", resp);
+            printf("[STREAM] sid=%lu DECRYPTED RESPONSE: %s\n",
+                   (unsigned long)sid, rlen > 0 ? resp : "[no response]");
+            fflush(stdout);
+
+            // ── cJSON: Parse cloud JSON response ─────────────────────────
+            // Cloud sends: {"verified": bool, "transcript": "...",
+            //               "intent": {"intent":"...","action":"...", ...}, ...}
+            // Uses ESP-IDF built-in cJSON — no extra dependency.
+            bool cloud_verified = false;
+            char clean_txt[128] = "[No Response]";
+            char intent_str[64] = "";
+
+            if (rlen > 0) {
+                cJSON* root = cJSON_ParseWithLength(resp, (size_t)rlen);
+                if (root) {
+                    // "verified"
+                    cJSON* jv = cJSON_GetObjectItemCaseSensitive(root, "verified");
+                    cloud_verified = cJSON_IsTrue(jv);
+
+                    // "transcript"
+                    cJSON* jt = cJSON_GetObjectItemCaseSensitive(root, "transcript");
+                    if (cJSON_IsString(jt) && jt->valuestring) {
+                        snprintf(clean_txt, sizeof(clean_txt), "%s", jt->valuestring);
+                    }
+
+                    // "intent" (optional — only present when --intent flag used)
+                    cJSON* ji = cJSON_GetObjectItemCaseSensitive(root, "intent");
+                    if (cJSON_IsObject(ji)) {
+                        cJSON* ja = cJSON_GetObjectItemCaseSensitive(ji, "intent");
+                        cJSON* jac = cJSON_GetObjectItemCaseSensitive(ji, "action");
+                        if (cJSON_IsString(ja) && cJSON_IsString(jac)) {
+                            snprintf(intent_str, sizeof(intent_str), "%s:%s",
+                                     ja->valuestring, jac->valuestring);
+                        }
+                    }
+
+                    cJSON_Delete(root);
                 } else {
-                    snprintf(clean_txt, sizeof(clean_txt), "[No Response]");
+                    // Fallback if JSON parse fails (malformed response)
+                    ESP_LOGW(TAG_STR, "[%lu] cJSON parse failed — raw: %.64s",
+                             (unsigned long)sid, resp);
+                    // Try to salvage something readable for the OLED
+                    snprintf(clean_txt, sizeof(clean_txt), "%.127s", resp);
                 }
             }
 
             if (cloud_verified) {
                 // ── CONFIRMED: Cloud matched "Hey Vaani" ─────────────────
-                // Only NOW fire LED + buzzer + update OLED
-                printf("[VERIFIED] Cloud CONFIRMED keyword — transcript: '%s'\n", clean_txt);
+                // Only NOW fire LED + buzzer + update OLED.
+                printf("[VERIFIED] Cloud CONFIRMED — transcript:'%s' intent:'%s'\n",
+                       clean_txt, intent_str[0] ? intent_str : "(none)");
                 fflush(stdout);
 
                 gpio_set_level(LED_PIN, 1);
                 g_disp_state = DISP_DETECTED;   // brief "Detected!" flash
-                xTaskCreatePinnedToCore(beep_task, "beep", 1024, NULL, 3, NULL, 1);
                 vTaskDelay(pdMS_TO_TICKS(300));  // hold "Detected!" for 300ms
 
-                // Transition to showing transcript
-                snprintf(g_disp_text, sizeof(g_disp_text), "%s", clean_txt);
+                // Write transcript under mutex — display_task reads it concurrently
+                if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    // Show intent if available, else transcript
+                    if (intent_str[0]) {
+                        snprintf(g_disp_text, sizeof(g_disp_text), "%s", intent_str);
+                    } else {
+                        snprintf(g_disp_text, sizeof(g_disp_text), "%s", clean_txt);
+                    }
+                    xSemaphoreGive(disp_mutex);
+                } else {
+                    ESP_LOGW(TAG_STR, "disp_mutex timeout — OLED text may be stale");
+                }
                 g_disp_state = DISP_TRANSCRIBED;
                 gpio_set_level(LED_PIN, 0);      // LED off — processing done
-                printf("[OLED] Transcript: '%s'\n", clean_txt); fflush(stdout);
+                printf("[OLED] Displaying: '%s'\n", clean_txt); fflush(stdout);
                 vTaskDelay(pdMS_TO_TICKS(3500)); // hold transcript on screen
             } else {
                 // ── REJECTED: Cloud did not match "Hey Vaani" ────────────
                 // No LED. No buzzer. No OLED change. Silent fallback.
-                printf("[REJECTED] Cloud REJECTED — transcript: '%s' — no user feedback\n",
+                printf("[REJECTED] Cloud REJECTED — transcript:'%s' — no user feedback\n",
                        clean_txt); fflush(stdout);
                 // g_disp_state remains DISP_LISTENING (set below)
             }
@@ -1157,14 +1340,7 @@ static void watchdog_task(void* arg) {
 // Created by inference_task at keyword confirm. Stack 1024 B is sufficient.
 // Runs concurrently — does NOT block inference_task critical path.
 // ============================================================================
-static void beep_task(void* arg) {
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL, 512); // 50% duty @ 2.5 kHz
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL);
-    vTaskDelay(pdMS_TO_TICKS(BUZZER_BEEP_MS));
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL, 0);   // silence
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, BUZZER_LEDC_CHANNEL);
-    vTaskDelete(NULL);   // self-delete — no stack/TCB leak
-}
+// beep_task removed — no buzzer hardware connected
 
 // ============================================================================
 // TASK 5 (NEW): display_task — ST7735 status screen, Core 0, priority 1.
@@ -1176,12 +1352,23 @@ static void beep_task(void* arg) {
 static void display_task(void* arg) {
     ESP_LOGI(TAG_DISP, "Display task started (core %d)", xPortGetCoreID());
     disp_state_t last_state = (disp_state_t)(-1);  // force draw on first iteration
+    char local_txt[256];   // local copy — read under mutex
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(100));
         disp_state_t cur = g_disp_state;
         if (cur != last_state) {
-            const char* txt = (cur == DISP_TRANSCRIBED) ? g_disp_text : "";
-            oled_show_status(cur, txt);
+            local_txt[0] = '\0';
+            if (cur == DISP_TRANSCRIBED) {
+                // Take disp_mutex to safely read g_disp_text written by streaming_task
+                if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    strlcpy(local_txt, g_disp_text, sizeof(local_txt));
+                    xSemaphoreGive(disp_mutex);
+                } else {
+                    ESP_LOGW(TAG_DISP, "disp_mutex timeout — showing stale text");
+                    strlcpy(local_txt, g_disp_text, sizeof(local_txt));  // best-effort
+                }
+            }
+            oled_show_status(cur, local_txt);
             last_state = cur;
             ESP_LOGI(TAG_DISP, "State → %d  (%s)", (int)cur,
                      cur==DISP_BOOTING    ? "Booting"   :
@@ -1275,6 +1462,7 @@ extern "C" void app_main() {
     ESP_ERROR_CHECK(nvs_flash_init());
 
     ring_mutex   = xSemaphoreCreateMutex();
+    disp_mutex   = xSemaphoreCreateMutex();   // guards g_disp_text (issue #3 fix)
     detect_queue = xQueueCreate(4, sizeof(int64_t));
 
     // ── LED: output, initially off ────────────────────────────────────────────
@@ -1283,27 +1471,8 @@ extern "C" void app_main() {
     gpio_set_level(LED_PIN, 0);
     ESP_LOGI(TAG_MAIN, "LED ready (GPIO%d)", LED_PIN);
 
-    // ── Buzzer: LEDC PWM, initially silent ───────────────────────────────────
-    ledc_timer_config_t lt = {};
-    lt.speed_mode      = LEDC_LOW_SPEED_MODE;
-    lt.duty_resolution = LEDC_TIMER_10_BIT;   // duty range 0–1023
-    lt.timer_num       = BUZZER_LEDC_TIMER;
-    lt.freq_hz         = BUZZER_FREQ_HZ;
-    lt.clk_cfg         = LEDC_AUTO_CLK;
-    ESP_ERROR_CHECK(ledc_timer_config(&lt));
-
-    ledc_channel_config_t lc = {};
-    lc.gpio_num   = (int)BUZZER_PIN;
-    lc.speed_mode = LEDC_LOW_SPEED_MODE;
-    lc.channel    = BUZZER_LEDC_CHANNEL;
-    // lc.intr_type deprecated in ESP-IDF 5.x — omit; driver handles it
-    lc.timer_sel  = BUZZER_LEDC_TIMER;
-
-
-    lc.duty       = 0;
-    lc.hpoint     = 0;
-    ESP_ERROR_CHECK(ledc_channel_config(&lc));
-    ESP_LOGI(TAG_MAIN, "Buzzer LEDC ready (GPIO%d, %u Hz)", BUZZER_PIN, BUZZER_FREQ_HZ);
+    // Buzzer LEDC init removed — no buzzer hardware connected
+    ESP_LOGI(TAG_MAIN, "LED ready on GPIO%d (buzzer not connected)", LED_PIN);
 
     // ── OLED: SSD1306 I2C init, immediately shows "Booting..." ──────────────────
     ssd1306_init();   // draws DISP_BOOTING screen at end

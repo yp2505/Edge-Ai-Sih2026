@@ -7,3 +7,9 @@ CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
 CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ=240
 # Suppress legacy I2C deprecation warning (migration not needed for this project)
 CONFIG_I2C_SUPPRESS_DEPRECATE_WARN=y
+# ── mbedTLS AES-128-CTR (for audio stream encryption) ─────────────────
+# Both are already enabled by default in ESP-IDF; listed here explicitly
+# so the build fails visibly if someone disables them via menuconfig.
+CONFIG_MBEDTLS_AES_C=y
+CONFIG_MBEDTLS_CTR_DRBG_C=y
+CONFIG_ESP_SYSTEM_USE_ECC_LIB=n   # Not needed — AES only

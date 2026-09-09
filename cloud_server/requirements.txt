@@ -1,5 +1,6 @@
 # ── Active Cloud Server (server.py) ──────────────────────────────────────────
 # All backends are open-source and run 100% offline — no API key, no cloud.
+# cryptography is used for AES-128-CTR encryption of the audio stream + responses.
 #
 # Run: python server.py                       (Whisper ASR, no intent)
 # Run: python server.py --asr vosk            (Vosk ASR, lighter)
@@ -9,6 +10,7 @@
 numpy>=1.23.0
 soundfile>=0.12.0           # WAV read/write for --test mode
 requests>=2.31.0            # Ollama intent API (localhost, no internet used)
+cryptography>=42.0.0        # AES-128-CTR for audio stream + JSON response encryption
 
 # ── Backend A: faster-whisper (default, offline, open-source) ────────────────
 faster-whisper>=0.10.0      # Open-source Whisper INT8 on CPU ✅

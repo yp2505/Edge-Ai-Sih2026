@@ -50,9 +50,10 @@ static const char* TAG = "PROV";
 #define AP_IP_STR   "192.168.4.1"
 
 // ─── Exported globals ────────────────────────────────────────────────────────
-char g_wifi_ssid[PROV_SSID_MAX] = {0};
-char g_wifi_pass[PROV_PASS_MAX] = {0};
-char g_server_ip[PROV_IP_MAX]   = "192.168.1.18";  // sensible default
+char g_wifi_ssid[PROV_SSID_MAX] = "Patel divy's S24 FE";
+char g_wifi_pass[PROV_PASS_MAX] = "divypatel2712";
+char g_server_ip[PROV_IP_MAX]   = "10.62.113.173";
+
 
 // ─── Setup portal HTML ───────────────────────────────────────────────────────
 // Served at http://192.168.4.1/ — dark-themed, responsive, minimal.
@@ -93,8 +94,8 @@ static const char PORTAL_HTML[] =
         "<input type='password' name='pass'"
             " placeholder='Leave blank for open networks'>"
         "<label>Server IP Address</label>"
-        "<input type='text' name='ip' value='192.168.1.18'"
-            " placeholder='192.168.x.x' required>"
+        "<input type='text' name='ip' value='13.233.154.18'"
+            " placeholder='Server IP Address' required>"
         "<div class='hint'>"
             "IP of the laptop running the Hey Vaani cloud server</div>"
         "<button type='submit'>&#128190;&nbsp;Save &amp; Connect</button>"
@@ -435,7 +436,8 @@ void wifi_provision_init(void) {
         ESP_LOGI(TAG, "NVS OK: SSID='%s'  server=%s", g_wifi_ssid, g_server_ip);
         return;   // wifi_start() in main.cpp handles the actual connection
     }
-    // No credentials stored → launch captive portal (never returns)
-    ESP_LOGW(TAG, "No NVS credentials — launching captive portal");
-    prov_start_portal();
+    // No NVS credentials stored → fallback to hardcoded default hotspot
+    ESP_LOGI(TAG, "NVS empty — using default hotspot: SSID='%s' server=%s", g_wifi_ssid, g_server_ip);
+    nvs_save_credentials(g_wifi_ssid, g_wifi_pass, g_server_ip);
 }
+

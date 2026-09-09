@@ -14,6 +14,9 @@ idf_component_register(
         nvs_flash
         esp_timer
         esp-tflite-micro
+        mbedtls          # AES-128-CTR (mbedtls/aes.h) + hardware RNG (esp_random.h)
+        esp_hw_support   # esp_fill_random()
+        cjson            # cJSON.h (cJSON parser from espressif/cjson)
 )
 
 # Enable runtime stats for CPU load measurement (benchmark_cpu.h)

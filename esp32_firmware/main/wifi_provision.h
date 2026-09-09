@@ -61,6 +61,11 @@ void wifi_provision_init(void);
  */
 void wifi_provision_clear(void);
 
+/**
+ * Update OLED screen to show Setup WiFi / Captive Portal instructions.
+ */
+void display_show_provisioning(void);
+
 #ifdef __cplusplus
 }
 #endif

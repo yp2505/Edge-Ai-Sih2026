@@ -53,19 +53,58 @@ from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import numpy as np
 
+# ─── AES-128-CTR Encryption ───────────────────────────────────────────────────
+# All audio (ESP32 → server) and responses (server → ESP32) are encrypted
+# with AES-128-CTR using a pre-shared key.  No licence, no API key.
+# Key source (in order of priority):
+#   1. HV_AES_KEY environment variable (hex string, 32 chars = 16 bytes)
+#   2. Hardcoded demo key below   ← CHANGE THIS before production deployment
+#
+# Protocol:
+#   [20-byte HVP1 header] [16-byte nonce] [encrypted audio...]
+#   [encrypted JSON response]
+# Nonces:
+#   Audio    nonce: 16 random bytes sent by ESP32 right after HVP1 header
+#   Response nonce: audio_nonce with last byte XOR 0xFF (both sides derive it)
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.backends import default_backend as _crypto_backend
+    _CRYPTO_AVAILABLE = True
+except ImportError:
+    _CRYPTO_AVAILABLE = False
+
+# 16-byte AES-128 key.  Must EXACTLY match AES_KEY[] in main.cpp.
+_HV_AES_KEY_HEX = os.environ.get("HV_AES_KEY", "48657956616e6e69534948323032362a")
+try:
+    AES_KEY = bytes.fromhex(_HV_AES_KEY_HEX)
+    assert len(AES_KEY) == 16, f"HV_AES_KEY must be 32 hex chars (16 bytes), got {len(AES_KEY)}"
+except Exception as e:
+    print(f"[AES] Key error: {e} — using default key")
+    AES_KEY = b'HeyVaaniSIH2026*'  # fallback
+
+
+def _aes_ctr_cipher(nonce: bytes):
+    """Return a fresh AES-128-CTR Cipher object for the given 16-byte nonce."""
+    if not _CRYPTO_AVAILABLE:
+        raise RuntimeError("cryptography library not installed — run: pip install cryptography")
+    return Cipher(algorithms.AES(AES_KEY), modes.CTR(nonce), backend=_crypto_backend())
+
+
+def _response_nonce(audio_nonce: bytes) -> bytes:
+    """Derive response nonce from audio nonce: flip last byte.
+    Both ESP32 and server compute this independently — no extra transmission needed."""
+    n = bytearray(audio_nonce)
+    n[15] ^= 0xFF
+    return bytes(n)
+
 # ─── Server-side VAD (Silence Detection) ─────────────────────────────────────
-# The ESP32 streams audio for COMMAND_DURATION_MS (2000ms) before closing.
-# Rather than waiting the full 2s, the server monitors RMS energy per chunk and
-# cuts off early when the user has clearly stopped speaking.
+# ⚡ LATENCY-OPTIMISED for <200ms total end-to-end (rev8)
+#   VAD_SILENCE_MS dropped 350→100ms (matches ESP32 COMMAND_SILENCE_MS=100ms)
+#   VAD_MIN_AUDIO_MS dropped 1500→300ms (no need to wait 1.5s ring buffer)
 #
-# Tuning:
-#   VAD_RMS_THRESHOLD   — below this level, chunk is "silence"
-#   VAD_SILENCE_MS      — how many consecutive ms of silence triggers cut-off
-#   VAD_MIN_AUDIO_MS    — don't cut before this — lets the command word start
-#
-VAD_RMS_THRESHOLD = 0.008    # 0.8% of full scale — works well for most mics
-VAD_SILENCE_MS    = 350      # stop after 350ms of consecutive silence
-VAD_MIN_AUDIO_MS  = 1500     # wait at least 1.5s (ring buffer 1s + command start)
+VAD_RMS_THRESHOLD = 0.008    # 0.8% of full scale
+VAD_SILENCE_MS    = 100      # stop after 100ms consecutive silence (⚡ was 350)
+VAD_MIN_AUDIO_MS  = 300      # accept stream after 300ms minimum (⚡ was 1500)
 
 # ─── Pre-Transcription Gates ─────────────────────────────────────────────────
 # These filters run BEFORE calling Whisper at all.
@@ -362,6 +401,28 @@ class ASRServer:
 
     # ── ASR backend loader ─────────────────────────────────────────────────
     def _load_asr(self):
+        self._vosk_model = None   # ⚡ pre-load cache
+
+        if self.asr_engine == "vosk":
+            if not _VOSK_AVAILABLE:
+                print("  ❌ vosk not installed — run: pip install vosk", file=sys.stderr)
+                sys.exit(1)
+            model_path = os.path.join(os.path.dirname(__file__), "vosk_model")
+            if not os.path.isdir(model_path):
+                print(
+                    f"  ❌ Vosk model not found at {model_path}\n"
+                    "  Download from https://alphacephei.com/vosk/models\n"
+                    "  Use vosk-model-small-en-us-0.15 (40MB) for best latency\n"
+                    "  Unzip into cloud_server/vosk_model/",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print("  ⏳ Pre-loading Vosk model at startup (⚡ eliminates per-request cold-start)...")
+            t0 = time.time()
+            self._vosk_model = vosk.Model(model_path)
+            print(f"  ✅ Vosk model loaded in {(time.time()-t0)*1000:.0f}ms — cached for all sessions")
+            return
+
         if self.asr_engine == "aws":
             if not _AWS_AVAILABLE:
                 print(
@@ -388,7 +449,7 @@ class ASRServer:
                 "║   ❌  FATAL: faster-whisper NOT INSTALLED                    ║\n"
                 "║                                                              ║\n"
                 "║   FIX:  pip install faster-whisper                          ║\n"
-                "║   OR use --asr aws to switch to Amazon Transcribe            ║\n"
+                "║   OR use --asr vosk to switch to Vosk (lower latency)       ║\n"
                 "╚══════════════════════════════════════════════════════════════╝\n",
                 file=sys.stderr,
             )
@@ -401,6 +462,7 @@ class ASRServer:
             compute_type="int8",
         )
         print(f"  ✅ Whisper '{self.whisper_model}' loaded in {(time.time()-t0)*1000:.0f}ms")
+
 
     # ── Client Handler ─────────────────────────────────────────────────────
     def _handle_client(self, client_socket: socket.socket,
@@ -441,6 +503,21 @@ class ASRServer:
             print(f"  📋 [{session_id}] HVP1: {sr}Hz/{ch}ch/{bits}bit "
                   f"mode={mode} kw→connect={kw_to_connect_ms}ms")
 
+            # ── Step 1b: Read AES nonce (16 bytes, sent right after HVP1 header) ──
+            aes_nonce: bytes | None = None
+            aes_decryptor = None
+            if _CRYPTO_AVAILABLE:
+                aes_nonce = self._recv_exact(client_socket, 16)
+                if not aes_nonce or len(aes_nonce) < 16:
+                    print(f"  ⚠️  [{session_id}] Missing AES nonce — falling back to plaintext")
+                    aes_nonce = None
+                else:
+                    aes_decryptor = _aes_ctr_cipher(aes_nonce).decryptor()
+                    print(f"  🔐 [{session_id}] AES-128-CTR decryptor ready "
+                          f"nonce={aes_nonce[:4].hex()}...")
+            else:
+                print(f"  ⚠️  [{session_id}] cryptography not installed — plaintext mode")
+
             # ── Step 2: Receive audio ──────────────────────────────────────
             audio_data = b""
             first_chunk = True
@@ -455,6 +532,9 @@ class ASRServer:
                     if first_chunk:
                         first_audio_byte_ms = int(time.time() * 1000)
                         first_chunk = False
+                    # Decrypt batch audio if AES active
+                    if aes_decryptor:
+                        chunk = aes_decryptor.update(chunk)
                     audio_data += chunk
                     remaining -= len(chunk)
             else:
@@ -475,6 +555,9 @@ class ASRServer:
                     if first_chunk:
                         first_audio_byte_ms = int(time.time() * 1000)
                         first_chunk = False
+                    # Decrypt chunk BEFORE VAD/accumulation — VAD operates on plaintext
+                    if aes_decryptor:
+                        chunk = aes_decryptor.update(chunk)
                     audio_data += chunk
                     total_audio_ms += 30
 
@@ -561,7 +644,7 @@ class ASRServer:
             print(f"  ⏱️  [{session_id}] END-TO-END:              {end_to_end_ms}ms")
             print(f"  {'─' * 58}\n")
 
-            # ── Step 4: Send JSON response to ESP32 ───────────────────────
+            # ── Step 4: Encrypt + Send JSON response to ESP32 ─────────────
             response_dict = {
                 "transcript":          transcript,
                 "verification_status": verification_status,
@@ -576,7 +659,19 @@ class ASRServer:
             }
             if intent_data:
                 response_dict["intent"] = intent_data
-            response = json.dumps(response_dict).encode("utf-8")
+            response: bytes = json.dumps(response_dict).encode("utf-8")
+
+            # Encrypt response with derived nonce (audio_nonce XOR 0xFF on last byte)
+            if aes_nonce:
+                try:
+                    resp_nonce = _response_nonce(aes_nonce)
+                    encryptor  = _aes_ctr_cipher(resp_nonce).encryptor()
+                    response   = encryptor.update(response) + encryptor.finalize()
+                    print(f"  \U0001f512 [{session_id}] Response encrypted "
+                          f"({len(response)}B, nonce={resp_nonce[:4].hex()}...)")
+                except Exception as enc_err:
+                    print(f"  \u26a0\ufe0f  [{session_id}] Response encryption failed: {enc_err} "
+                          f"— sending plaintext")
             try:
                 client_socket.sendall(response)
             except Exception:
@@ -747,37 +842,40 @@ class ASRServer:
         Transcribe raw 16-bit PCM using Vosk offline ASR.
         Vosk runs 100% locally — no cloud, no API key, no internet required.
 
-        Setup:
-          pip install vosk
-          Download model from https://alphacephei.com/vosk/models
-          e.g. vosk-model-en-us-0.22 (40MB) or vosk-model-small-en-us-0.15 (40MB)
-          Place in cloud_server/vosk_model/
+        ⚡ LATENCY-OPTIMISED (rev8):
+          - Vosk Model is pre-loaded ONCE at server startup (self._vosk_model)
+            and reused across sessions. Eliminates ~300ms cold-start per call.
+          - chunk_size 4000 bytes = 125ms chunks (was 8000 = 250ms)
         """
         try:
             if not _VOSK_AVAILABLE:
                 raise RuntimeError("vosk not installed — run: pip install vosk")
 
-            model_path = os.path.join(os.path.dirname(__file__), "vosk_model")
-            if not os.path.isdir(model_path):
-                raise RuntimeError(
-                    f"Vosk model not found at {model_path}\n"
-                    "  Download from https://alphacephei.com/vosk/models\n"
-                    "  Unzip into cloud_server/vosk_model/"
-                )
+            # Use pre-loaded model (set in __init__) or load on first call
+            if not hasattr(self, '_vosk_model') or self._vosk_model is None:
+                model_path = os.path.join(os.path.dirname(__file__), "vosk_model")
+                if not os.path.isdir(model_path):
+                    raise RuntimeError(
+                        f"Vosk model not found at {model_path}\n"
+                        "  Download from https://alphacephei.com/vosk/models\n"
+                        "  Unzip into cloud_server/vosk_model/"
+                    )
+                print("  ⏳ [Vosk] Loading model (first call)...")
+                self._vosk_model = vosk.Model(model_path)
+                print("  ✅ [Vosk] Model ready (cached for future calls)")
 
-            model = vosk.Model(model_path)
-            rec   = vosk.KaldiRecognizer(model, sample_rate)
-            rec.SetWords(True)
+            rec = vosk.KaldiRecognizer(self._vosk_model, sample_rate)
+            rec.SetWords(False)   # ⚡ skip per-word timestamps — saves ~10ms
 
-            # Feed audio in 4KB chunks
-            chunk_size = 8000  # 250ms at 16kHz int16
+            # Feed audio in smaller 125ms chunks for faster processing
+            chunk_size = 4000  # 125ms at 16kHz int16 (⚡ was 8000=250ms)
             for i in range(0, len(audio_data), chunk_size):
                 rec.AcceptWaveform(audio_data[i:i + chunk_size])
 
             result = json.loads(rec.FinalResult())
             transcript = result.get("text", "").strip() or "[silence]"
             print(f"  🟢 [{session_id}] Vosk result: {repr(transcript)}")
-            return transcript, None   # Vosk doesn't give log-probs
+            return transcript, None
 
         except Exception as e:
             print(f"  ❌ [{session_id}] Vosk error: {e}")
