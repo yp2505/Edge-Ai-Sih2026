@@ -2,8 +2,37 @@ import { useState, useEffect } from 'react'
 import { VaaniLogo, IconSettings } from './Icons.jsx'
 
 function Clock() {
+  const [offset, setOffset] = useState(0)
+  const [synced, setSynced] = useState(false)
   const [t, setT] = useState(new Date())
-  useEffect(() => { const i = setInterval(() => setT(new Date()), 1000); return () => clearInterval(i) }, [])
+
+  // Network synchronization with real-world time
+  useEffect(() => {
+    async function syncTime() {
+      try {
+        const res = await fetch('/api/realtime')
+        if (res.ok) {
+          const data = await res.json()
+          if (data.offsetMs !== undefined) {
+            setOffset(data.offsetMs)
+            setSynced(true)
+            setT(new Date(Date.now() + data.offsetMs))
+          }
+        }
+      } catch (err) {}
+    }
+    syncTime()
+    const syncInterval = setInterval(syncTime, 60000)
+    return () => clearInterval(syncInterval)
+  }, [])
+
+  useEffect(() => {
+    const i = setInterval(() => {
+      setT(new Date(Date.now() + offset))
+    }, 1000)
+    return () => clearInterval(i)
+  }, [offset])
+
   const pad = n => String(n).padStart(2, '0')
   const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT']
   const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
@@ -17,7 +46,7 @@ function Clock() {
   const dateStr = `${day}, ${date} ${month} ${year}`
 
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 14 }} title={synced ? "Network Synchronized Time (IST)" : "Local Time"}>
       {/* Date */}
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center' }}>
         <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 2 }}>DATE</div>
@@ -30,7 +59,10 @@ function Clock() {
 
       {/* Time */}
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center' }}>
-        <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 2 }}>TIME</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
+          {synced && <div style={{ width: 4, height: 4, borderRadius: '50%', background: 'var(--green)', boxShadow: '0 0 6px var(--green)' }} />}
+          <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5 }}>TIME (IST)</div>
+        </div>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
           <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: 'var(--t1)' }}>{timeStr}</span>
           <span style={{ fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 800, color: 'var(--c1)', letterSpacing: 1 }}>
