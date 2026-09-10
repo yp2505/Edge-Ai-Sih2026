@@ -112,6 +112,8 @@ button { font-family: inherit; cursor: pointer; border: none; background: none; 
 .a-bar    { grid-area: bar; }
 .a-left   { grid-area: left; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .a-mid    { grid-area: mid; min-width: 0; }
+.wave-panel-content { min-height: 0; min-width: 0; }
+.wave-status-card { flex: 0 0 auto; min-height: 76px; }
 .a-right  { grid-area: right; min-width: 0; }
 .a-bot    { grid-area: bot; min-width: 0; }
 .ai-panel { min-height: 210px; }
@@ -206,6 +208,11 @@ button { font-family: inherit; cursor: pointer; border: none; background: none; 
   .hardware-panel .hw-g > div:first-child { transform: scale(0.82); transform-origin: center; margin: -5px 0 -7px; }
   .hardware-panel .hw-g > div:last-child { max-width: 64px; font-size: 9px !important; letter-spacing: 0.8px !important; line-height: 1.15; white-space: normal; text-align: center; }
   .hardware-panel .hw-panel-content > div { min-width: 0; }
+  .a-mid { min-height: 460px; }
+  .wave-panel-content { padding: 12px 14px 14px !important; }
+  .wave-panel-content > div:first-child { flex-shrink: 0; margin-bottom: 12px !important; }
+  .waveform-area { flex: 1 1 auto; min-height: 120px !important; margin-bottom: 12px !important; }
+  .wave-status-card { min-height: 78px; padding: 12px !important; }
 }
 
 .ai-panel .orb-panel-content { justify-content: flex-start !important; }
