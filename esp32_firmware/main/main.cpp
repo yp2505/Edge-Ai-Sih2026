@@ -114,11 +114,11 @@ static const uint8_t AES_KEY[16] = {
 // threshold before the trigger fires — halves false-positive rate
 // at cost of ~30 ms extra latency (one extra hop).
 static const float DETECT_THRESHOLD         = 0.85f;   // Lowered from 0.96f for easier triggering
-static const int   DETECTION_HITS_REQUIRED  = 2;        // two consecutive hits = lower false positives
-static const float MIN_SPEECH_RMS           = 0.050f;
+static const int   DETECTION_HITS_REQUIRED  = 1;        // single hit = more responsive
+static const float MIN_SPEECH_RMS           = 0.080f;
 static const float NOISE_FLOOR_MULTIPLIER   = 2.5f;
 static const int   NOISE_CALIBRATION_FRAMES = 50;
-static const float NOISE_CAL_MAX_RMS        = 0.04f;
+static const float NOISE_CAL_MAX_RMS        = 0.15f;
 
 // ─── Streaming / VAD ─────────────────────────────────────────────────────────
 // ⚡ LATENCY-OPTIMISED for <200ms total end-to-end (rev8)
@@ -406,6 +406,8 @@ static void i2s_global_init() {
     };
     // Both slots enabled; INMP441 L/R=GND → LEFT slot has mic data, RIGHT=0
     std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
+    // INMP441 requires 64 SCK cycles per frame. 32-bit slot width achieves this.
+    std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(g_i2s_rx, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(g_i2s_rx));
@@ -753,8 +755,8 @@ static void wifi_start() {
     }
     wifi_config_t wcfg = {};
     // Use credentials loaded from NVS by wifi_provision_init() at boot.
-    strncpy((char*)wcfg.sta.ssid,     g_wifi_ssid, sizeof(wcfg.sta.ssid));
-    strncpy((char*)wcfg.sta.password, g_wifi_pass, sizeof(wcfg.sta.password));
+    strlcpy((char*)wcfg.sta.ssid,     g_wifi_ssid, sizeof(wcfg.sta.ssid));
+    strlcpy((char*)wcfg.sta.password, g_wifi_pass, sizeof(wcfg.sta.password));
     wcfg.sta.threshold.authmode = WIFI_AUTH_OPEN;  // allow open networks too
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wcfg);
@@ -813,7 +815,7 @@ static void audio_task(void* arg) {
         int got = i2s_read_pcm(hop, HOP);
         if (got < HOP) {
             if (got < 0) ESP_LOGW(TAG_INF, "I2S read error (ret=%d)", got);
-            vTaskDelay(pdMS_TO_TICKS(5));
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
         if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -882,7 +884,7 @@ static void inference_task(void* arg) {
             printf("[INFERENCE] resync: jumped to latest\n"); fflush(stdout);
         }
         if (avail < hop_samples || valid_ring_samples < AUDIO_BUFFER_SAMPLES) {
-            xSemaphoreGive(ring_mutex); vTaskDelay(pdMS_TO_TICKS(5)); continue;
+            xSemaphoreGive(ring_mutex); vTaskDelay(pdMS_TO_TICKS(10)); continue;
         }
         {
             int start = (int)ring_write_pos - hop_samples;
@@ -907,6 +909,12 @@ static void inference_task(void* arg) {
         // 4. [ENERGY] log every ~500 ms
         int64_t now_us = esp_timer_get_time();
         {
+            static int64_t last_mic_check_us = 0;
+            if (now_us - last_mic_check_us >= 2000000) {
+                last_mic_check_us = now_us;
+                printf("[MIC-CHECK] rms=%.5f\n", (double)rms);
+                fflush(stdout);
+            }
             float speech_thr = fmaxf(MIN_SPEECH_RMS, noise_floor_rms * NOISE_FLOOR_MULTIPLIER);
             if (now_us - last_energy_log_us >= 500000) {
                 last_energy_log_us = now_us;
@@ -923,7 +931,7 @@ static void inference_task(void* arg) {
                 noise_floor_rms += (rms - noise_floor_rms) / (float)(++noise_cal_frames);
                 telemetry_noise_floor_rms = noise_floor_rms;
             }
-            if (noise_cal_frames < 5) { consecutive_hits = 0; vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+            if (noise_cal_frames < 5) { consecutive_hits = 0; vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         }
 
         // 6. VAD gate
@@ -937,7 +945,7 @@ static void inference_task(void* arg) {
                        (unsigned long)vad_fail_skip, (double)rms, (double)speech_thr);
                 fflush(stdout);
             }
-            vTaskDelay(pdMS_TO_TICKS(1)); continue;
+            vTaskDelay(pdMS_TO_TICKS(10)); continue;
         }
         printf("[VAD] PASS rms=%.5f thr=%.5f noise_floor=%.5f\n",
                (double)rms, (double)speech_thr, (double)noise_floor_rms); fflush(stdout);
@@ -974,7 +982,7 @@ static void inference_task(void* arg) {
         float infer_us = (float)(esp_timer_get_time() - t0);
         if (invoke_ok != kTfLiteOk) {
             printf("[STAGE-C] Invoke FAILED (%.0f us) — skipping frame\n", infer_us); fflush(stdout);
-            vTaskDelay(pdMS_TO_TICKS(5)); continue;
+            vTaskDelay(pdMS_TO_TICKS(10)); continue;
         }
         printf("[STAGE-C] post-invoke (%.0f us)\n", infer_us); fflush(stdout);
 
@@ -989,6 +997,7 @@ static void inference_task(void* arg) {
 
         // Sigmoid model → 1 elem; softmax model → 2 elems (read index 1 = keyword)
         float kw_prob = (out_elems >= 2) ? (out[1]-out_zp)*out_scale : (out[0]-out_zp)*out_scale;
+        printf("[RAW-CONF] %.4f\n", (double)kw_prob);
         bool  trigger = (kw_prob >= DETECT_THRESHOLD);
         printf("[INFER] loop=%lu conf=%.4f threshold=%.2f result=%s infer_us=%.0f\n",
                (unsigned long)dbg_loop, (double)kw_prob, (double)DETECT_THRESHOLD,
@@ -1000,20 +1009,23 @@ static void inference_task(void* arg) {
         telemetry_keyword_confidence = kw_prob;
         consecutive_hits = trigger ? consecutive_hits + 1 : 0;
 
-        if (consecutive_hits >= DETECTION_HITS_REQUIRED && !streaming_active) {
+        if (consecutive_hits >= DETECTION_HITS_REQUIRED) {
             int64_t kw_end = esp_timer_get_time();
-            printf("[TRIGGER->STREAM] EDGE KWS FIRED conf=%.4f (%.1f%%) — streaming to cloud for verification\n",
+            printf("[TRIGGER->STREAM] EDGE KWS FIRED conf=%.4f (%.1f%%)\n",
                    (double)kw_prob, (double)(kw_prob * 100.0f));
             fflush(stdout);
 
-            // ── Immediate LED feedback on KWS trigger ──────────────────────
+            // ── Immediate LED + OLED feedback — always fires regardless of WiFi ──
             gpio_set_level((gpio_num_t)LED_PIN, 1);
             g_disp_state = DISP_DETECTED;
-
-            xQueueSend(detect_queue, &kw_end, 0);
             consecutive_hits = 0;
 
-            vTaskDelay(pdMS_TO_TICKS(500));  // hold LED on for 500ms
+            // Only stream to cloud if WiFi is available
+            if (!streaming_active) {
+                xQueueSend(detect_queue, &kw_end, 0);
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(2000));  // hold LED and "Detected!" for 2 seconds
             gpio_set_level((gpio_num_t)LED_PIN, 0);
             g_disp_state = DISP_LISTENING;
 
@@ -1123,11 +1135,11 @@ static void streaming_task(void* arg) {
         while (xTaskGetTickCount() < deadline) {
             if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
                 printf("[MUTEX-TIMEOUT] streaming_task: ring_mutex >50ms\n"); fflush(stdout);
-                vTaskDelay(pdMS_TO_TICKS(5)); continue;
+                vTaskDelay(pdMS_TO_TICKS(10)); continue;
             }
             int avail = (int)ring_write_pos - last_pos;
             if (avail < 0) avail += AUDIO_BUFFER_SAMPLES;
-            if (avail < CHUNK) { xSemaphoreGive(ring_mutex); vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+            if (avail < CHUNK) { xSemaphoreGive(ring_mutex); vTaskDelay(pdMS_TO_TICKS(10)); continue; }
             for (int i = 0; i < CHUNK; i++) {
                 pcm[i] = audio_ring[last_pos];
                 last_pos = (last_pos + 1) % AUDIO_BUFFER_SAMPLES;
@@ -1481,6 +1493,8 @@ static void telemetry_task(void* arg) {
 
 // ─── app_main ────────────────────────────────────────────────────────────────
 extern "C" void app_main() {
+    printf("[BOOT-CHECK] DETECT_THRESHOLD=%.3f  MIC_MODE=%s  MODEL_SIZE=%u bytes\n", 
+           (double)DETECT_THRESHOLD, "I2S", (unsigned)g_model_len);
     printf("\n\n=== Hey Vaani booting in 5 seconds — open monitor NOW ===\n"); fflush(stdout);
     for (int i = 5; i > 0; i--) { printf("  Starting in %d...\n", i); fflush(stdout); vTaskDelay(pdMS_TO_TICKS(1000)); }
     printf("=== GO ===\n\n"); fflush(stdout);
