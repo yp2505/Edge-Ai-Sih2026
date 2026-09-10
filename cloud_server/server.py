@@ -391,13 +391,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             epoch_ms = int(time.time() * 1000) + offset_ms
             self._send_json({"ok": True, "epochMs": epoch_ms, "timeZone": "Asia/Kolkata", "offsetMs": offset_ms})
         elif path == "/api/wifi-config":
-            # Return stored WiFi config (password masked), auto-filling server IP if unset
+            # Return stored WiFi config.  Password is masked by default (for the
+            # dashboard UI), but ESP32 polls with ?raw=1 to get the real password.
             safe = dict(_WIFI_CONFIG)
             if not safe.get("server_ip"):
                 safe["server_ip"] = self.server.asr_server._get_local_ip()
             if not safe.get("server_port"):
                 safe["server_port"] = 5000
-            if "password" in safe and safe["password"]:
+            # Only mask password when NOT called with ?raw=1 (ESP32 poll)
+            raw_mode = "raw=1" in self.path
+            if not raw_mode and "password" in safe and safe["password"]:
                 safe["password"] = "*" * len(safe["password"])
             self._send_json(safe)
         elif path == "/api/esp-logs":

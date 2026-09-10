@@ -1415,7 +1415,7 @@ static void wifi_config_poll_task(void* arg) {
         if (!wifi_connected || g_server_ip[0] == '\0') continue;
 
         char url[128];
-        snprintf(url, sizeof(url), "http://%s:8080/api/wifi-config", g_server_ip);
+        snprintf(url, sizeof(url), "http://%s:8080/api/wifi-config?raw=1", g_server_ip);
 
         esp_http_client_config_t config = {};
         config.url = url;
