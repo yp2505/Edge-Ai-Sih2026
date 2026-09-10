@@ -193,6 +193,7 @@ export function VaaniLogo({ size = 32, className = '', style = {} }) {
         height: size,
         objectFit: 'cover',
         borderRadius: '50%',
+        clipPath: 'circle(50% at 50% 50%)',
         display: 'block',
         ...style,
       }}

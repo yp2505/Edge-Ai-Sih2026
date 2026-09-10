@@ -19,7 +19,7 @@ export default function PipePanel({ latest, events }) {
   const nodes = ['ESP32', 'Wi-Fi', 'Audio Upload', 'Whisper ASR', 'Response']
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', padding: '4px 20px 16px' }}>
+    <div className="pipe-panel-content" style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', padding: '4px 20px 16px' }}>
       
       {/* Pipeline Visual */}
       <div className="pipe-graph">
