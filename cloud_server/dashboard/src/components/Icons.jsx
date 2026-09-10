@@ -179,19 +179,24 @@ export function IconDonut({ size = 16, color = 'currentColor' }) {
   )
 }
 
-/** Unique Hey Vaani logo SVG — stylised V with sound waves */
-export function VaaniLogo({ size = 32 }) {
+/** Official Hey Vaani aerospace mission logo */
+export function VaaniLogo({ size = 32, className = '', style = {} }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
-      <path d="M5 10 L16 26 L27 10" stroke="url(#vaani-grad)" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-      <path d="M12 12 L16 18 L20 12" stroke="#38bdf8" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-      <defs>
-        <linearGradient id="vaani-grad" x1="0" y1="0" x2="32" y2="32">
-          <stop offset="0%" stopColor="#00d4ff"/>
-          <stop offset="100%" stopColor="#00b4a0"/>
-        </linearGradient>
-      </defs>
-    </svg>
+    <img
+      src="/logo.png"
+      alt="HEY VAANI Logo"
+      width={size}
+      height={size}
+      className={className}
+      style={{
+        width: size,
+        height: size,
+        objectFit: 'cover',
+        borderRadius: '50%',
+        display: 'block',
+        ...style,
+      }}
+    />
   )
 }
 

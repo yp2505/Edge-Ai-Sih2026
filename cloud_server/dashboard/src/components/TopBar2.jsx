@@ -88,8 +88,8 @@ export default function TopBar({ health, up, total, telemetryStale, onSettings }
       {/* Brand */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div style={{ width: 34, height: 34, borderRadius: 10, background: 'rgba(0,229,255,0.08)', border: '1px solid rgba(0,229,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 15px rgba(0,229,255,0.1)' }}>
-            <VaaniLogo size={20} />
+          <div style={{ width: 36, height: 36, borderRadius: 10, background: 'rgba(0,0,0,0.6)', border: '1px solid rgba(0,229,255,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 16px rgba(0,229,255,0.18)', overflow: 'hidden' }}>
+            <VaaniLogo size={36} style={{ borderRadius: 8 }} />
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
             <div style={{ fontFamily: 'var(--title)', fontSize: 15, fontWeight: 900, color: 'var(--t1)', letterSpacing: 2, lineHeight: 1.1 }}>HEY VAANI</div>
