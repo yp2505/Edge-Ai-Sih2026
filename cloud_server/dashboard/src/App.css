@@ -450,7 +450,7 @@ button { font-family: inherit; cursor: pointer; border: none; background: none; 
 }
 .transcript-icon.on { background: rgba(0,229,255,0.15); border-color: rgba(0,229,255,0.3); }
 .tr-sub { font-size: 9px; font-weight: 800; letter-spacing: 1.3px; text-transform: uppercase; color: var(--t2); margin-bottom: 3px; }
-.tr-text { font-size: 14px; font-weight: 600; color: var(--t2); font-style: italic; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.4; transition: all 0.3s; }
+.tr-text { font-size: 14px; font-weight: 600; color: var(--t2); font-style: italic; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.4; transition: all 0.3s; }
 .tr-text.on { color: var(--t1); font-style: normal; font-weight: 800; font-size: 15px; }
 
 /* ── HARDWARE ────────────────────────────────────────────── */
@@ -486,7 +486,7 @@ button { font-family: inherit; cursor: pointer; border: none; background: none; 
 .feed-id.new { background: rgba(0,229,255,0.15); border-color: rgba(0,229,255,0.25); color: var(--c1); }
 .feed-lat { font-family: var(--mono); font-size: 10px; font-weight: 800; }
 .feed-time { font-size: 10px; font-weight: 700; color: var(--t2); }
-.feed-tx { font-size: 12px; font-weight: 600; color: var(--t1); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.4; margin-top: 2px; }
+.feed-tx { font-size: 12px; font-weight: 600; color: var(--t1); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.4; margin-top: 2px; }
 .feed-tx.new { color: var(--t1); font-weight: 800; }
 .feed-tx.muted { color: var(--t3); font-style: italic; font-size: 11px; font-weight: 500; }
 .feed-bar { display: flex; height: 3px; border-radius: 3px; overflow: hidden; gap: 1px; margin-top: 7px; }
