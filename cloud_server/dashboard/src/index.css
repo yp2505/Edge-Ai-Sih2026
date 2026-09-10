@@ -1,39 +1,12 @@
-/* ── Reset & Base ─────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@300;400;500;600;700&family=Orbitron:wght@400;500;600;700;800;900&display=swap');
+
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html { color-scheme: dark; }
-
 body {
   font-family: 'Inter', -apple-system, sans-serif;
-  background: #0d1117;
-  color: #e8edf5;
-  height: 100vh;
-  overflow: hidden;
+  background: #000008;
+  color: #fff;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
-
-#root { display: flex; height: 100vh; min-height: 100vh; }
-
-/* ── Scrollbar ────────────────────────────────────────── */
-::-webkit-scrollbar { width: 4px; height: 4px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(124,106,247,0.25); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(124,106,247,0.5); }
-
-/* ── Shared Keyframes ─────────────────────────────────── */
-@keyframes pulse-dot {
-  0%,100% { opacity: 1; transform: scale(1); }
-  50%      { opacity: 0.3; transform: scale(0.7); }
-}
-@keyframes slide-up {
-  from { opacity: 0; transform: translateY(8px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-@keyframes blink-dot {
-  0%,100% { opacity: 1; }
-  50%      { opacity: 0.2; }
-}
-@keyframes siri-ring { to { transform: rotate(360deg); } }
-@keyframes wave-bar  {
-  0%,100% { transform: scaleY(0.25); }
-  50%      { transform: scaleY(1); }
-}
+button { font-family: inherit; }

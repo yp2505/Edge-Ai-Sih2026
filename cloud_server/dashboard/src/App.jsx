@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback } from 'react'
-import HeroOrb from './components/HeroOrb.jsx'
+import TopBar from './components/TopBar2.jsx'
+import OrbPanel from './components/OrbPanel.jsx'
 import WavePanel from './components/WavePanel.jsx'
-import DetectionFeedNew from './components/DetectionFeedNew.jsx'
-import HardwareTelemetryNew from './components/HardwareTelemetryNew.jsx'
-import PipelinePanel from './components/PipelinePanel.jsx'
-import TopBar from './components/TopBarNew.jsx'
+import HwPanel from './components/HwPanel.jsx'
+import FeedPanel from './components/FeedPanel.jsx'
+import PipePanel from './components/PipePanel.jsx'
 import SettingsModal from './components/SettingsModal.jsx'
-import { IconSearch, IconWaveform, IconReport, IconCpu, IconTrendChart } from './components/Icons.jsx'
+import LiveBackground from './components/LiveBackground.jsx'
+import { IconWaveform, IconReport, IconCpu, IconTrendChart } from './components/Icons.jsx'
 import './App.css'
 
 const API = 'http://localhost:8080'
@@ -16,7 +17,14 @@ export default function App() {
   const [health, setHealth] = useState(null)
   const [telemetry, setTelemetry] = useState(null)
   const [serverUp, setServerUp] = useState(false)
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
+  const [settings, setSettings] = useState(false)
+
+  const get = useCallback(async (path, setter, transform) => {
+    try {
+      const r = await fetch(`${API}${path}`, { signal: AbortSignal.timeout(2000) })
+      if (r.ok) { const d = await r.json(); setter(transform ? transform(d) : d) }
+    } catch {}
+  }, [])
 
   const fetchHealth = useCallback(async () => {
     try {
@@ -26,122 +34,97 @@ export default function App() {
     } catch { setServerUp(false) }
   }, [])
 
-  const fetchTelemetry = useCallback(async () => {
-    try {
-      const r = await fetch(`${API}/api/telemetry`, { signal: AbortSignal.timeout(2000) })
-      if (r.ok) {
-        const data = await r.json()
-        setTelemetry(Object.keys(data).length ? data : null)
-      }
-    } catch {}
-  }, [])
-
-  const fetchEvents = useCallback(async () => {
-    try {
-      const r = await fetch(`${API}/api/events`, { signal: AbortSignal.timeout(2000) })
-      if (r.ok) setEvents(await r.json())
-    } catch {}
-  }, [])
-
   useEffect(() => {
-    fetchHealth(); fetchEvents(); fetchTelemetry()
+    fetchHealth()
+    get('/api/events', setEvents)
+    get('/api/telemetry', setTelemetry, d => Object.keys(d).length ? d : null)
     const h = setInterval(fetchHealth, 2000)
-    const e = setInterval(fetchEvents, 800)
-    const t = setInterval(fetchTelemetry, 1000)
+    const e = setInterval(() => get('/api/events', setEvents), 800)
+    const t = setInterval(() => get('/api/telemetry', setTelemetry, d => Object.keys(d).length ? d : null), 1000)
     return () => { clearInterval(h); clearInterval(e); clearInterval(t) }
-  }, [fetchHealth, fetchEvents, fetchTelemetry])
+  }, [fetchHealth, get])
 
-  const latestEvent = events.length > 0 ? events[events.length - 1] : null
+  const latest = events.length ? events[events.length - 1] : null
+  const telemetryStale = !serverUp || !telemetry || !telemetry.received_at || (Date.now() - new Date(telemetry.received_at).getTime() > 5000)
 
   return (
     <>
-      {/* Soft ambient background */}
-      <div className="bg-blobs" aria-hidden="true">
-        <div className="blob blob-1" />
-        <div className="blob blob-2" />
-        <div className="blob blob-3" />
-      </div>
+      <LiveBackground />
 
-      {isSettingsOpen && <SettingsModal onClose={() => setIsSettingsOpen(false)} />}
+      {settings && <SettingsModal telemetry={telemetry} serverUp={serverUp} health={health} onClose={() => setSettings(false)} />}
 
-      <div className="app-layout">
-        {/* Top Bar */}
-        <div className="area-topbar panel" style={{ borderRadius: 16 }}>
-          <TopBar health={health} serverUp={serverUp} totalEvents={events.length} onSettingsClick={() => setIsSettingsOpen(true)} />
-        </div>
+      <div className="dash">
 
-        {/* Hero — Slime Character */}
-        <div className="area-hero panel">
-          <div className="panel-header">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <IconSearch size={12} color="var(--t3)" />
-              <span>AI Companion</span>
+        {/* ── Top Bar ── */}
+        <div className="a-bar glass"><TopBar health={health} up={serverUp} total={events.length} telemetryStale={telemetryStale} onSettings={() => setSettings(true)} /></div>
+
+        {/* ── Left Column ── */}
+        <div className="a-left">
+          {/* AI Companion */}
+          <div className="glass" style={{ flex: 1, minHeight: 0 }}>
+            <div className="ph">
+              <div className="ph-l">
+                <div className="ph-dot" style={{ background: serverUp ? 'var(--green)' : 'var(--t4)', boxShadow: serverUp ? '0 0 10px var(--green)' : 'none' }} />
+                <span className="ph-tag">AI Companion</span>
+              </div>
+              {serverUp && <div className="live-badge"><div className="live-badge-dot" /><span>LIVE</span></div>}
             </div>
-            <div className="panel-header-dot" style={{ background: serverUp ? 'var(--green)' : 'var(--t3)', boxShadow: serverUp ? '0 0 8px var(--green)' : 'none' }} />
+            <OrbPanel latest={latest} up={serverUp} pings={events.length} />
           </div>
-          <div className="panel-content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <HeroOrb latest={latestEvent} serverUp={serverUp} pingCount={events.length} />
-          </div>
-        </div>
 
-        {/* Voice Waveform + Transcript */}
-        <div className="area-wave panel">
-          <div className="panel-header">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <IconWaveform size={12} color="var(--t3)" />
-              <span>Voice Activity</span>
+          {/* Hardware */}
+          <div className="glass" style={{ flexShrink: 0 }}>
+            <div className="ph">
+              <div className="ph-l">
+                <IconCpu size={11} color="var(--t3)" />
+                <span className="ph-tag">Hardware Telemetry</span>
+              </div>
+              <div className="live-badge" style={{ background: 'transparent', border: 'none', padding: 0 }}>
+                <span style={{ fontSize: 8, color: 'var(--t4)', fontFamily: 'var(--mono)', letterSpacing: 1.5 }}>LIVE</span>
+              </div>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--sky)', animation: 'blink-dot 2s infinite' }} />
-              <span style={{ fontSize: 9, color: 'var(--sky)' }}>LIVE</span>
-            </div>
-          </div>
-          <div className="panel-content no-pad" style={{ display: 'flex', flexDirection: 'column' }}>
-            <WavePanel latestEvent={latestEvent} serverUp={serverUp} />
+            <div className="hw-body"><HwPanel telemetry={telemetry} stale={telemetryStale} serverUp={serverUp} /></div>
           </div>
         </div>
 
-        {/* Detection Feed */}
-        <div className="area-feed panel">
-          <div className="panel-header">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <IconReport size={12} color="var(--t3)" />
-              <span>Detection Feed</span>
+        {/* ── Center: Voice ── */}
+        <div className="a-mid glass">
+          <div className="ph">
+            <div className="ph-l">
+              <IconWaveform size={11} color="var(--t3)" />
+              <span className="ph-tag">Voice Activity</span>
             </div>
-            <span className="badge badge-primary">{events.length}</span>
+            <div className="live-badge"><div className="live-badge-dot" /><span>LIVE</span></div>
           </div>
-          <div className="panel-content no-pad scroll">
-            <DetectionFeedNew events={events} />
+          <WavePanel latestEvent={latest} serverUp={serverUp} telemetry={telemetry} stale={telemetryStale} />
+        </div>
+
+        {/* ── Right: Feed ── */}
+        <div className="a-right glass">
+          <div className="ph">
+            <div className="ph-l">
+              <IconReport size={11} color="var(--t3)" />
+              <span className="ph-tag">Detection Feed</span>
+            </div>
+            <span className="count-badge">{events.length}</span>
+          </div>
+          <div className="feed-body" style={{ overflowY: 'auto' }}>
+            <FeedPanel events={events} />
           </div>
         </div>
 
-        {/* Hardware Telemetry */}
-        <div className="area-hw panel">
-          <div className="panel-header">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <IconCpu size={12} color="var(--t3)" />
-              <span>Hardware</span>
+        {/* ── Bottom: Pipeline ── */}
+        <div className="a-bot glass">
+          <div className="ph">
+            <div className="ph-l">
+              <IconTrendChart size={11} color="var(--t3)" />
+              <span className="ph-tag">Inference Pipeline</span>
             </div>
-            <span style={{ fontSize: 9, color: 'var(--t3)' }}>LIVE</span>
+            <span style={{ fontSize: 7, fontWeight: 700, color: 'var(--t4)', fontFamily: 'var(--mono)', letterSpacing: 1.5 }}>E2E TIMING</span>
           </div>
-          <div className="panel-content" style={{ padding: '12px 16px' }}>
-            <HardwareTelemetryNew telemetry={telemetry} />
-          </div>
+          <div className="pl-body"><PipePanel latest={latest} events={events} /></div>
         </div>
 
-        {/* Pipeline + Latency */}
-        <div className="area-pipeline panel">
-          <div className="panel-header">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <IconTrendChart size={12} color="var(--t3)" />
-              <span>Inference Pipeline</span>
-            </div>
-            <span className="mono" style={{ fontSize: 9, color: 'var(--t3)' }}>E2E TIMING</span>
-          </div>
-          <div className="panel-content" style={{ padding: '12px 16px' }}>
-            <PipelinePanel latestEvent={latestEvent} events={events} />
-          </div>
-        </div>
       </div>
     </>
   )

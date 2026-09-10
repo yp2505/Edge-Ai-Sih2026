@@ -1,30 +1,35 @@
 import { IconCpu, IconFlash, IconWifi, IconWarning } from './Icons.jsx'
 
-function Gauge({ label, value, color, icon }) {
+function RadialGauge({ label, value, color, icon }) {
   const known = Number.isFinite(value)
   const pct = known ? Math.max(0, Math.min(100, value)) : 0
+  const r = 28
+  const circ = 2 * Math.PI * r
+  const dash = circ * (pct / 100)
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
-      <div style={{ position: 'relative', width: 74, height: 74 }}>
-        <svg width="74" height="74" viewBox="0 0 74 74" style={{ transform: 'rotate(-90deg)' }}>
-          <circle cx="37" cy="37" r="30" fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="6.5" />
-          <circle cx="37" cy="37" r="30" fill="none" stroke={color} strokeWidth="6.5" strokeLinecap="round"
-            strokeDasharray="188.5" strokeDashoffset={188.5 * (1 - pct / 100)} />
+    <div className="hw-gauge">
+      <div style={{ position: 'relative', width: 68, height: 68 }}>
+        <svg width="68" height="68" viewBox="0 0 68 68" style={{ transform: 'rotate(-90deg)' }}>
+          <circle cx="34" cy="34" r={r} fill="none" stroke="rgba(255,255,255,0.04)" strokeWidth="6" />
+          <circle
+            cx="34" cy="34" r={r}
+            fill="none" stroke={color} strokeWidth="6" strokeLinecap="round"
+            strokeDasharray={`${dash} ${circ - dash}`}
+            style={{ transition: 'stroke-dasharray 0.6s ease', filter: known ? `drop-shadow(0 0 4px ${color})` : 'none' }}
+          />
         </svg>
-        <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
-          <span style={{ fontSize: known ? 16 : 12, fontWeight: 700, fontFamily: 'var(--font-mono)' }}>{known ? `${value.toFixed(1)}%` : '—'}</span>
+        <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column' }}>
+          <span style={{ fontSize: known ? 13 : 10, fontWeight: 800, fontFamily: 'var(--font-mono)', color: known ? color : 'var(--t4)' }}>
+            {known ? `${value.toFixed(0)}%` : '—'}
+          </span>
         </div>
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>{icon}<span style={{ fontSize: 9, color: 'var(--t3)', fontWeight: 700 }}>{label}</span></div>
+      <div className="hw-gauge-label">
+        {icon}<span>{label}</span>
+      </div>
     </div>
   )
-}
-
-function Row({ label, value, note, color = 'var(--t2)', icon }) {
-  return <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
-    <span style={{ display: 'flex', gap: 5, alignItems: 'center', fontSize: 10, color: 'var(--t3)', fontWeight: 700 }}>{icon}{label}</span>
-    <span title={note} style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700, color }}>{value}</span>
-  </div>
 }
 
 export default function HardwareTelemetryNew({ telemetry }) {
@@ -33,63 +38,63 @@ export default function HardwareTelemetryNew({ telemetry }) {
   const heapPct = connected && telemetry.heap_total_bytes ? heapUsed * 100 / telemetry.heap_total_bytes : NaN
   const duty = connected ? telemetry.inference_duty_pct : NaN
   const confidence = connected ? telemetry.keyword_confidence * 100 : NaN
-  const heapText = connected ? `${(heapUsed / 1024).toFixed(1)} KB heap used` : 'Waiting for ESP32 telemetry'
 
-  // Live mic RMS from ESP32 telemetry (0.0 – 1.0 normalised)
   const micRms = connected && telemetry.mic_rms != null ? telemetry.mic_rms : null
-  const rmsColor = micRms == null
-    ? 'var(--t3)'
-    : micRms >= 0.05 ? 'var(--green)'   // speech-level signal
-    : micRms >= 0.01 ? 'var(--amber)'   // weak / background noise
-    : 'var(--red)'                       // near-silent / likely not picking up
-  const rmsLabel = micRms == null
-    ? '—'
-    : `${micRms.toFixed(5)}${micRms >= 0.05 ? ' 🎙' : micRms >= 0.01 ? ' 〰' : ' 🔇'}`
-
-  // Visual bar: scale 0..0.15 → 0..100% (typical speech is 0.05-0.12)
+  const rmsColor = micRms == null ? 'var(--t4)'
+    : micRms >= 0.05 ? 'var(--green)'
+    : micRms >= 0.01 ? 'var(--amber)'
+    : 'var(--red)'
+  const rmsLabel = micRms == null ? '—'
+    : micRms >= 0.05 ? `${micRms.toFixed(4)} 🎙`
+    : micRms >= 0.01 ? `${micRms.toFixed(4)} ~`
+    : `${micRms.toFixed(4)} 🔇`
   const rmsBarPct = micRms != null ? Math.min(100, (micRms / 0.15) * 100) : 0
 
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 11, height: '100%', justifyContent: 'center' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-around' }}>
-        <Gauge label="INFERENCE DUTY" value={duty} color="var(--primary)" icon={<IconCpu size={10} color="var(--t3)" />} />
-        <Gauge label="HEAP USED" value={heapPct} color="var(--sky)" icon={<IconCpu size={10} color="var(--t3)" />} />
-        <Gauge label="WAKE CONF." value={confidence} color="var(--pink)" icon={<IconFlash size={10} color="var(--t3)" />} />
-      </div>
-      <div style={{ height: 1, background: 'var(--border)' }} />
+  const heapText = connected ? `${(heapUsed / 1024).toFixed(1)} KB` : 'Waiting...'
 
-      {/* ── Live Mic RMS ─────────────────────────────────────────────────── */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span style={{ fontSize: 10, color: 'var(--t3)', fontWeight: 700 }}>🎤 MIC RMS</span>
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700, color: rmsColor }}>
-            {rmsLabel}
-          </span>
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, height: '100%' }}>
+      {/* Gauges */}
+      <div className="hw-gauges">
+        <RadialGauge label="DUTY" value={duty} color="var(--cyan)" icon={<IconCpu size={9} color="var(--t3)" />} />
+        <RadialGauge label="HEAP" value={heapPct} color="var(--ice)" icon={<IconCpu size={9} color="var(--t3)" />} />
+        <RadialGauge label="CONF." value={confidence} color="var(--teal)" icon={<IconFlash size={9} color="var(--t3)" />} />
+      </div>
+
+      {/* MIC RMS */}
+      <div className="hw-rms">
+        <div className="hw-row">
+          <span className="hw-row-label">🎤 Mic RMS</span>
+          <span className="hw-row-val" style={{ color: rmsColor }}>{rmsLabel}</span>
         </div>
-        {/* Progress bar */}
-        <div style={{ height: 5, borderRadius: 4, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
-          <div style={{
-            height: '100%',
+        <div className="hw-rms-bar">
+          <div className="hw-rms-fill" style={{
             width: `${rmsBarPct}%`,
             background: rmsColor,
-            borderRadius: 4,
-            transition: 'width 0.25s ease, background 0.3s',
             boxShadow: micRms >= 0.05 ? `0 0 8px ${rmsColor}` : 'none',
           }} />
         </div>
-        <div style={{ fontSize: 9, color: 'var(--t3)', display: 'flex', justifyContent: 'space-between' }}>
+        <div className="hw-rms-scale">
           <span>0.00</span>
-          <span style={{ color: micRms >= 0.05 ? 'var(--green)' : 'var(--t3)' }}>speech ≥ 0.05</span>
+          <span style={{ color: micRms >= 0.05 ? 'var(--green)' : 'var(--t4)' }}>speech ≥0.05</span>
           <span>0.15</span>
         </div>
       </div>
 
-      <div style={{ height: 1, background: 'var(--border)' }} />
-      <Row label="RAM" value={heapText} color={connected ? 'var(--sky)' : 'var(--t3)'} icon={<IconCpu size={10} color="var(--t3)" />} />
-      <Row label="TFLITE ARENA" value={connected ? `${(telemetry.tflite_arena_bytes / 1024).toFixed(1)} KB` : '—'} icon={<IconCpu size={10} color="var(--t3)" />} />
-      <Row label="AUDIO BUFFERS" value={connected ? `${(telemetry.audio_buffer_bytes / 1024).toFixed(1)} KB` : '—'} icon={<IconCpu size={10} color="var(--t3)" />} />
-      <Row label="WI-FI RSSI" value={connected ? `${telemetry.wifi_rssi_dbm} dBm` : '—'} color="var(--green)" icon={<IconWifi size={10} color="var(--t3)" />} />
-      <Row label="POWER / TEMP" value="Sensor required" note="Add INA219 for actual power and a temperature sensor for temperature." color="var(--amber)" icon={<IconWarning size={10} color="var(--t3)" />} />
+      {/* Row data */}
+      <div className="hw-rows">
+        {[
+          { label: 'RAM', value: heapText, color: connected ? 'var(--ice)' : 'var(--t4)', icon: <IconCpu size={9} color="var(--t3)" /> },
+          { label: 'TFLITE', value: connected ? `${(telemetry.tflite_arena_bytes / 1024).toFixed(1)} KB` : '—', color: 'var(--t2)', icon: <IconCpu size={9} color="var(--t3)" /> },
+          { label: 'BUFFERS', value: connected ? `${(telemetry.audio_buffer_bytes / 1024).toFixed(1)} KB` : '—', color: 'var(--t2)', icon: <IconCpu size={9} color="var(--t3)" /> },
+          { label: 'Wi-Fi RSSI', value: connected ? `${telemetry.wifi_rssi_dbm} dBm` : '—', color: 'var(--green)', icon: <IconWifi size={9} color="var(--t3)" /> },
+        ].map(row => (
+          <div key={row.label} className="hw-row">
+            <span className="hw-row-label">{row.icon}{row.label}</span>
+            <span className="hw-row-val" style={{ color: row.color }}>{row.value}</span>
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
