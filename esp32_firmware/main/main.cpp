@@ -113,25 +113,27 @@ static const uint8_t AES_KEY[16] = {
 // DETECTION_HITS_REQUIRED=2: both consecutive inferences must exceed
 // threshold before the trigger fires — halves false-positive rate
 // at cost of ~30 ms extra latency (one extra hop).
-static const float DETECT_THRESHOLD         = 0.85f;   // Lowered from 0.96f for easier triggering
-static const int   DETECTION_HITS_REQUIRED  = 1;        // single hit = more responsive
+static const float DETECT_THRESHOLD         = 0.96f;   // Must match model_data.h threshold
+static const int   DETECTION_HITS_REQUIRED  = 2;        // two consecutive hits for reliability
 static const float MIN_SPEECH_RMS           = 0.080f;
 static const float NOISE_FLOOR_MULTIPLIER   = 2.5f;
 static const int   NOISE_CALIBRATION_FRAMES = 50;
 static const float NOISE_CAL_MAX_RMS        = 0.15f;
 
 // ─── Streaming / VAD ─────────────────────────────────────────────────────────
-// ⚡ LATENCY-OPTIMISED for <200ms total end-to-end (rev8)
+// ⚡ LATENCY-OPTIMISED for <200ms total end-to-end (rev9)
 //   SLIDE_STEP_MS=30:          inference every 30ms window hop
-//   COMMAND_DURATION_MS=1500:  max 1.5s command capture (was 4000ms)
+//   COMMAND_DURATION_MS=5000:  max 5s command capture (was 1500ms)
 //   COMMAND_MIN_DURATION_MS=300: minimum 300ms before EOS eligible
-//   COMMAND_SILENCE_MS=150:    close stream after 150ms quiet (was 450ms)
+//   COMMAND_SILENCE_MS=300:    close stream after 300ms quiet (was 100ms)
+//   COOLDOWN_MS=3000:          3s post-cycle cooldown to prevent re-trigger loops
 //   Measured pipeline budget: KWS=18ms + AES=0.2ms + Vosk=55ms + RTT≤20ms = ~93ms
 //   Remaining budget for EOS silence window: 200ms - 93ms = ~107ms → set 100ms
 #define SLIDE_STEP_MS           30
-#define COMMAND_DURATION_MS     1500
+#define COMMAND_DURATION_MS     5000
 #define COMMAND_MIN_DURATION_MS 300
-#define COMMAND_SILENCE_MS      100
+#define COMMAND_SILENCE_MS      300
+#define COOLDOWN_MS             3000       // 3s cooldown after each detection cycle
 #define AUDIO_BUFFER_SAMPLES    16000
 #define STREAM_WATCHDOG_MS      5000
 
@@ -223,9 +225,20 @@ typedef enum {
     DISP_DETECTED,
     DISP_STREAMING,
     DISP_TRANSCRIBED,
+    DISP_PROMPT,          // "How can I help you?" — command-capture mode
 } disp_state_t;
 
 static volatile disp_state_t g_disp_state = DISP_BOOTING;
+
+// ─── System state machine ────────────────────────────────────────────────────
+// Gates inference_task: only runs in SYS_LISTENING.
+typedef enum {
+    SYS_LISTENING = 0,     // normal KWS mode — inference_task runs
+    SYS_CAPTURE_COMMAND,   // keyword detected — streaming_task active, inference gated
+} SystemState;
+
+static volatile SystemState g_sys_state = SYS_LISTENING;
+static int64_t g_cooldown_end_us = 0;  // timestamp when cooldown expires (0 = no cooldown)
 // Transcription result — written by streaming_task BEFORE setting DISP_TRANSCRIBED.
 // MUST be accessed under disp_mutex to prevent torn reads in display_task.
 static char              g_disp_text[256] = "";
@@ -541,6 +554,7 @@ static void oled_show_status(disp_state_t state, const char* text) {
         case DISP_DETECTED:     label = "Detected!"; break;
         case DISP_STREAMING:    label = "Streaming"; break;
         case DISP_TRANSCRIBED:  label = "Received";  break;
+        case DISP_PROMPT:       label = "I'm listening"; break;
         default:                label = "Unknown";   break;
     }
     int lbl_w = (int)strlen(label) * 12;   // scale=2 → 12px/char
@@ -857,16 +871,26 @@ static void inference_task(void* arg) {
     while (true) {
         dbg_loop++;
 
-        // 1. Idle while streaming
-        if (streaming_active) {
+        // 1. Idle while streaming or in command-capture mode
+        if (streaming_active || g_sys_state != SYS_LISTENING) {
             static int64_t last_sa_skip_log = 0;
             int64_t now = esp_timer_get_time();
             if (now - last_sa_skip_log >= 1000000) {
                 last_sa_skip_log = now;
                 int64_t held = streaming_active_set_us ? (now - streaming_active_set_us) : 0;
-                printf("[DBG-SA] inference SKIPPED — streaming for %.1fs\n", (double)held/1e6); fflush(stdout);
+                printf("[DBG-SA] inference SKIPPED — streaming=%d sys_state=%d for %.1fs\n",
+                       (int)streaming_active, (int)g_sys_state, (double)held/1e6); fflush(stdout);
             }
             vTaskDelay(pdMS_TO_TICKS(20)); continue;
+        }
+
+        // 1b. Idle during post-detection cooldown to prevent re-trigger loops
+        {
+            int64_t now = esp_timer_get_time();
+            if (now < g_cooldown_end_us) {
+                vTaskDelay(pdMS_TO_TICKS(50)); continue;
+            }
+            g_cooldown_end_us = 0;  // expired — clear flag
         }
 
         // 2. Read hop from ring (bounded mutex)
@@ -995,8 +1019,13 @@ static void inference_task(void* arg) {
         for (int oi = 0; oi < out_elems && oi < 8; oi++) printf(" [%d]=%d", oi, out[oi]);
         printf(" scale=%.6f zp=%d\n", (double)out_scale, (int)out_zp); fflush(stdout);
 
-        // Sigmoid model → 1 elem; softmax model → 2 elems (read index 1 = keyword)
-        float kw_prob = (out_elems >= 2) ? (out[1]-out_zp)*out_scale : (out[0]-out_zp)*out_scale;
+        // Sigmoid model: output tensor has exactly 1 element — out[0] = keyword probability.
+        if (out_elems < 1) {
+            printf("[INFER-ERROR] Expected >=1 output elem, got %d — skipping\n", out_elems);
+            fflush(stdout);
+            vTaskDelay(pdMS_TO_TICKS(10)); continue;
+        }
+        float kw_prob = (out[0] - out_zp) * out_scale;
         printf("[RAW-CONF] %.4f\n", (double)kw_prob);
         bool  trigger = (kw_prob >= DETECT_THRESHOLD);
         printf("[INFER] loop=%lu conf=%.4f threshold=%.2f result=%s infer_us=%.0f\n",
@@ -1015,9 +1044,16 @@ static void inference_task(void* arg) {
                    (double)kw_prob, (double)(kw_prob * 100.0f));
             fflush(stdout);
 
-            // ── Immediate LED + OLED feedback — always fires regardless of WiFi ──
+            // ── Transition to command-capture mode ──────────────────────────
+            g_sys_state = SYS_CAPTURE_COMMAND;
             gpio_set_level((gpio_num_t)LED_PIN, 1);
-            g_disp_state = DISP_DETECTED;
+
+            // Write prompt text under mutex — display_task reads it concurrently
+            if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                snprintf(g_disp_text, sizeof(g_disp_text), "How can I\nhelp you?");
+                xSemaphoreGive(disp_mutex);
+            }
+            g_disp_state = DISP_PROMPT;   // OLED shows "How can I help you?"
             consecutive_hits = 0;
 
             // Only stream to cloud if WiFi is available
@@ -1025,11 +1061,10 @@ static void inference_task(void* arg) {
                 xQueueSend(detect_queue, &kw_end, 0);
             }
 
-            vTaskDelay(pdMS_TO_TICKS(2000));  // hold LED and "Detected!" for 2 seconds
-            gpio_set_level((gpio_num_t)LED_PIN, 0);
-            g_disp_state = DISP_LISTENING;
-
-            vTaskDelay(pdMS_TO_TICKS(700));  // 1 s total cooldown — suppress echo re-trigger
+            // No blocking delay here — streaming_task handles the full
+            // command-capture lifecycle and returns to SYS_LISTENING when done.
+            // yield briefly so streaming_task can pick up the queue item.
+            vTaskDelay(pdMS_TO_TICKS(10));
         } else if (consecutive_hits > 0) {
             printf("[INFER] building... hit %d/%d conf=%.4f\n",
                    consecutive_hits, DETECTION_HITS_REQUIRED, (double)kw_prob); fflush(stdout);
@@ -1084,8 +1119,10 @@ static void streaming_task(void* arg) {
         }
         if (sock < 0) {
             ESP_LOGE(TAG_STR, "[%lu] All TCP attempts failed", (unsigned long)sid);
-            g_disp_state = DISP_LISTENING;  // [NEW] reset OLED
-            gpio_set_level(LED_PIN, 0);     // [NEW] reset LED
+            g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
+            g_sys_state    = SYS_LISTENING;
+            g_disp_state = DISP_LISTENING;
+            gpio_set_level(LED_PIN, 0);
             wifi_stop(); continue;
         }
 
@@ -1124,8 +1161,16 @@ static void streaming_task(void* arg) {
         esp_aes_init(&aes_ctx);
         esp_aes_setkey(&aes_ctx, AES_KEY, 128);
 
+        // ── Prompt delay: hold "How can I help you?" on OLED while user speaks ──
+        // During this 1.5s window, inference_task continues running and filling the
+        // ring buffer with command audio.  streaming_active is still false so
+        // inference_task is NOT gated.  After the delay, we start streaming.
+        printf("[STREAM] sid=%lu prompt delay 1.5s — user speaking...\n",
+               (unsigned long)sid); fflush(stdout);
+        vTaskDelay(pdMS_TO_TICKS(1500));
+
         set_streaming_active(true, "keyword_detected");
-        g_disp_state = DISP_STREAMING;   // [NEW] display_task picks up within 100 ms
+        g_disp_state = DISP_STREAMING;   // display_task picks up within 100 ms
 
         const int  CHUNK = 480; int16_t pcm[CHUNK];
         TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
@@ -1305,9 +1350,15 @@ static void streaming_task(void* arg) {
             }
         }
 
-        // Return to listening state and flush stale triggers accumulated during display hold
-        g_disp_state  = DISP_LISTENING;
+        // ── Return to listening state with cooldown ────────────────────────
+        // Start cooldown: inference stays gated for COOLDOWN_MS to prevent
+        // re-trigger loops.  The OLED shows "Listening" immediately so the
+        // user knows the system is ready again after the cooldown expires.
+        g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
+        g_sys_state    = SYS_LISTENING;
+        g_disp_state   = DISP_LISTENING;
         g_disp_text[0] = '\0';
+        printf("[COOLDOWN] %dms cooldown started\n", COOLDOWN_MS); fflush(stdout);
         if (detect_queue) {
             xQueueReset(detect_queue);
         }
@@ -1367,8 +1418,10 @@ static void watchdog_task(void* arg) {
                 printf("[WATCHDOG] streaming_active stuck for %.1fs — FORCE CLEARING\n",
                        (double)held / 1e6); fflush(stdout);
                 set_streaming_active(false, "watchdog_forced");
-                gpio_set_level(LED_PIN, 0);    // [NEW] ensure LED off on forced clear
-                g_disp_state = DISP_LISTENING; // [NEW] reset display state
+                g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
+                g_sys_state  = SYS_LISTENING;
+                gpio_set_level(LED_PIN, 0);
+                g_disp_state = DISP_LISTENING;
             }
         }
     }
@@ -1397,8 +1450,8 @@ static void display_task(void* arg) {
         disp_state_t cur = g_disp_state;
         if (cur != last_state) {
             local_txt[0] = '\0';
-            if (cur == DISP_TRANSCRIBED) {
-                // Take disp_mutex to safely read g_disp_text written by streaming_task
+            if (cur == DISP_TRANSCRIBED || cur == DISP_PROMPT) {
+                // Take disp_mutex to safely read g_disp_text written by other tasks
                 if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     strlcpy(local_txt, g_disp_text, sizeof(local_txt));
                     xSemaphoreGive(disp_mutex);
@@ -1413,7 +1466,8 @@ static void display_task(void* arg) {
                      cur==DISP_BOOTING    ? "Booting"   :
                      cur==DISP_LISTENING  ? "Listening" :
                      cur==DISP_DETECTED   ? "Detected"  :
-                     cur==DISP_STREAMING  ? "Streaming" : "Transcribed");
+                     cur==DISP_STREAMING  ? "Streaming" :
+                     cur==DISP_PROMPT     ? "Prompt"    : "Transcribed");
         }
     }
 }
@@ -1493,8 +1547,8 @@ static void telemetry_task(void* arg) {
 
 // ─── app_main ────────────────────────────────────────────────────────────────
 extern "C" void app_main() {
-    printf("[BOOT-CHECK] DETECT_THRESHOLD=%.3f  MIC_MODE=%s  MODEL_SIZE=%u bytes\n", 
-           (double)DETECT_THRESHOLD, "I2S", (unsigned)g_model_len);
+    printf("[BOOT-CHECK] DETECT_THRESHOLD=%.3f  DETECTION_HITS_REQUIRED=%d  COOLDOWN_MS=%d  MIC_MODE=%s  MODEL_SIZE=%u bytes\n", 
+           (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED, COOLDOWN_MS, "I2S", (unsigned)g_model_len);
     printf("\n\n=== Hey Vaani booting in 5 seconds — open monitor NOW ===\n"); fflush(stdout);
     for (int i = 5; i > 0; i--) { printf("  Starting in %d...\n", i); fflush(stdout); vTaskDelay(pdMS_TO_TICKS(1000)); }
     printf("=== GO ===\n\n"); fflush(stdout);

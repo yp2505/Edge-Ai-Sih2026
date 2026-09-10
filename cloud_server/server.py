@@ -391,9 +391,13 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             epoch_ms = int(time.time() * 1000) + offset_ms
             self._send_json({"ok": True, "epochMs": epoch_ms, "timeZone": "Asia/Kolkata", "offsetMs": offset_ms})
         elif path == "/api/wifi-config":
-            # Return stored WiFi config (password masked)
+            # Return stored WiFi config (password masked), auto-filling server IP if unset
             safe = dict(_WIFI_CONFIG)
-            if "password" in safe:
+            if not safe.get("server_ip"):
+                safe["server_ip"] = self.server.asr_server._get_local_ip()
+            if not safe.get("server_port"):
+                safe["server_port"] = 5000
+            if "password" in safe and safe["password"]:
                 safe["password"] = "*" * len(safe["password"])
             self._send_json(safe)
         elif path == "/api/esp-logs":
