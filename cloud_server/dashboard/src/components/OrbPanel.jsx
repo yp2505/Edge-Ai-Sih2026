@@ -64,7 +64,7 @@ export default function OrbPanel({ latest, up, pings }) {
     : '0 0 32px rgba(0,229,255,0.38), 0 0 65px rgba(0,229,255,0.12)'
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'space-between', padding: '12px 10px', height: '100%', minHeight: 0 }}>
+    <div className="orb-panel-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'space-between', padding: '12px 10px', height: '100%', minHeight: 0 }}>
       {/* Top Labels */}
       <div style={{ textAlign: 'center', zIndex: 3 }}>
         <div style={{ fontFamily: 'var(--title)', fontSize: 16, fontWeight: 800, color: 'var(--t1)', letterSpacing: 2 }}>VAANI AI</div>

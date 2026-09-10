@@ -18,7 +18,7 @@ export default function Sidebar({ activeNav, onNav, serverUp }) {
 
       {/* ── Logo ── */}
       <div className={styles.logoRow}>
-        <VaaniLogo size={38} />
+        <div className={styles.logoMark}><VaaniLogo size={40} /></div>
         <div>
           <div className={styles.logoName}>Hey Vaani</div>
           <div className={styles.logoSub}>Edge AI Platform</div>

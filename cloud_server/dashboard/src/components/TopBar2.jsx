@@ -88,8 +88,8 @@ export default function TopBar({ health, up, total, telemetryStale, onSettings }
       {/* Brand */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div style={{ width: 34, height: 34, borderRadius: 10, background: 'rgba(0,229,255,0.08)', border: '1px solid rgba(0,229,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 15px rgba(0,229,255,0.1)' }}>
-            <VaaniLogo size={20} />
+          <div style={{ width: 40, height: 40, borderRadius: '50%', background: 'rgba(0,0,0,0.6)', border: '1px solid rgba(0,229,255,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 16px rgba(0,229,255,0.18)', overflow: 'hidden' }}>
+            <VaaniLogo size={40} />
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
             <div style={{ fontFamily: 'var(--title)', fontSize: 15, fontWeight: 900, color: 'var(--t1)', letterSpacing: 2, lineHeight: 1.1 }}>HEY VAANI</div>
@@ -126,7 +126,7 @@ export default function TopBar({ health, up, total, telemetryStale, onSettings }
       {/* Right */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
         <div className="hide-on-mobile"><Clock /></div>
-        <button onClick={onSettings} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12, color: 'var(--t2)', fontSize: 11, fontWeight: 700, letterSpacing: 1, transition: 'all 0.2s' }}>
+        <button aria-label="Open settings" onClick={onSettings} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12, color: 'var(--t2)', fontSize: 11, fontWeight: 700, letterSpacing: 1, transition: 'all 0.2s' }}>
           <IconSettings size={14} color="var(--c1)" /> <span className="hide-on-mobile">SETTINGS</span>
         </button>
       </div>

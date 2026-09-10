@@ -7,6 +7,7 @@ import FeedPanel from './components/FeedPanel.jsx'
 import PipePanel from './components/PipePanel.jsx'
 import SettingsModal from './components/SettingsModal.jsx'
 import LiveBackground from './components/LiveBackground.jsx'
+import LogTerminal from './components/LogTerminal.jsx'
 import { IconWaveform, IconReport, IconCpu, IconTrendChart } from './components/Icons.jsx'
 import './App.css'
 
@@ -18,6 +19,7 @@ export default function App() {
   const [telemetry, setTelemetry] = useState(null)
   const [serverUp, setServerUp] = useState(false)
   const [settings, setSettings] = useState(false)
+  const [bottomView, setBottomView] = useState('pipeline')
 
   const get = useCallback(async (path, setter, transform) => {
     try {
@@ -61,7 +63,7 @@ export default function App() {
         {/* ── Left Column ── */}
         <div className="a-left">
           {/* AI Companion */}
-          <div className="glass" style={{ flex: 1, minHeight: 0 }}>
+          <div className="glass ai-panel" style={{ flex: 1, minHeight: 0 }}>
             <div className="ph">
               <div className="ph-l">
                 <div className="ph-dot" style={{ background: serverUp ? 'var(--green)' : 'var(--t4)', boxShadow: serverUp ? '0 0 10px var(--green)' : 'none' }} />
@@ -73,7 +75,7 @@ export default function App() {
           </div>
 
           {/* Hardware */}
-          <div className="glass" style={{ flexShrink: 0 }}>
+          <div className="glass hardware-panel" style={{ flexShrink: 0 }}>
             <div className="ph">
               <div className="ph-l">
                 <IconCpu size={11} color="var(--t3)" />
@@ -83,7 +85,7 @@ export default function App() {
                 <span style={{ fontSize: 8, color: 'var(--t4)', fontFamily: 'var(--mono)', letterSpacing: 1.5 }}>LIVE</span>
               </div>
             </div>
-            <div className="hw-body"><HwPanel telemetry={telemetry} stale={telemetryStale} serverUp={serverUp} /></div>
+            <div className="hw-body"><HwPanel telemetry={telemetry} stale={telemetryStale} serverUp={serverUp} health={health} /></div>
           </div>
         </div>
 
@@ -118,11 +120,18 @@ export default function App() {
           <div className="ph">
             <div className="ph-l">
               <IconTrendChart size={11} color="var(--t3)" />
-              <span className="ph-tag">Inference Pipeline</span>
+              <span className="ph-tag">{bottomView === 'pipeline' ? 'Inference Pipeline' : 'Wireless Terminal'}</span>
             </div>
-            <span style={{ fontSize: 7, fontWeight: 700, color: 'var(--t4)', fontFamily: 'var(--mono)', letterSpacing: 1.5 }}>E2E TIMING</span>
+            <div className="bottom-tabs" role="tablist" aria-label="Bottom dashboard view">
+              <button className={bottomView === 'pipeline' ? 'active' : ''} onClick={() => setBottomView('pipeline')} role="tab" aria-selected={bottomView === 'pipeline'}>PIPELINE</button>
+              <button className={bottomView === 'terminal' ? 'active' : ''} onClick={() => setBottomView('terminal')} role="tab" aria-selected={bottomView === 'terminal'}>TERMINAL</button>
+            </div>
           </div>
-          <div className="pl-body"><PipePanel latest={latest} events={events} /></div>
+          {bottomView === 'pipeline' ? (
+            <div className="pl-body"><PipePanel latest={latest} events={events} /></div>
+          ) : (
+            <LogTerminal />
+          )}
         </div>
 
       </div>

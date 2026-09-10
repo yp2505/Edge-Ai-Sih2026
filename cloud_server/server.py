@@ -67,8 +67,8 @@ import numpy as np
 #   Audio    nonce: 16 random bytes sent by ESP32 right after HVP1 header
 #   Response nonce: audio_nonce with last byte XOR 0xFF (both sides derive it)
 try:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.backends import default_backend as _crypto_backend
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore
+    from cryptography.hazmat.backends import default_backend as _crypto_backend  # type: ignore
     _CRYPTO_AVAILABLE = True
 except ImportError:
     _CRYPTO_AVAILABLE = False
@@ -200,6 +200,49 @@ try:
 except ImportError:
     _REQUESTS_AVAILABLE = False
 
+try:
+    from amazon_transcribe.client import TranscribeStreamingClient  # type: ignore
+    _AWS_AVAILABLE = True
+except ImportError:
+    _AWS_AVAILABLE = False
+
+try:
+    import psutil as _psutil  # used for server CPU/RAM metrics
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    _PSUTIL_AVAILABLE = False
+
+
+# ─── Persistent state (in-memory + file) ─────────────────────────────────────
+import json as _json_module
+
+# WiFi provisioning config (persisted to wifi_config.json)
+_WIFI_CONFIG: dict = {}
+_WIFI_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wifi_config.json")
+try:
+    with open(_WIFI_CONFIG_FILE) as _f:
+        _WIFI_CONFIG = _json_module.load(_f)
+except Exception:
+    pass
+
+# ESP32 wireless log ring buffer (last 500 entries)
+_ESP_LOG_BUFFER: list = []
+_ESP_LOG_LOCK = threading.Lock()
+_ESP_LOG_MAX = 300
+
+def _esp_log_append(level: str, tag: str, msg: str):
+    """Append a log line to the ring buffer (thread-safe)."""
+    entry = {
+        "ts": datetime.now().isoformat(timespec="milliseconds"),
+        "level": level,
+        "tag": tag,
+        "msg": msg,
+    }
+    with _ESP_LOG_LOCK:
+        _ESP_LOG_BUFFER.append(entry)
+        if len(_ESP_LOG_BUFFER) > _ESP_LOG_MAX:
+            _ESP_LOG_BUFFER.pop(0)
+
 # ─── ASR backend + intent selection ──────────────────────────────────────────
 # Set by CLI flags in main().
 ASR_ENGINE    = "whisper"   # overridden by --asr flag
@@ -244,7 +287,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "*")
             self.end_headers()
             self.wfile.write(body)
@@ -257,17 +300,57 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self): self._send_json({})
 
     def do_POST(self):
-        if self.path.split("?")[0] != "/api/telemetry":
+        path = self.path.split("?", 1)[0]
+        if path not in {"/api/telemetry", "/api/wifi-config", "/api/esp-logs"}:
             self._send_json({"error": "not found"}, status=404)
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             data = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(data, dict): raise ValueError("expected object")
-            data["received_at"] = datetime.now().isoformat()
-            asr = self.server.asr_server
-            with asr._lock: asr.telemetry = data
-            self._send_json({"ok": True})
+            if path == "/api/telemetry":
+                data["received_at"] = datetime.now().isoformat()
+                asr = self.server.asr_server
+                with asr._lock: asr.telemetry = data
+                self._send_json({"ok": True})
+            elif path == "/api/wifi-config":
+                # Save WiFi provisioning config to disk
+                global _WIFI_CONFIG
+                allowed = {"ssid", "password", "server_ip", "server_port"}
+                next_config = {k: v for k, v in data.items() if k in allowed}
+                if not next_config.get("password") and _WIFI_CONFIG.get("password"):
+                    next_config["password"] = _WIFI_CONFIG["password"]
+                if not next_config.get("ssid") or not next_config.get("server_ip"):
+                    raise ValueError("ssid and server_ip are required")
+                try:
+                    next_config["server_port"] = int(next_config.get("server_port", 5000))
+                    if not 1 <= next_config["server_port"] <= 65535:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise ValueError("server_port must be between 1 and 65535")
+                _WIFI_CONFIG = next_config
+                try:
+                    with open(_WIFI_CONFIG_FILE, "w") as wf:
+                        json.dump(_WIFI_CONFIG, wf, indent=2)
+                    _esp_log_append("I", "WIFI-CFG", f"New WiFi config saved: SSID={_WIFI_CONFIG.get('ssid', '?')} IP={_WIFI_CONFIG.get('server_ip', '?')}:{_WIFI_CONFIG.get('server_port', '?')}")
+                    self._send_json({"ok": True, "saved": True})
+                except Exception as e:
+                    self._send_json({"error": str(e)}, status=500)
+            elif path == "/api/esp-logs":
+                # Accept ESP32 log POST (for wireless logging firmware patch)
+                entries = data.get("entries", [])
+                if isinstance(entries, list) and entries:
+                    for e in entries:
+                        _esp_log_append(
+                            e.get("level", "I"),
+                            e.get("tag", "ESP32"),
+                            e.get("msg", ""),
+                        )
+                elif "msg" in data:
+                    _esp_log_append(data.get("level", "I"), data.get("tag", "ESP32"), data["msg"])
+                self._send_json({"ok": True})
+            else:
+                self._send_json({"error": "not found"}, status=404)
         except Exception as e:
             self._send_json({"error": str(e)}, status=400)
 
@@ -277,12 +360,24 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             with asr._lock:
                 count = len(asr.log_entries)
-            self._send_json({
+            resp = {
                 "status":         "running",
                 "uptime_seconds": int(time.time() - asr.start_time),
                 "session_count":  count,
                 "asr_engine":     f"faster-whisper-{asr.whisper_model}",
-            })
+            }
+            # Server CPU / RAM via psutil
+            if _PSUTIL_AVAILABLE:
+                try:
+                    resp["server_cpu_pct"]  = _psutil.cpu_percent(interval=None)
+                    vm = _psutil.virtual_memory()
+                    resp["server_ram_pct"]  = vm.percent
+                    resp["server_ram_mb"] = round(vm.used / 1024 / 1024, 1)
+                    resp["server_ram_used_mb"] = round(vm.used / 1024 / 1024, 1)
+                    resp["server_ram_total_mb"] = round(vm.total / 1024 / 1024, 1)
+                except Exception:
+                    pass
+            self._send_json(resp)
         elif path == "/api/telemetry":
             with asr._lock:
                 telemetry = dict(asr.telemetry)
@@ -292,15 +387,28 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 entries = list(asr.log_entries)
             self._send_json(entries)
         elif path == "/api/realtime":
-            # Real-world network time (IST Asia/Kolkata) with fallback
             offset_ms = int(5.5 * 3600 * 1000)
             epoch_ms = int(time.time() * 1000) + offset_ms
-            self._send_json({
-                "ok": True,
-                "epochMs": epoch_ms,
-                "timeZone": "Asia/Kolkata",
-                "offsetMs": offset_ms,
-            })
+            self._send_json({"ok": True, "epochMs": epoch_ms, "timeZone": "Asia/Kolkata", "offsetMs": offset_ms})
+        elif path == "/api/wifi-config":
+            # Return stored WiFi config (password masked)
+            safe = dict(_WIFI_CONFIG)
+            if "password" in safe:
+                safe["password"] = "*" * len(safe["password"])
+            self._send_json(safe)
+        elif path == "/api/esp-logs":
+            # Return ESP32 / server log ring buffer
+            since_idx = 0
+            qs = self.path.split("?", 1)
+            if len(qs) > 1:
+                for part in qs[1].split("&"):
+                    if part.startswith("since="):
+                        try: since_idx = int(part[6:])
+                        except ValueError: pass
+            with _ESP_LOG_LOCK:
+                total = len(_ESP_LOG_BUFFER)
+                entries = list(_ESP_LOG_BUFFER[since_idx:])
+            self._send_json({"total": total, "entries": entries})
         else:
             self._send_json({"error": "not found"}, status=404)
 
@@ -397,6 +505,7 @@ class ASRServer:
                         "status": "wake_word_detected",
                         "wake_word": "Hey Vaani",
                     })
+                _esp_log_append("I", "SESSION", f"Wake word detected from {client_addr[0]} (session {sid})")
                 self._save_log()
                 print(f"  📡 [{sid}] Connection from {client_addr[0]}:{client_addr[1]}")
                 threading.Thread(
@@ -643,6 +752,7 @@ class ASRServer:
             asr_label = "Vosk" if self.asr_engine == "vosk" else f"Whisper '{self.whisper_model}'"
             print(f"\n  {'─' * 58}")
             print(f"  📝 [{session_id}] RAW TRANSCRIPT:  \"{transcript}\"")
+            _esp_log_append("I", "ASR", f"Session {session_id}: {transcript or '[empty transcript]'}")
             if intent_data:
                 print(f"  🤖 [{session_id}] INTENT:          {json.dumps(intent_data)}")
             print(f"  🛡️  [{session_id}] VERIFICATION GATE: {verification_status} (score={match_score:.2f}, match='{matched_var}')")
@@ -730,6 +840,7 @@ class ASRServer:
             self._save_log()
 
         except Exception as e:
+            _esp_log_append("E", "SERVER", f"Session {session_id} failed: {e}")
             print(f"  ❌ [{session_id}] Unhandled error: {e}")
         finally:
             client_socket.close()

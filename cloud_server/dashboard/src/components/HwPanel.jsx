@@ -26,26 +26,28 @@ function Gauge({ label, value, color, unit = '%' }) {
   )
 }
 
-export default function HwPanel({ telemetry, stale, serverUp }) {
+export default function HwPanel({ telemetry, stale, serverUp, health }) {
   const conn = serverUp && telemetry && !stale
   
   const cpu = conn && telemetry.cpu != null ? telemetry.cpu : NaN
-  const npu = conn && telemetry.npu != null ? telemetry.npu : NaN
   const temp = conn && telemetry.temp != null ? telemetry.temp : NaN
   const vcore = conn && telemetry.vcore != null ? `${telemetry.vcore.toFixed(2)} V` : 'N/A'
   const latency = conn && telemetry.latency_ms != null ? `${telemetry.latency_ms} ms` : 'N/A'
   const pktLoss = conn && telemetry.pkt_loss != null ? `${telemetry.pkt_loss} %` : 'N/A'
   const rssi = conn && telemetry.wifi_rssi_dbm != null ? `${telemetry.wifi_rssi_dbm} dBm` : 'N/A'
   const micStr = conn && telemetry.mic_rms != null ? (telemetry.mic_rms > 0 ? `${(20 * Math.log10(telemetry.mic_rms)).toFixed(1)} dB` : '-inf dB') : 'N/A'
+  const heap = conn && telemetry.free_heap_bytes != null ? Math.min(100, (telemetry.free_heap_bytes / 320000) * 100) : NaN
+  const ram = serverUp && health?.server_ram_pct != null ? health.server_ram_pct : NaN
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 20, padding: '16px 20px', height: '100%' }}>
+    <div className="hw-panel-content" style={{ display: 'flex', flexDirection: 'column', gap: 20, padding: '16px 20px', height: '100%' }}>
       
       {/* Gauges */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', padding: '0 10px' }}>
+      <div className="hw-gauges" style={{ display: 'flex', justifyContent: 'space-between', padding: '0 10px' }}>
         <Gauge label="CPU" value={cpu} color="var(--c1)" />
-        <Gauge label="NPU" value={npu} color="var(--c3)" />
+        <Gauge label="RAM" value={ram} color="var(--c3)" />
         <Gauge label="TEMP" value={temp} color="var(--amber)" unit="°" />
+        <Gauge label="HEAP FREE" value={heap} color="var(--green)" />
       </div>
 
       <div style={{ height: 1, background: 'rgba(255,255,255,0.06)', margin: '4px 0' }} />

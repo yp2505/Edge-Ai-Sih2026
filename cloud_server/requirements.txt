@@ -10,6 +10,7 @@
 numpy>=1.23.0
 soundfile>=0.12.0           # WAV read/write for --test mode
 requests>=2.31.0            # Ollama intent API (localhost, no internet used)
+psutil>=5.9.0               # Server CPU and RAM metrics for the dashboard
 cryptography>=42.0.0        # AES-128-CTR for audio stream + JSON response encryption
 
 # ── Backend A: faster-whisper (default, offline, open-source) ────────────────
