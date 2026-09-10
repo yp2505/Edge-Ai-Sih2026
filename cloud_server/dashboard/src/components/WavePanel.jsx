@@ -81,7 +81,7 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
   }, [])
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', padding: '16px 20px 20px' }}>
+    <div className="wave-panel-content" style={{ display: 'flex', flexDirection: 'column', height: '100%', padding: '16px 20px 20px' }}>
       
       {/* Metrics Row */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
@@ -94,7 +94,7 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
       </div>
 
       {/* Waveform Area */}
-      <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative', marginBottom: 20 }}>
+      <div className="waveform-area" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative', marginBottom: 20 }}>
         <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 8, paddingLeft: 4 }}>LIVE AUDIO</div>
         <div style={{ flex: 1, position: 'relative', background: 'rgba(255,255,255,0.015)', borderRadius: 12, border: '1px solid rgba(255,255,255,0.04)', overflow: 'hidden', opacity: active ? 1 : 0.25, transition: 'opacity 0.5s' }}>
           <canvas ref={ref} style={{ width: '100%', height: '100%', display: 'block' }} />
@@ -108,7 +108,7 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
       </div>
 
       {/* Transcript Card */}
-      <div style={{ 
+      <div className="wave-status-card" style={{ 
         padding: 16, borderRadius: 14,
         background: active ? 'rgba(0,229,255,0.06)' : 'rgba(255,255,255,0.03)',
         border: `1px solid ${active ? 'rgba(0,229,255,0.2)' : 'rgba(255,255,255,0.05)'}`,
