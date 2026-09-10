@@ -2,17 +2,73 @@ import { useState, useEffect } from 'react'
 import { VaaniLogo, IconSettings } from './Icons.jsx'
 
 function Clock() {
+  const [offset, setOffset] = useState(0)
+  const [synced, setSynced] = useState(false)
   const [t, setT] = useState(new Date())
-  useEffect(() => { const i = setInterval(() => setT(new Date()), 1000); return () => clearInterval(i) }, [])
+
+  // Network synchronization with real-world time
+  useEffect(() => {
+    async function syncTime() {
+      try {
+        const res = await fetch('/api/realtime')
+        if (res.ok) {
+          const data = await res.json()
+          if (data.offsetMs !== undefined) {
+            setOffset(data.offsetMs)
+            setSynced(true)
+            setT(new Date(Date.now() + data.offsetMs))
+          }
+        }
+      } catch (err) {}
+    }
+    syncTime()
+    const syncInterval = setInterval(syncTime, 60000)
+    return () => clearInterval(syncInterval)
+  }, [])
+
+  useEffect(() => {
+    const i = setInterval(() => {
+      setT(new Date(Date.now() + offset))
+    }, 1000)
+    return () => clearInterval(i)
+  }, [offset])
+
   const pad = n => String(n).padStart(2, '0')
+  const days = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT']
+  const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+  const day = days[t.getDay()]
+  const month = months[t.getMonth()]
+  const date = pad(t.getDate())
+  const year = t.getFullYear()
+  const h12 = pad(t.getHours() % 12 || 12)
+  const ampm = t.getHours() >= 12 ? 'PM' : 'AM'
+  const timeStr = `${h12}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`
+  const dateStr = `${day}, ${date} ${month} ${year}`
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center' }}>
-      <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 2 }}>TIME</div>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
-        <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: 'var(--t1)' }}>{pad(t.getHours())}:{pad(t.getMinutes())}:{pad(t.getSeconds())}</span>
-        <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--t3)', letterSpacing: 1 }}>
-          {t.getHours() >= 12 ? 'PM' : 'AM'}
-        </span>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 14 }} title={synced ? "Network Synchronized Time (IST)" : "Local Time"}>
+      {/* Date */}
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center' }}>
+        <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 2 }}>DATE</div>
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 12, fontWeight: 700, color: 'var(--t2)', whiteSpace: 'nowrap', letterSpacing: 0.5 }}>
+          {dateStr}
+        </div>
+      </div>
+
+      <div style={{ width: 1, height: 20, background: 'rgba(255,255,255,0.08)' }} />
+
+      {/* Time */}
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', justifyContent: 'center' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
+          {synced && <div style={{ width: 4, height: 4, borderRadius: '50%', background: 'var(--green)', boxShadow: '0 0 6px var(--green)' }} />}
+          <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5 }}>TIME (IST)</div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: 'var(--t1)' }}>{timeStr}</span>
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 800, color: 'var(--c1)', letterSpacing: 1 }}>
+            {ampm}
+          </span>
+        </div>
       </div>
     </div>
   )

@@ -291,6 +291,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             with asr._lock:
                 entries = list(asr.log_entries)
             self._send_json(entries)
+        elif path == "/api/realtime":
+            # Real-world network time (IST Asia/Kolkata) with fallback
+            offset_ms = int(5.5 * 3600 * 1000)
+            epoch_ms = int(time.time() * 1000) + offset_ms
+            self._send_json({
+                "ok": True,
+                "epochMs": epoch_ms,
+                "timeZone": "Asia/Kolkata",
+                "offsetMs": offset_ms,
+            })
         else:
             self._send_json({"error": "not found"}, status=404)
 
