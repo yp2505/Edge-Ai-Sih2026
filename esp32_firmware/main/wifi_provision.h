@@ -54,6 +54,9 @@ extern char g_server_ip[PROV_IP_MAX];
  */
 void wifi_provision_init(void);
 
+/** Save SSID / password / server IP to NVS. Returns true on success. */
+bool wifi_provision_save(const char* ssid, const char* pass, const char* ip);
+
 /**
  * Erase all stored credentials from NVS.
  * Calling esp_restart() afterwards forces the setup portal on next boot.

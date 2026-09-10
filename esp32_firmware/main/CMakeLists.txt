@@ -10,6 +10,7 @@ idf_component_register(
         esp_netif
         esp_event
         esp_http_server
+        esp_http_client
         lwip
         nvs_flash
         esp_timer

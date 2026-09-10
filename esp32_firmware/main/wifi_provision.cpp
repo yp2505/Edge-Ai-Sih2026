@@ -182,7 +182,7 @@ static bool nvs_load_credentials(void) {
 }
 
 /** Save SSID / password / server IP to NVS. Returns true on success. */
-static bool nvs_save_credentials(const char* ssid, const char* pass,
+bool wifi_provision_save(const char* ssid, const char* pass,
                                   const char* ip) {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
@@ -315,8 +315,9 @@ static esp_err_t handle_save(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Saving: SSID='%s'  server=%s", ssid, ip);
-    if (!nvs_save_credentials(ssid, pass, ip)) {
+    ESP_LOGI(TAG, "Saving -> SSID:'%s' PASS:'%s' IP:'%s'", ssid, pass, ip);
+    if (!wifi_provision_save(ssid, pass, ip)) {
+        ESP_LOGE(TAG, "NVS save failed");
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "NVS write failed");
         return ESP_FAIL;
@@ -437,7 +438,7 @@ void wifi_provision_init(void) {
         return;   // wifi_start() in main.cpp handles the actual connection
     }
     // No NVS credentials stored → fallback to hardcoded default hotspot
-    ESP_LOGI(TAG, "NVS empty — using default hotspot: SSID='%s' server=%s", g_wifi_ssid, g_server_ip);
-    nvs_save_credentials(g_wifi_ssid, g_wifi_pass, g_server_ip);
+    ESP_LOGI(TAG, "Provisioning skipped — credentials already in NVS");
+    // Ensure NVS has the exact same credentials (useful if formats upgraded)
+    wifi_provision_save(g_wifi_ssid, g_wifi_pass, g_server_ip);
 }
-

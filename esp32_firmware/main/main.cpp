@@ -57,6 +57,7 @@
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
+#include "esp_http_client.h"
 #include "cJSON.h"            // ESP-IDF built-in JSON parser — no extra deps
 #include "aes/esp_aes.h"      // Hardware-accelerated AES-128-CTR encryption
 #include "esp_random.h"       // Hardware RNG for nonce generation
@@ -1406,6 +1407,66 @@ static void wifi_keepalive_task(void* arg) {
 }
 
 // ============================================================================
+// TASK 4: wifi_config_poll_task — checks for updated WiFi credentials from server
+// ============================================================================
+static void wifi_config_poll_task(void* arg) {
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Poll every 10 seconds
+        if (!wifi_connected || g_server_ip[0] == '\0') continue;
+
+        char url[128];
+        snprintf(url, sizeof(url), "http://%s:8080/api/wifi-config", g_server_ip);
+
+        esp_http_client_config_t config = {};
+        config.url = url;
+        config.timeout_ms = 3000;
+        
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (!client) continue;
+
+        esp_err_t err = esp_http_client_open(client, 0);
+        if (err == ESP_OK) {
+            esp_http_client_fetch_headers(client);
+            int status_code = esp_http_client_get_status_code(client);
+            if (status_code == 200) {
+                char buf[512] = {0};
+                int read_len = esp_http_client_read(client, buf, sizeof(buf) - 1);
+                if (read_len > 0) {
+                    buf[read_len] = '\0';
+                    cJSON* root = cJSON_Parse(buf);
+                    if (root) {
+                        cJSON* ssid = cJSON_GetObjectItem(root, "ssid");
+                        cJSON* pass = cJSON_GetObjectItem(root, "password");
+                        cJSON* s_ip = cJSON_GetObjectItem(root, "server_ip");
+                        
+                        if (ssid && ssid->valuestring && pass && pass->valuestring && s_ip && s_ip->valuestring) {
+                            // Check if different from current
+                            if (strcmp(ssid->valuestring, g_wifi_ssid) != 0 || 
+                                strcmp(pass->valuestring, g_wifi_pass) != 0 || 
+                                strcmp(s_ip->valuestring, g_server_ip) != 0) {
+                                
+                                ESP_LOGI(TAG_MAIN, "New WiFi config received via OTA!");
+                                ESP_LOGI(TAG_MAIN, "SSID: %s -> %s", g_wifi_ssid, ssid->valuestring);
+                                ESP_LOGI(TAG_MAIN, "IP: %s -> %s", g_server_ip, s_ip->valuestring);
+                                
+                                if (wifi_provision_save(ssid->valuestring, pass->valuestring, s_ip->valuestring)) {
+                                    ESP_LOGI(TAG_MAIN, "NVS updated. Restarting ESP32...");
+                                    vTaskDelay(pdMS_TO_TICKS(1000));
+                                    esp_restart();
+                                }
+                            }
+                        }
+                        cJSON_Delete(root);
+                    }
+                }
+            }
+        }
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+    }
+}
+
+// ============================================================================
 // TASK 3b: watchdog_task — force-clears streaming_active if stuck >10 s.
 // UNCHANGED from rev6, plus: also resets LED and display state on force-clear.
 // ============================================================================
@@ -1602,6 +1663,7 @@ extern "C" void app_main() {
     xTaskCreatePinnedToCore(inference_task,     "inference",   24576, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(streaming_task,     "streaming",   8192,  NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(wifi_keepalive_task,"wifi_ka",     4096,  NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(wifi_config_poll_task,"wifi_poll", 4096,  NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(watchdog_task,      "watchdog",    2048,  NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(display_task,       "display",     4096,  NULL, 1, NULL, 1); // [NEW] Moved to Core 1 to avoid I2C crash!
     xTaskCreatePinnedToCore(stack_monitor_task, "stack_mon",   3072,  NULL, 1, NULL, 0);
