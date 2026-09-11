@@ -297,6 +297,26 @@ HEADER_SIZE   = struct.calcsize(HEADER_FORMAT)   # 20 bytes
 MAX_AUDIO_BYTES    = 640_000   # 20s × 16kHz × 2B safety cap
 VALID_SAMPLE_RATES = {8000, 16000, 22050, 44100, 48000}
 
+# ─── SSE (Server-Sent Events) for live telemetry push ─────────────────────────
+# Dashboard subscribes to /api/telemetry-stream for real-time ESP32 telemetry.
+# Each subscriber gets a queue; when ESP32 POSTs telemetry, all queues are notified.
+import queue as _queue
+_SSE_SUBSCRIBERS: list[_queue.Queue] = []
+_SSE_LOCK = threading.Lock()
+
+def _sse_notify(data: dict):
+    """Push telemetry dict to all active SSE subscribers."""
+    payload = json.dumps(data)
+    with _SSE_LOCK:
+        dead = []
+        for q in _SSE_SUBSCRIBERS:
+            try:
+                q.put_nowait(payload)
+            except _queue.Full:
+                dead.append(q)
+        for q in dead:
+            _SSE_SUBSCRIBERS.remove(q)
+
 
 # ─── Dashboard HTTP API ───────────────────────────────────────────────────────
 class _DashboardHandler(BaseHTTPRequestHandler):
@@ -347,6 +367,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 print(f"  📱 [ESP32] cpu={cpu_pct:.1f}% latency={latency_ms:.0f}ms "
                       f"mic={mic_rms:.4f} conf={conf:.4f} snr={snr_db:.1f}dB "
                       f"heap={heap} inf={inf_count}")
+                _sse_notify(data)  # push to dashboard SSE subscribers
                 self._send_json({"ok": True})
             elif path == "/api/wifi-config":
                 # Save WiFi provisioning config to disk
@@ -424,6 +445,33 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             with asr._lock:
                 entries = list(asr.log_entries)
             self._send_json(entries)
+        elif path == "/api/telemetry-stream":
+            # SSE endpoint — streams telemetry in real-time
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            q = _queue.Queue(maxsize=32)
+            with _SSE_LOCK:
+                _SSE_SUBSCRIBERS.append(q)
+            try:
+                while True:
+                    try:
+                        payload = q.get(timeout=15)
+                        self.wfile.write(f"data: {payload}\n\n".encode())
+                        self.wfile.flush()
+                    except _queue.Empty:
+                        # Send keepalive comment every 15s
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            finally:
+                with _SSE_LOCK:
+                    if q in _SSE_SUBSCRIBERS:
+                        _SSE_SUBSCRIBERS.remove(q)
         elif path == "/api/realtime":
             offset_ms = int(5.5 * 3600 * 1000)
             epoch_ms = int(time.time() * 1000) + offset_ms

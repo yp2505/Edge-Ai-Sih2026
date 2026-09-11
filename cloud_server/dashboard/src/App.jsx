@@ -42,8 +42,25 @@ export default function App() {
     get('/api/telemetry', setTelemetry, d => Object.keys(d).length ? d : null)
     const h = setInterval(fetchHealth, 2000)
     const e = setInterval(() => get('/api/events', setEvents), 800)
-    const t = setInterval(() => get('/api/telemetry', setTelemetry, d => Object.keys(d).length ? d : null), 1000)
-    return () => { clearInterval(h); clearInterval(e); clearInterval(t) }
+    // SSE for real-time telemetry instead of polling
+    let eventSource = null
+    try {
+      eventSource = new EventSource(`${API}/api/telemetry-stream`)
+      eventSource.onmessage = (ev) => {
+        try {
+          const d = JSON.parse(ev.data)
+          if (d && Object.keys(d).length) setTelemetry(d)
+        } catch {}
+      }
+      eventSource.onerror = () => {
+        // Fallback to polling if SSE fails
+        eventSource.close()
+      }
+    } catch {
+      // Fallback: poll telemetry every 1s if EventSource not available
+    }
+    const tFallback = eventSource ? null : setInterval(() => get('/api/telemetry', setTelemetry, d => Object.keys(d).length ? d : null), 1000)
+    return () => { clearInterval(h); clearInterval(e); if (tFallback) clearInterval(tFallback); if (eventSource) eventSource.close() }
   }, [fetchHealth, get])
 
   const latest = events.length ? events[events.length - 1] : null

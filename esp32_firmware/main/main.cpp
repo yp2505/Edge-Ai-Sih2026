@@ -106,7 +106,7 @@ static const uint8_t AES_KEY[16] = {
 #define I2S_PORT           I2S_NUM_0
 #define I2S_SCK_PIN        GPIO_NUM_26   // BCLK  (INMP441 SCK)
 #define I2S_WS_PIN         GPIO_NUM_25   // LRCLK (INMP441 WS)
-#define I2S_SD_PIN         GPIO_NUM_22   // DATA  (INMP441 SD)
+#define I2S_SD_PIN         GPIO_NUM_22   // DATA  (INMP441 SD)  — wired to GPIO22
 
 // ─── KWS / Inference ─────────────────────────────────────────────────────────
 // DETECT_THRESHOLD: sigmoid decision boundary calibrated on the custom
@@ -118,26 +118,21 @@ static const uint8_t AES_KEY[16] = {
 // DETECTION_HITS_REQUIRED=2: both consecutive inferences must exceed
 // threshold before the trigger fires — halves false-positive rate
 // at cost of ~30 ms extra latency (one extra hop).
-static const float DETECT_THRESHOLD          = 0.45f;   // Lowered — model scores ~0.36 on noise, ~0.55+ on speech
-static const int   DETECTION_HITS_REQUIRED  = 1;
-static const float MIN_SPEECH_RMS           = 0.020f;   // Your mic: noise floor ~0.015, speech ~0.025-0.033
-static const float NOISE_FLOOR_MULTIPLIER   = 1.8f;
+static const float DETECT_THRESHOLD          = 0.70f;   // Raise to reduce false triggers — only real "Hey Vaani" should pass
+static const int   DETECTION_HITS_REQUIRED  = 1;        // Single frame trigger — model peaks in 1 frame during "Hey Vaani"
+static const float MIN_SPEECH_RMS           = 0.030f;   // Gate out fan/AC noise
+static const float NOISE_FLOOR_MULTIPLIER   = 2.5f;     // VAD gate: must be 2.5x above noise floor
 static const int   NOISE_CALIBRATION_FRAMES = 50;
 static const float NOISE_CAL_MAX_RMS        = 0.15f;
 
 // ─── Streaming / VAD ─────────────────────────────────────────────────────────
-// LATENCY-OPTIMISED for <200ms detection + 7s streaming (rev9)
-//   SLIDE_STEP_MS=30:          inference every 30ms window hop
-//   COMMAND_DURATION_MS=4000:  max 4s command capture
-//   COMMAND_MIN_DURATION_MS=200: minimum 200ms before EOS eligible
-//   COMMAND_SILENCE_MS=200:    close stream after 200ms quiet
-//   COOLDOWN_MS=3000:          3s post-cycle cooldown to prevent re-trigger loops
-//   Prompt delay: 500ms (was 1500ms) — faster transition to command capture
-//   Budget: KWS=18ms + MFCC=15ms + invoke=18ms = ~51ms detection latency
+// Command capture: after "How can I help you?", keep streaming long enough
+// for the user to speak their command.  Minimum 2s before EOS eligible,
+// then close after 1s of silence.  Max 15s hard cap.
 #define SLIDE_STEP_MS           30
-#define COMMAND_DURATION_MS     15000
-#define COMMAND_MIN_DURATION_MS 200
-#define COMMAND_SILENCE_MS      200
+#define COMMAND_DURATION_MS     10000
+#define COMMAND_MIN_DURATION_MS 2000       // 2s minimum before EOS — user needs time to speak
+#define COMMAND_SILENCE_MS      1500       // 1.5s silence to end stream — give time between words
 #define COOLDOWN_MS             3000       // 3s cooldown after each detection cycle
 #define AUDIO_BUFFER_SAMPLES    16000
 #define STREAM_WATCHDOG_MS      5000
@@ -158,7 +153,7 @@ typedef struct __attribute__((packed)) {
 // BUZZER not connected — PWM/LEDC removed
 
 // ─── SSD1306 I2C OLED (0.96", 128×64, monochrome) ───────────────────────────
-// GPIO21=SDA (default I2C), GPIO19=SCL (avoids GPIO22 used by INMP441 SD).
+// GPIO21=SDA (default I2C), GPIO19=SCL (avoids GPIO33 used by INMP441 SD).
 #define OLED_SDA_PIN    GPIO_NUM_21
 #define OLED_SCL_PIN    GPIO_NUM_19
 #define OLED_I2C_PORT   I2C_NUM_0
@@ -251,6 +246,7 @@ static int64_t g_cooldown_end_us = 0;  // timestamp when cooldown expires (0 = n
 static char              g_disp_text[256] = "";
 static SemaphoreHandle_t disp_mutex;            // guards g_disp_text
 // SSD1306 framebuffer — modified in DRAM, flushed to display each redraw
+// I2C: SDA=GPIO21, SCL=GPIO19 (GPIO33 reserved for INMP441 SD).
 static uint8_t g_oled_fb[OLED_BUF_BYTES];
 
 // ─── Minimal 5×8 fixed font (ASCII 32–126, 95 entries × 5 col-bytes) ─────────
@@ -373,7 +369,7 @@ static void tflite_init() {
     if (model->version() != TFLITE_SCHEMA_VERSION) {
         ESP_LOGE(TAG_INF, "TFLite schema version mismatch!"); esp_restart();
     }
-    ESP_LOGI(TAG_INF, "Model size: %u bytes (%.1f KB)", g_model_len, g_model_len / 1024.0f);
+    ESP_LOGI(TAG_INF, "Model size: %u bytes (%.1f KB)", g_model_data_len, g_model_data_len / 1024.0f);
     resolver.AddConv2D();
     resolver.AddDepthwiseConv2D();
     resolver.AddBatchMatMul();
@@ -393,7 +389,7 @@ static void tflite_init() {
     output_tensor = interpreter->output(0);
     size_t used   = interpreter->arena_used_bytes();
     printf("[INIT] TFLite: model=%uB arena=%u/%u\n",
-           (unsigned)g_model_len, (unsigned)used, (unsigned)TENSOR_ARENA_SIZE);
+           (unsigned)g_model_data_len, (unsigned)used, (unsigned)TENSOR_ARENA_SIZE);
     fflush(stdout);
 }
 
@@ -409,7 +405,7 @@ static void i2s_global_init() {
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+                        I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = (gpio_num_t)(-1),
             .bclk = I2S_SCK_PIN,
@@ -421,7 +417,6 @@ static void i2s_global_init() {
     };
     // Both slots enabled; INMP441 L/R=GND → LEFT slot has mic data, RIGHT=0
     std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
-    // INMP441 requires 64 SCK cycles per frame. 32-bit slot width achieves this.
     std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(g_i2s_rx, &std_cfg));
@@ -432,26 +427,27 @@ static void i2s_global_init() {
 }
 
 // ─── I2S PCM read — STEREO de-interleave for INMP441 ─────────────────────────
-// We read STEREO frames (L=mic, R=zero from INMP441 with L/R=GND).
-// De-interleave: keep only even-index (LEFT) samples into out_buf.
-// Returns number of mono samples written to out_buf, or -1 on hard error.
+// INMP441 outputs 24-bit left-justified in 32-bit frame.  With I2S_SLOT_BIT_WIDTH_32BIT,
+// each sample is 4 bytes (int32).  We read int32 stereo, de-interleave LEFT channel,
+// and right-shift by 16 to get int16 audio.
 static int i2s_read_pcm(int16_t* out_buf, int out_count) {
-    // Read 2x stereo samples into a temp buffer
-    static int16_t stereo_buf[960 * 2];   // 60 ms stereo @ 16kHz (static = DRAM)
+    // Read stereo frames as int32 (4 bytes per sample)
+    static int32_t stereo_buf32[960 * 2];  // 32-bit stereo buffer
     int read_stereo = (out_count <= 960) ? out_count : 960;
-    size_t bytes_wanted = (size_t)read_stereo * 2 * sizeof(int16_t); // stereo
+    size_t bytes_wanted = (size_t)read_stereo * 2 * sizeof(int32_t);  // stereo int32
     size_t bytes_read = 0;
     esp_err_t e = i2s_channel_read(g_i2s_rx,
-                                   stereo_buf,
+                                   stereo_buf32,
                                    bytes_wanted,
                                    &bytes_read,
                                    pdMS_TO_TICKS(200));
     if (e != ESP_OK && e != ESP_ERR_TIMEOUT) return -1;
-    int stereo_samples = (int)(bytes_read / sizeof(int16_t)); // L+R interleaved
+    int stereo_samples = (int)(bytes_read / sizeof(int32_t));  // L+R interleaved int32
     int mono_out = 0;
-    // Extract LEFT channel (even indices = mic data)
+    // Extract LEFT channel (even indices = mic data), shift 24-bit → 16-bit
     for (int i = 0; i + 1 < stereo_samples && mono_out < out_count; i += 2) {
-        out_buf[mono_out++] = stereo_buf[i];  // LEFT = mic
+        int32_t s32 = stereo_buf32[i];          // 24-bit left-justified in 32 bits
+        out_buf[mono_out++] = (int16_t)(s32 >> 16);  // top 16 bits of 24-bit = audio
     }
     return mono_out;
 }
@@ -811,11 +807,11 @@ static void audio_task(void* arg) {
 
     // I2S sanity: first read to confirm data flows before entering main loop
     {
-        static int16_t sanity_stereo[128];
+        static int32_t sanity_stereo[128];
         size_t br = 0;
         esp_err_t e = i2s_channel_read(g_i2s_rx, sanity_stereo, sizeof(sanity_stereo),
                                        &br, pdMS_TO_TICKS(200));
-        int n = (e == ESP_OK) ? (int)(br / sizeof(int16_t)) : -1;
+        int n = (e == ESP_OK) ? (int)(br / sizeof(int32_t)) : -1;
         if (n <= 0) {
             ESP_LOGW(TAG_INF, "WARNING: I2S no data on sanity read — check SCK/WS/SD wiring");
         }
@@ -989,6 +985,11 @@ static void inference_task(void* arg) {
             g_sys_state = SYS_CAPTURE_COMMAND;
             gpio_set_level((gpio_num_t)LED_PIN, 1);
 
+            // Step 1: Flash "Hey Vaani Detected!" on OLED for 400ms
+            g_disp_state = DISP_DETECTED;
+            vTaskDelay(pdMS_TO_TICKS(400));
+
+            // Step 2: Show "How can I help you?" — command-capture mode
             if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 snprintf(g_disp_text, sizeof(g_disp_text), "How can I\nhelp you?");
                 xSemaphoreGive(disp_mutex);
@@ -997,7 +998,8 @@ static void inference_task(void* arg) {
             consecutive_hits = 0;
 
             if (!streaming_active) {
-                g_stream_start_pos = ((int)ring_write_pos - 8000 + AUDIO_BUFFER_SAMPLES) % AUDIO_BUFFER_SAMPLES;
+                // Start from current ring position — guaranteed fresh data
+                g_stream_start_pos = (int)ring_write_pos;
                 xQueueSend(detect_queue, &kw_end, 0);
             }
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -1098,8 +1100,8 @@ static void streaming_task(void* arg) {
         set_streaming_active(true, "keyword_detected");
         g_disp_state = DISP_STREAMING;
 
-        // Start from position saved at detection time (0.5s before detection = includes wake word)
         int last_pos = g_stream_start_pos;
+        printf("[STREAM] started last_pos=%d ring_wp=%d\n", last_pos, (int)ring_write_pos); fflush(stdout);
 
         while (xTaskGetTickCount() < deadline) {
             if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -1147,7 +1149,7 @@ static void streaming_task(void* arg) {
             if (streamed_ms >= COMMAND_MIN_DURATION_MS) {
                 int64_t sq = 0; for (int i = 0; i < CHUNK; i++) sq += (int64_t)pcm[i]*pcm[i];
                 float crms    = sqrtf((float)sq / CHUNK) / 32768.0f;
-                float sil_thr = fmaxf(0.025f, telemetry_noise_floor_rms * 1.5f);
+                float sil_thr = fmaxf(0.015f, telemetry_noise_floor_rms * 2.5f);
                 consec_silence_ms = crms < sil_thr ? consec_silence_ms + chunk_ms : 0;
                 if (consec_silence_ms >= COMMAND_SILENCE_MS) {
                     break;
@@ -1228,24 +1230,21 @@ static void streaming_task(void* arg) {
             }
 
             if (cloud_verified) {
-                gpio_set_level(LED_PIN, 1);
-                g_disp_state = DISP_DETECTED;   // brief "Detected!" flash
-                vTaskDelay(pdMS_TO_TICKS(300));  // hold "Detected!" for 300ms
-
-                // Write transcript under mutex — display_task reads it concurrently
+                // "Detected!" was already shown at the local KWS stage (inference_task).
+                // Now write the cloud transcript directly to OLED so it is visible immediately.
                 if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    // Show intent if available, else transcript
+                    // Prefer intent string when available, otherwise show raw transcript
                     if (intent_str[0]) {
                         snprintf(g_disp_text, sizeof(g_disp_text), "%s", intent_str);
                     } else {
                         snprintf(g_disp_text, sizeof(g_disp_text), "%s", clean_txt);
                     }
                     xSemaphoreGive(disp_mutex);
-                } else {
                 }
-                g_disp_state = DISP_TRANSCRIBED;
-                gpio_set_level(LED_PIN, 0);
-                vTaskDelay(pdMS_TO_TICKS(3500));
+                printf("[TRANSCRIPT] %s\n", clean_txt); fflush(stdout);
+                g_disp_state = DISP_TRANSCRIBED;   // OLED now shows the transcript text
+                gpio_set_level(LED_PIN, 0);         // LED off — transcription complete
+                vTaskDelay(pdMS_TO_TICKS(4000));    // hold transcript visible for 4s
             } else {
                 gpio_set_level(LED_PIN, 0);
             }
@@ -1499,7 +1498,7 @@ static void telemetry_task(void* arg) {
 // ─── app_main ────────────────────────────────────────────────────────────────
 extern "C" void app_main() {
     printf("[BOOT] DETECT_THRESHOLD=%.3f  HITS=%d  COOLDOWN=%d  MODEL=%u bytes\n", 
-           (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED, COOLDOWN_MS, (unsigned)g_model_len);
+           (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED, COOLDOWN_MS, (unsigned)g_model_data_len);
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(3000));
 
