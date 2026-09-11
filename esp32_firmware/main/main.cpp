@@ -1033,11 +1033,89 @@ static void streaming_task(void* arg) {
             continue;
         }
 
+        const int  CHUNK = 480; int16_t pcm[CHUNK];
+        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
+        int total_sent = 0, streamed_ms = 0, consec_silence_ms = 0;
+
+        set_streaming_active(true, "keyword_detected");
+
+        // ── Phase 1: "Listening" — wait for user to speak ──────────────────
+        // Don't connect to server yet.  Just monitor mic for speech.
+        // This gives the user time to read "How can I help you?" and respond.
+        g_disp_state = DISP_LISTENING;
+        printf("[STREAM] Waiting for speech...\n"); fflush(stdout);
+
+        int last_pos = (int)ring_write_pos;   // start reading from current position
+        bool speech_detected = false;
+        int wait_speech_ms = 0;
+        const int SPEECH_WAIT_TIMEOUT_MS = 8000;  // max 8s waiting for speech
+        const int PRE_BUFFER_MS = 300;             // 300ms pre-buffer before speech
+        const int PRE_BUF_SAMPLES = I2S_SAMPLE_RATE * PRE_BUFFER_MS / 1000;  // 4800
+        int16_t* pre_buf = (int16_t*)heap_caps_malloc(PRE_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_8BIT);
+        if (!pre_buf) { pre_buf = pcm; /* fallback: no pre-buffer */ }
+        int pre_buf_write = 0;
+        int pre_buf_count = 0;
+
+        while (!speech_detected && xTaskGetTickCount() < deadline) {
+            if (wait_speech_ms >= SPEECH_WAIT_TIMEOUT_MS) {
+                printf("[STREAM] No speech after %dms — giving up\n", wait_speech_ms); fflush(stdout);
+                break;
+            }
+            if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+                vTaskDelay(pdMS_TO_TICKS(10)); continue;
+            }
+            int avail = (int)ring_write_pos - last_pos;
+            if (avail < 0) avail += AUDIO_BUFFER_SAMPLES;
+            if (avail < CHUNK) { xSemaphoreGive(ring_mutex); vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+            for (int i = 0; i < CHUNK; i++) {
+                pcm[i] = audio_ring[last_pos];
+                last_pos = (last_pos + 1) % AUDIO_BUFFER_SAMPLES;
+            }
+            xSemaphoreGive(ring_mutex);
+
+            // Check RMS for speech
+            int64_t sq = 0;
+            for (int i = 0; i < CHUNK; i++) sq += (int64_t)pcm[i] * pcm[i];
+            float crms = sqrtf((float)sq / CHUNK) / 32768.0f;
+            float sil_thr = fmaxf(0.015f, telemetry_noise_floor_rms * 2.5f);
+
+            if (crms >= sil_thr) {
+                speech_detected = true;
+                printf("[STREAM] Speech detected! rms=%.4f thr=%.4f after %dms\n",
+                       (double)crms, (double)sil_thr, wait_speech_ms); fflush(stdout);
+            } else {
+                // Store in circular pre-buffer
+                for (int i = 0; i < CHUNK; i++) {
+                    pre_buf[pre_buf_write] = pcm[i];
+                    pre_buf_write = (pre_buf_write + 1) % PRE_BUF_SAMPLES;
+                }
+                if (pre_buf_count < PRE_BUF_SAMPLES) pre_buf_count += CHUNK;
+                wait_speech_ms += CHUNK * 1000 / I2S_SAMPLE_RATE;
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+        }
+
+        if (!speech_detected) {
+            // No speech — go back to listening
+            set_streaming_active(false, "no_speech");
+            if (pre_buf && pre_buf != pcm) heap_caps_free(pre_buf);
+            g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
+            g_sys_state = SYS_LISTENING;
+            g_disp_state = DISP_LISTENING;
+            gpio_set_level(LED_PIN, 0);
+            continue;
+        }
+
+        // ── Phase 2: Connect to server and stream command ──────────────────
+        g_disp_state = DISP_STREAMING;
+        printf("[STREAM] Connecting to server...\n"); fflush(stdout);
+
         int sock = -1; uint32_t kw_ms = 0, backoff_ms = 200;
         for (int attempt = 0; attempt < 4; attempt++) {
             struct sockaddr_in srv = {};
             srv.sin_family = AF_INET; srv.sin_port = htons(CONFIG_SERVER_PORT);
-            inet_pton(AF_INET, g_server_ip, &srv.sin_addr);  // from NVS / portal
+            inet_pton(AF_INET, g_server_ip, &srv.sin_addr);
             sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
             if (sock < 0) { vTaskDelay(pdMS_TO_TICKS(backoff_ms)); backoff_ms *= 2; continue; }
             int f = 1; setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
@@ -1055,7 +1133,7 @@ static void streaming_task(void* arg) {
             g_sys_state    = SYS_LISTENING;
             g_disp_state = DISP_LISTENING;
             gpio_set_level(LED_PIN, 0);
-            wifi_stop(); continue;
+            continue;
         }
 
         hvp1_header_t hdr = { .magic = MAGIC_NUMBER, .sample_rate = I2S_SAMPLE_RATE,
@@ -1070,7 +1148,6 @@ static void streaming_task(void* arg) {
             }
         }
 
-        // ── AES-128-CTR session setup ────────────────────────────────────
 #if ENABLE_AES
         uint8_t aes_nonce[16] = {0};
         uint8_t aes_stream_blk[16] = {0};
@@ -1093,19 +1170,39 @@ static void streaming_task(void* arg) {
         }
 #endif
 
-        const int  CHUNK = 480; int16_t pcm[CHUNK];
-        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
-        int total_sent = 0, streamed_ms = 0, consec_silence_ms = 0;
+        // ── Phase 3: Stream pre-buffer + live audio ────────────────────────
+        printf("[STREAM] Sending pre-buffer (%d samples) + streaming...\n", pre_buf_count); fflush(stdout);
 
-        set_streaming_active(true, "keyword_detected");
-        g_disp_state = DISP_STREAMING;
+        // Send pre-buffer first (speech context)
+        if (pre_buf_count > 0) {
+            int pre_start = (pre_buf_write - pre_buf_count + PRE_BUF_SAMPLES) % PRE_BUF_SAMPLES;
+            int remaining = pre_buf_count;
+            while (remaining > 0) {
+                int batch = remaining < CHUNK ? remaining : CHUNK;
+                uint8_t* pp = (uint8_t*)&pre_buf[pre_start];
+                size_t pl = batch * sizeof(int16_t);
+                pre_start = (pre_start + batch) % PRE_BUF_SAMPLES;
+                remaining -= batch;
+                ssize_t n = send(sock, pp, pl, 0);
+                if (n < 0) break;
+                total_sent += batch;
+            }
+        }
 
-        int last_pos = g_stream_start_pos;
-        printf("[STREAM] started last_pos=%d ring_wp=%d\n", last_pos, (int)ring_write_pos); fflush(stdout);
+        // Now stream live audio (current chunk that triggered speech + subsequent)
+        // The pcm buffer already has the speech-triggering chunk
+        {
+            uint8_t* pp = (uint8_t*)pcm; size_t pl = CHUNK * sizeof(int16_t);
+            ssize_t n = send(sock, pp, pl, 0);
+            if (n > 0) total_sent += CHUNK;
+        }
+
+        deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
+        consec_silence_ms = 0;
+        streamed_ms = pre_buf_count * 1000 / I2S_SAMPLE_RATE + CHUNK * 1000 / I2S_SAMPLE_RATE;
 
         while (xTaskGetTickCount() < deadline) {
             if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-                printf("[MUTEX-TIMEOUT] streaming_task: ring_mutex >50ms\n"); fflush(stdout);
                 vTaskDelay(pdMS_TO_TICKS(10)); continue;
             }
             int avail = (int)ring_write_pos - last_pos;
@@ -1121,18 +1218,8 @@ static void streaming_task(void* arg) {
                 uint8_t* pp = (uint8_t*)pcm; size_t pl = CHUNK * sizeof(int16_t); bool se = false;
 
 #if ENABLE_AES
-                // Encrypt chunk in-place using AES-128-CTR
-                // mbedtls_aes_crypt_ctr maintains aes_nc_off + aes_stream_blk across calls,
-                // so the keystream continues seamlessly across all chunks.
                 static uint8_t enc_buf[CHUNK * sizeof(int16_t)];
-                esp_aes_crypt_ctr(&aes_ctx,
-                                  pl,
-                                  &aes_nc_off,
-                                  aes_nonce,
-                                  aes_stream_blk,
-                                  pp,          // plaintext in
-                                  enc_buf);    // ciphertext out
-
+                esp_aes_crypt_ctr(&aes_ctx, pl, &aes_nc_off, aes_nonce, aes_stream_blk, pp, enc_buf);
                 uint8_t* send_ptr = enc_buf; size_t send_len = pl;
 #else
                 uint8_t* send_ptr = pp; size_t send_len = pl;
@@ -1254,6 +1341,7 @@ static void streaming_task(void* arg) {
         // Start cooldown: inference stays gated for COOLDOWN_MS to prevent
         // re-trigger loops.  The OLED shows "Listening" immediately so the
         // user knows the system is ready again after the cooldown expires.
+        if (pre_buf && pre_buf != pcm) heap_caps_free(pre_buf);
         g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
         g_sys_state    = SYS_LISTENING;
         g_disp_state   = DISP_LISTENING;
