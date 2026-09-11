@@ -21,7 +21,7 @@ export default function BreakdownDonut({ events }) {
   const segments = [
     { label: 'kw→connect (ESP32)', value: kw,  pct: kwP,  color: '#a78bfa' },
     { label: 'rcv gap (server)',    value: rcv, pct: rcvP, color: '#00c8ff' },
-    { label: 'transcribe (Whisper)',value: txc, pct: txcP, color: '#0a84ff' },
+    { label: 'transcribe (Vosk)',value: txc, pct: txcP, color: '#0a84ff' },
   ]
 
   const data = {

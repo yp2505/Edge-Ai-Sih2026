@@ -11,7 +11,7 @@ import LogTerminal from './components/LogTerminal.jsx'
 import { IconWaveform, IconReport, IconCpu, IconTrendChart } from './components/Icons.jsx'
 import './App.css'
 
-const API = 'http://localhost:8080'
+const API = import.meta.env.VITE_API_URL || ''
 
 export default function App() {
   const [events, setEvents] = useState([])

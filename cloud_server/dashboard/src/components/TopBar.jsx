@@ -4,7 +4,7 @@ import styles from './TopBar.module.css'
 const PAGE_TITLES = {
   overview: { title: 'Detection Overview', sub: 'Monitor wake-word activations, latency and ASR transcripts in real time' },
   livefeed: { title: 'Live Detection Feed', sub: 'Streaming wake-word events from ESP32 as they happen' },
-  latency:  { title: 'Latency Analytics',   sub: 'End-to-end breakdown: kw→connect, receive gap, Whisper transcription' },
+  latency:  { title: 'Latency Analytics',   sub: 'End-to-end breakdown: kw→connect, receive gap, Vosk transcription' },
   device:   { title: 'Device Specs',         sub: 'ESP32-S3 hardware configuration and model efficiency metrics' },
   reports:  { title: 'Reports',              sub: 'Session summaries and downloadable logs' },
   settings: { title: 'Settings',             sub: 'Configure API endpoint, model specs and display preferences' },

@@ -4,7 +4,7 @@ import { IconCpu, IconWifi, IconSatellite, IconTrendChart } from './Icons.jsx'
 const STEPS = [
   { key: 'tx',  label: 'Wake to Server', sub: 'ESP32 → Wi-Fi', color: 'var(--cyan)', icon: IconWifi },
   { key: 'rx',  label: 'First Audio Byte', sub: 'Server receive',  color: 'var(--ice)',  icon: IconSatellite },
-  { key: 'asr', label: 'Whisper ASR',     sub: 'Server CPU',       color: 'var(--teal)', icon: IconCpu },
+  { key: 'asr', label: 'Vosk ASR',      sub: 'Server CPU',       color: 'var(--teal)', icon: IconCpu },
 ]
 
 function Sparkline({ events }) {
@@ -57,7 +57,7 @@ export default function PipelinePanel({ latestEvent, events }) {
       <div className="pipeline-e2e">
         <div>
           <div className="pipeline-e2e-label">End-to-End Latency</div>
-          <div className="pipeline-e2e-sub">Wake → Wi-Fi → Audio → Whisper</div>
+          <div className="pipeline-e2e-sub">Wake → Wi-Fi → Audio → Vosk</div>
         </div>
         <div className="pipeline-e2e-value" style={{
           color: active ? totalColor : 'var(--t4)',

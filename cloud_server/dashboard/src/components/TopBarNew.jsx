@@ -29,7 +29,7 @@ export default function TopBarNew({ health, serverUp, totalEvents, onSettingsCli
   const stats = [
     { label: 'Queries', value: totalEvents, color: 'var(--cyan)' },
     { label: 'Uptime', value: serverUp ? upStr : '—', color: 'var(--ice)' },
-    { label: 'Model', value: 'Whisper tiny', color: 'var(--t1)' },
+    { label: 'Model', value: 'Vosk ASR', color: 'var(--t1)' },
     { label: 'ESP32', value: serverUp ? 'Connected' : 'Waiting', color: serverUp ? 'var(--green)' : 'var(--t4)' },
   ]
 

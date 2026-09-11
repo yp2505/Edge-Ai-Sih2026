@@ -50,9 +50,9 @@ static const char* TAG = "PROV";
 #define AP_IP_STR   "192.168.4.1"
 
 // ─── Exported globals ────────────────────────────────────────────────────────
-char g_wifi_ssid[PROV_SSID_MAX] = "Patel divy's S24 FE";
-char g_wifi_pass[PROV_PASS_MAX] = "divypatel2712";
-char g_server_ip[PROV_IP_MAX]   = "10.62.113.173";
+char g_wifi_ssid[PROV_SSID_MAX] = "Khush's A55";
+char g_wifi_pass[PROV_PASS_MAX] = "khush2073";
+char g_server_ip[PROV_IP_MAX]   = "13.233.154.18";
 
 
 // ─── Setup portal HTML ───────────────────────────────────────────────────────
@@ -433,12 +433,7 @@ static void prov_start_portal(void) {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 void wifi_provision_init(void) {
-    if (nvs_load_credentials()) {
-        ESP_LOGI(TAG, "NVS OK: SSID='%s'  server=%s", g_wifi_ssid, g_server_ip);
-        return;   // wifi_start() in main.cpp handles the actual connection
-    }
-    // No NVS credentials stored → fallback to hardcoded default hotspot
-    ESP_LOGI(TAG, "Provisioning skipped — credentials already in NVS");
-    // Ensure NVS has the exact same credentials (useful if formats upgraded)
+    // Always save hardcoded credentials to NVS
     wifi_provision_save(g_wifi_ssid, g_wifi_pass, g_server_ip);
+    ESP_LOGI(TAG, "NVS OK: SSID='%s'  server=%s", g_wifi_ssid, g_server_ip);
 }

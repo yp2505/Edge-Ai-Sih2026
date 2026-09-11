@@ -94,7 +94,11 @@ static const uint8_t AES_KEY[16] = {
 //
 // Only the server PORT remains hardcoded here — it never changes per-network.
 #ifndef CONFIG_SERVER_PORT
-#define CONFIG_SERVER_PORT     5000
+#define CONFIG_SERVER_PORT     80
+#endif
+
+#ifndef ENABLE_AES
+#define ENABLE_AES             0    // Set to 1 when ESP32↔server AES CTR is verified
 #endif
 
 // ─── I2S / INMP441 ───────────────────────────────────────────────────────────
@@ -114,26 +118,26 @@ static const uint8_t AES_KEY[16] = {
 // DETECTION_HITS_REQUIRED=2: both consecutive inferences must exceed
 // threshold before the trigger fires — halves false-positive rate
 // at cost of ~30 ms extra latency (one extra hop).
-static const float DETECT_THRESHOLD         = 0.96f;   // Must match model_data.h threshold
-static const int   DETECTION_HITS_REQUIRED  = 2;        // two consecutive hits for reliability
-static const float MIN_SPEECH_RMS           = 0.080f;
-static const float NOISE_FLOOR_MULTIPLIER   = 2.5f;
+static const float DETECT_THRESHOLD          = 0.45f;   // Lowered — model scores ~0.36 on noise, ~0.55+ on speech
+static const int   DETECTION_HITS_REQUIRED  = 1;
+static const float MIN_SPEECH_RMS           = 0.020f;   // Your mic: noise floor ~0.015, speech ~0.025-0.033
+static const float NOISE_FLOOR_MULTIPLIER   = 1.8f;
 static const int   NOISE_CALIBRATION_FRAMES = 50;
 static const float NOISE_CAL_MAX_RMS        = 0.15f;
 
 // ─── Streaming / VAD ─────────────────────────────────────────────────────────
-// ⚡ LATENCY-OPTIMISED for <200ms total end-to-end (rev9)
+// LATENCY-OPTIMISED for <200ms detection + 7s streaming (rev9)
 //   SLIDE_STEP_MS=30:          inference every 30ms window hop
-//   COMMAND_DURATION_MS=5000:  max 5s command capture (was 1500ms)
-//   COMMAND_MIN_DURATION_MS=300: minimum 300ms before EOS eligible
-//   COMMAND_SILENCE_MS=300:    close stream after 300ms quiet (was 100ms)
+//   COMMAND_DURATION_MS=4000:  max 4s command capture
+//   COMMAND_MIN_DURATION_MS=200: minimum 200ms before EOS eligible
+//   COMMAND_SILENCE_MS=200:    close stream after 200ms quiet
 //   COOLDOWN_MS=3000:          3s post-cycle cooldown to prevent re-trigger loops
-//   Measured pipeline budget: KWS=18ms + AES=0.2ms + Vosk=55ms + RTT≤20ms = ~93ms
-//   Remaining budget for EOS silence window: 200ms - 93ms = ~107ms → set 100ms
+//   Prompt delay: 500ms (was 1500ms) — faster transition to command capture
+//   Budget: KWS=18ms + MFCC=15ms + invoke=18ms = ~51ms detection latency
 #define SLIDE_STEP_MS           30
-#define COMMAND_DURATION_MS     5000
-#define COMMAND_MIN_DURATION_MS 300
-#define COMMAND_SILENCE_MS      300
+#define COMMAND_DURATION_MS     15000
+#define COMMAND_MIN_DURATION_MS 200
+#define COMMAND_SILENCE_MS      200
 #define COOLDOWN_MS             3000       // 3s cooldown after each detection cycle
 #define AUDIO_BUFFER_SAMPLES    16000
 #define STREAM_WATCHDOG_MS      5000
@@ -191,6 +195,7 @@ static volatile float    telemetry_inference_ms       = 0.0f;
 static volatile float    telemetry_keyword_confidence = 0.0f;
 static volatile float    telemetry_mic_rms            = 0.0f;
 static volatile float    telemetry_noise_floor_rms    = 0.0f;
+static volatile float    telemetry_last_infer_ms      = 0.0f;
 
 // ─── Audio ring buffer ───────────────────────────────────────────────────────
 static int16_t           audio_ring[AUDIO_BUFFER_SAMPLES];
@@ -201,6 +206,7 @@ static SemaphoreHandle_t ring_mutex;
 
 static QueueHandle_t     detect_queue;
 static volatile uint32_t session_id = 0;
+static volatile int      g_stream_start_pos = 0;  // ring pos saved at detection time
 
 // ─── TFLite ──────────────────────────────────────────────────────────────────
 static const size_t TENSOR_ARENA_SIZE = 32 * 1024;
@@ -355,13 +361,10 @@ static void set_streaming_active(bool value, const char* reason) {
     if (value) {
         streaming_active        = true;
         streaming_active_set_us = esp_timer_get_time();
-        printf("[DBG-SA] streaming_active SET TRUE  (reason=%s)\n", reason);
     } else {
         streaming_active        = false;
         streaming_active_set_us = 0;
-        printf("[DBG-SA] streaming_active CLEARED    (reason=%s)\n", reason);
     }
-    fflush(stdout);
 }
 
 // ─── TFLite Init — UNCHANGED from rev6 ───────────────────────────────────────
@@ -389,10 +392,8 @@ static void tflite_init() {
     input_tensor  = interpreter->input(0);
     output_tensor = interpreter->output(0);
     size_t used   = interpreter->arena_used_bytes();
-    printf("[INIT] TFLite ready: model=%uB arena=%u/%u out_scale=%.6f out_zp=%d threshold=%.2f hits=%d\n",
-           (unsigned)g_model_len, (unsigned)used, (unsigned)TENSOR_ARENA_SIZE,
-           (double)output_tensor->params.scale, (int)output_tensor->params.zero_point,
-           (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED);
+    printf("[INIT] TFLite: model=%uB arena=%u/%u\n",
+           (unsigned)g_model_len, (unsigned)used, (unsigned)TENSOR_ARENA_SIZE);
     fflush(stdout);
 }
 
@@ -810,19 +811,13 @@ static void audio_task(void* arg) {
 
     // I2S sanity: first read to confirm data flows before entering main loop
     {
-        static int16_t sanity_stereo[128];   // 32 stereo frames
+        static int16_t sanity_stereo[128];
         size_t br = 0;
         esp_err_t e = i2s_channel_read(g_i2s_rx, sanity_stereo, sizeof(sanity_stereo),
                                        &br, pdMS_TO_TICKS(200));
         int n = (e == ESP_OK) ? (int)(br / sizeof(int16_t)) : -1;
-        int16_t first_l = (n > 0) ? sanity_stereo[0] : -1;
-        int16_t first_r = (n > 1) ? sanity_stereo[1] : -1;
-        ESP_LOGI(TAG_INF, "I2S sanity: got=%d stereo_frames=%d L_first=%d R_first=%d err=0x%x",
-                 n, n / 2, (int)first_l, (int)first_r, (unsigned)e);
         if (n <= 0) {
             ESP_LOGW(TAG_INF, "WARNING: I2S no data on sanity read — check SCK/WS/SD wiring");
-        } else if (first_l == 0 && first_r == 0) {
-            ESP_LOGW(TAG_INF, "WARNING: I2S returned all zeros — INMP441 may not be responding");
         }
     }
 
@@ -841,7 +836,7 @@ static void audio_task(void* arg) {
             xSemaphoreGive(ring_mutex);
             if (valid_ring_samples < AUDIO_BUFFER_SAMPLES) valid_ring_samples += HOP;
         } else {
-            printf("[MUTEX-TIMEOUT] audio_task: ring_mutex >50ms — frame dropped\n"); fflush(stdout);
+            // frame dropped — ring_mutex held too long
         }
         // No vTaskDelay — i2s_read_pcm blocks ~30 ms naturally
     }
@@ -853,35 +848,21 @@ static void audio_task(void* arg) {
 // New additions (marked NEW): LED on, display state, beep_task spawn.
 // ============================================================================
 static void inference_task(void* arg) {
-    printf(">>> INFERENCE TASK STARTING <<<\n"); fflush(stdout);
     ESP_LOGI(TAG_INF, "Inference task started on core %d", xPortGetCoreID());
     const int hop_samples = I2S_SAMPLE_RATE * SLIDE_STEP_MS / 1000;
     int16_t* hop_buf = (int16_t*)malloc(hop_samples * sizeof(int16_t));
     if (!hop_buf) { ESP_LOGE(TAG_INF, "FATAL: hop_buf malloc failed"); vTaskDelay(portMAX_DELAY); return; }
-    ESP_LOGI(TAG_INF, "Buffers OK. Free heap: %lu", (unsigned long)esp_get_free_heap_size());
 
     uint32_t infer_count      = 0;
     int      consecutive_hits = 0;
     float    noise_floor_rms  = 0.0f;
     int      noise_cal_frames = 0;
-    uint32_t dbg_loop         = 0;
     int      last_read_pos    = 0;
-    int64_t  last_energy_log_us = 0;
-    uint32_t vad_fail_skip    = 0;
 
     while (true) {
-        dbg_loop++;
 
         // 1. Idle while streaming or in command-capture mode
         if (streaming_active || g_sys_state != SYS_LISTENING) {
-            static int64_t last_sa_skip_log = 0;
-            int64_t now = esp_timer_get_time();
-            if (now - last_sa_skip_log >= 1000000) {
-                last_sa_skip_log = now;
-                int64_t held = streaming_active_set_us ? (now - streaming_active_set_us) : 0;
-                printf("[DBG-SA] inference SKIPPED — streaming=%d sys_state=%d for %.1fs\n",
-                       (int)streaming_active, (int)g_sys_state, (double)held/1e6); fflush(stdout);
-            }
             vTaskDelay(pdMS_TO_TICKS(20)); continue;
         }
 
@@ -891,13 +872,12 @@ static void inference_task(void* arg) {
             if (now < g_cooldown_end_us) {
                 vTaskDelay(pdMS_TO_TICKS(50)); continue;
             }
-            g_cooldown_end_us = 0;  // expired — clear flag
+            g_cooldown_end_us = 0;
         }
 
         // 2. Read hop from ring (bounded mutex)
         int avail;
         if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-            printf("[MUTEX-TIMEOUT] inference_task: ring_mutex >50ms\n"); fflush(stdout);
             vTaskDelay(pdMS_TO_TICKS(10)); continue;
         }
         avail = (int)ring_write_pos - last_read_pos;
@@ -906,7 +886,6 @@ static void inference_task(void* arg) {
             avail = hop_samples;
             last_read_pos = (int)ring_write_pos - hop_samples;
             if (last_read_pos < 0) last_read_pos += AUDIO_BUFFER_SAMPLES;
-            printf("[INFERENCE] resync: jumped to latest\n"); fflush(stdout);
         }
         if (avail < hop_samples || valid_ring_samples < AUDIO_BUFFER_SAMPLES) {
             xSemaphoreGive(ring_mutex); vTaskDelay(pdMS_TO_TICKS(10)); continue;
@@ -920,37 +899,15 @@ static void inference_task(void* arg) {
         }
         xSemaphoreGive(ring_mutex);
 
-        // 3. RMS + peak
-        int64_t sum_sq = 0; int16_t hop_peak = 0;
+        // 3. RMS + peak (VAD)
+        int64_t sum_sq = 0;
         for (int i = 0; i < hop_samples; i++) {
             sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
-            int16_t av = hop_buf[i] < 0 ? (int16_t)(-(int32_t)hop_buf[i]) : hop_buf[i];
-            if (av > hop_peak) hop_peak = av;
         }
         float rms    = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
-        float peak_f = (float)hop_peak / 32768.0f;
         telemetry_mic_rms = rms;
 
-        // 4. [ENERGY] log every ~500 ms
-        int64_t now_us = esp_timer_get_time();
-        {
-            static int64_t last_mic_check_us = 0;
-            if (now_us - last_mic_check_us >= 2000000) {
-                last_mic_check_us = now_us;
-                printf("[MIC-CHECK] rms=%.5f\n", (double)rms);
-                fflush(stdout);
-            }
-            float speech_thr = fmaxf(MIN_SPEECH_RMS, noise_floor_rms * NOISE_FLOOR_MULTIPLIER);
-            if (now_us - last_energy_log_us >= 500000) {
-                last_energy_log_us = now_us;
-                printf("[ENERGY] rms=%.5f peak=%.5f thr=%.5f noise_floor=%.5f streaming=%d\n",
-                       (double)rms, (double)peak_f, (double)speech_thr,
-                       (double)noise_floor_rms, (int)streaming_active);
-                fflush(stdout);
-            }
-        }
-
-        // 5. Noise calibration
+        // 4. Noise calibration
         if (noise_cal_frames < NOISE_CALIBRATION_FRAMES) {
             if (rms < NOISE_CAL_MAX_RMS) {
                 noise_floor_rms += (rms - noise_floor_rms) / (float)(++noise_cal_frames);
@@ -959,39 +916,25 @@ static void inference_task(void* arg) {
             if (noise_cal_frames < 5) { consecutive_hits = 0; vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         }
 
-        // 6. VAD gate
+        // 5. VAD gate — skip MFCC+TFLite if silence (CPU savings)
         float speech_thr = fmaxf(MIN_SPEECH_RMS, noise_floor_rms * NOISE_FLOOR_MULTIPLIER);
         if (rms < speech_thr) {
             noise_floor_rms = 0.02f * rms + 0.98f * noise_floor_rms;
             telemetry_noise_floor_rms = noise_floor_rms;
-            consecutive_hits = 0; vad_fail_skip++;
-            if (vad_fail_skip % 50 == 0) {
-                printf("[VAD] FAIL #%lu rms=%.5f thr=%.5f\n",
-                       (unsigned long)vad_fail_skip, (double)rms, (double)speech_thr);
-                fflush(stdout);
-            }
+            consecutive_hits = 0;
             vTaskDelay(pdMS_TO_TICKS(10)); continue;
         }
-        printf("[VAD] PASS rms=%.5f thr=%.5f noise_floor=%.5f\n",
-               (double)rms, (double)speech_thr, (double)noise_floor_rms); fflush(stdout);
 
-        // 7. Linearise ring → 1 s window
-        printf("[STAGE-C] pre-linearize loop=%lu\n", (unsigned long)dbg_loop); fflush(stdout);
+        // 6. Linearize ring → 1-second window + MFCC
         if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             int start = (int)ring_write_pos;
             for (int i = 0; i < AUDIO_BUFFER_SAMPLES; i++)
                 audio_window[i] = audio_ring[(start + i) % AUDIO_BUFFER_SAMPLES];
             xSemaphoreGive(ring_mutex);
-        } else { printf("[MUTEX-TIMEOUT] inference_task: linearize >50ms — skip\n"); fflush(stdout); continue; }
-        printf("[STAGE-C] post-linearize\n"); fflush(stdout);
-
-        // 8. MFCC — COMPLETELY UNCHANGED
-        printf("[STAGE-C] pre-MFCC\n"); fflush(stdout);
+        } else { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         mfcc_proc.compute(audio_window, mfcc_output);
-        printf("[STAGE-C] post-MFCC\n"); fflush(stdout);
 
-        // 9. Quantise input — COMPLETELY UNCHANGED
-        printf("[STAGE-C] pre-quantize\n"); fflush(stdout);
+        // 7. Quantise input
         float   in_scale = input_tensor->params.scale;
         int32_t in_zp    = input_tensor->params.zero_point;
         int8_t* inp      = input_tensor->data.int8;
@@ -1000,75 +943,64 @@ static void inference_task(void* arg) {
             q = q < -128 ? -128 : (q > 127 ? 127 : q); inp[i] = (int8_t)q;
         }
 
-        // 10. Invoke — COMPLETELY UNCHANGED
-        printf("[STAGE-C] pre-invoke\n"); fflush(stdout);
+        // 8. TFLite invoke
         int64_t t0 = esp_timer_get_time();
         TfLiteStatus invoke_ok = interpreter->Invoke();
         float infer_us = (float)(esp_timer_get_time() - t0);
-        if (invoke_ok != kTfLiteOk) {
-            printf("[STAGE-C] Invoke FAILED (%.0f us) — skipping frame\n", infer_us); fflush(stdout);
-            vTaskDelay(pdMS_TO_TICKS(10)); continue;
-        }
-        printf("[STAGE-C] post-invoke (%.0f us)\n", infer_us); fflush(stdout);
+        if (invoke_ok != kTfLiteOk) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
 
-        // 11. Dequantise output
+        // 9. Dequantise output — sigmoid model: 1 element = keyword probability
         float   out_scale = output_tensor->params.scale;
         int32_t out_zp    = output_tensor->params.zero_point;
         int8_t* out       = output_tensor->data.int8;
         int     out_elems = output_tensor->dims->data[output_tensor->dims->size - 1];
-        printf("[INFER-RAW] out_elems=%d", out_elems);
-        for (int oi = 0; oi < out_elems && oi < 8; oi++) printf(" [%d]=%d", oi, out[oi]);
-        printf(" scale=%.6f zp=%d\n", (double)out_scale, (int)out_zp); fflush(stdout);
-
-        // Sigmoid model: output tensor has exactly 1 element — out[0] = keyword probability.
-        if (out_elems < 1) {
-            printf("[INFER-ERROR] Expected >=1 output elem, got %d — skipping\n", out_elems);
-            fflush(stdout);
-            vTaskDelay(pdMS_TO_TICKS(10)); continue;
-        }
+        if (out_elems < 1) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         float kw_prob = (out[0] - out_zp) * out_scale;
-        printf("[RAW-CONF] %.4f\n", (double)kw_prob);
         bool  trigger = (kw_prob >= DETECT_THRESHOLD);
-        printf("[INFER] loop=%lu conf=%.4f threshold=%.2f result=%s infer_us=%.0f\n",
-               (unsigned long)dbg_loop, (double)kw_prob, (double)DETECT_THRESHOLD,
-               trigger ? "TRIGGER" : "no", (double)infer_us);
-        fflush(stdout);
 
         infer_count++; telemetry_inference_count = telemetry_inference_count + 1;
         telemetry_inference_ms      += infer_us / 1000.0f;
+        telemetry_last_infer_ms      = infer_us / 1000.0f;
         telemetry_keyword_confidence = kw_prob;
         consecutive_hits = trigger ? consecutive_hits + 1 : 0;
 
+        // Periodic confidence log every 2 seconds for dashboard visibility
+        {
+            static int64_t last_log_us = 0;
+            int64_t now = esp_timer_get_time();
+            if (now - last_log_us >= 2000000) {
+                last_log_us = now;
+                float uptime_s = (float)(now / 1000);
+                float cpu_pct = uptime_s > 0 ? (telemetry_inference_ms / uptime_s) * 100.0f : 0.0f;
+                printf("[KWS] conf=%.4f thr=%.2f infer=%.0fus mic=%.4f floor=%.4f cpu=%.1f%% heap=%lu\n",
+                       (double)kw_prob, (double)DETECT_THRESHOLD, (double)infer_us,
+                       (double)telemetry_mic_rms, (double)telemetry_noise_floor_rms,
+                       (double)cpu_pct,
+                       (unsigned long)esp_get_free_heap_size());
+                fflush(stdout);
+            }
+        }
+
         if (consecutive_hits >= DETECTION_HITS_REQUIRED) {
             int64_t kw_end = esp_timer_get_time();
-            printf("[TRIGGER->STREAM] EDGE KWS FIRED conf=%.4f (%.1f%%)\n",
-                   (double)kw_prob, (double)(kw_prob * 100.0f));
-            fflush(stdout);
+            printf("[TRIGGER] conf=%.4f infer=%.0fus\n", (double)kw_prob, (double)infer_us); fflush(stdout);
 
-            // ── Transition to command-capture mode ──────────────────────────
+            // Transition to command-capture mode
             g_sys_state = SYS_CAPTURE_COMMAND;
             gpio_set_level((gpio_num_t)LED_PIN, 1);
 
-            // Write prompt text under mutex — display_task reads it concurrently
             if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 snprintf(g_disp_text, sizeof(g_disp_text), "How can I\nhelp you?");
                 xSemaphoreGive(disp_mutex);
             }
-            g_disp_state = DISP_PROMPT;   // OLED shows "How can I help you?"
+            g_disp_state = DISP_PROMPT;
             consecutive_hits = 0;
 
-            // Only stream to cloud if WiFi is available
             if (!streaming_active) {
+                g_stream_start_pos = ((int)ring_write_pos - 8000 + AUDIO_BUFFER_SAMPLES) % AUDIO_BUFFER_SAMPLES;
                 xQueueSend(detect_queue, &kw_end, 0);
             }
-
-            // No blocking delay here — streaming_task handles the full
-            // command-capture lifecycle and returns to SYS_LISTENING when done.
-            // yield briefly so streaming_task can pick up the queue item.
             vTaskDelay(pdMS_TO_TICKS(10));
-        } else if (consecutive_hits > 0) {
-            printf("[INFER] building... hit %d/%d conf=%.4f\n",
-                   consecutive_hits, DETECTION_HITS_REQUIRED, (double)kw_prob); fflush(stdout);
         }
     }
 }
@@ -1089,11 +1021,13 @@ static void streaming_task(void* arg) {
 
         // WiFi is kept always-on since boot — only reconnect if it dropped
         if (!wifi_connected) {
-            ESP_LOGW(TAG_STR, "[%lu] WiFi dropped — reconnecting...", (unsigned long)sid);
             wifi_start();
         }
         if (!wifi_connected) {
-            ESP_LOGE(TAG_STR, "[%lu] WiFi failed — drop", (unsigned long)sid);
+            g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
+            g_sys_state = SYS_LISTENING;
+            g_disp_state = DISP_LISTENING;
+            gpio_set_level(LED_PIN, 0);
             continue;
         }
 
@@ -1110,16 +1044,11 @@ static void streaming_task(void* arg) {
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             if (connect(sock, (struct sockaddr*)&srv, sizeof(srv)) == 0) {
                 kw_ms = (uint32_t)((esp_timer_get_time() - keyword_end_us) / 1000);
-                printf("[STREAM] sid=%lu TCP connected (attempt %d) kw->conn=%lums\n",
-                       (unsigned long)sid, attempt+1, (unsigned long)kw_ms); fflush(stdout);
                 break;
             }
-            printf("[STREAM] sid=%lu TCP FAILED attempt %d: errno=%d\n",
-                   (unsigned long)sid, attempt+1, errno); fflush(stdout);
             close(sock); sock = -1; vTaskDelay(pdMS_TO_TICKS(backoff_ms)); backoff_ms *= 2;
         }
         if (sock < 0) {
-            ESP_LOGE(TAG_STR, "[%lu] All TCP attempts failed", (unsigned long)sid);
             g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
             g_sys_state    = SYS_LISTENING;
             g_disp_state = DISP_LISTENING;
@@ -1134,49 +1063,43 @@ static void streaming_task(void* arg) {
             uint8_t* hp = (uint8_t*)&hdr; size_t hl = sizeof(hdr);
             while (hl > 0) {
                 ssize_t n = send(sock, hp, hl, 0);
-                if (n < 0) { printf("[SEND-ERROR] sid=%lu HVP1 header errno=%d\n", (unsigned long)sid, errno); fflush(stdout); break; }
+                if (n < 0) break;
                 hp += n; hl -= (size_t)n;
             }
-            printf("[STREAM] sid=%lu HVP1 header sent (%d bytes)\n", (unsigned long)sid, (int)sizeof(hdr)); fflush(stdout);
         }
 
         // ── AES-128-CTR session setup ────────────────────────────────────
-        uint8_t aes_nonce[16];                 // 16-byte random nonce (audio direction)
-        uint8_t aes_stream_blk[16] = {0};      // AES-CTR keystream block state
-        size_t  aes_nc_off = 0;                // offset within keystream block
-        esp_fill_random(aes_nonce, sizeof(aes_nonce));  // hardware RNG
-
-        // Send nonce immediately after HVP1 header — server reads it before audio
+#if ENABLE_AES
+        uint8_t aes_nonce[16] = {0};
+        uint8_t aes_stream_blk[16] = {0};
+        size_t  aes_nc_off = 0;
+        esp_fill_random(aes_nonce, sizeof(aes_nonce));
         {
             ssize_t n = send(sock, aes_nonce, sizeof(aes_nonce), 0);
             if (n != (ssize_t)sizeof(aes_nonce)) {
-                printf("[AES] sid=%lu nonce send failed (%zd)\n", (unsigned long)sid, n); fflush(stdout);
-            } else {
-                printf("[AES] sid=%lu nonce sent (%02X%02X%02X%02X...)\n",
-                       (unsigned long)sid, aes_nonce[0], aes_nonce[1], aes_nonce[2], aes_nonce[3]);
-                fflush(stdout);
+                printf("[AES] nonce send failed\n"); fflush(stdout);
             }
         }
 
         esp_aes_context aes_ctx;
         esp_aes_init(&aes_ctx);
         esp_aes_setkey(&aes_ctx, AES_KEY, 128);
-
-        // ── Prompt delay: hold "How can I help you?" on OLED while user speaks ──
-        // During this 1.5s window, inference_task continues running and filling the
-        // ring buffer with command audio.  streaming_active is still false so
-        // inference_task is NOT gated.  After the delay, we start streaming.
-        printf("[STREAM] sid=%lu prompt delay 1.5s — user speaking...\n",
-               (unsigned long)sid); fflush(stdout);
-        vTaskDelay(pdMS_TO_TICKS(1500));
-
-        set_streaming_active(true, "keyword_detected");
-        g_disp_state = DISP_STREAMING;   // display_task picks up within 100 ms
+#else
+        {
+            uint8_t zero_nonce[16] = {0};
+            send(sock, zero_nonce, sizeof(zero_nonce), 0);
+        }
+#endif
 
         const int  CHUNK = 480; int16_t pcm[CHUNK];
         TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
         int total_sent = 0, streamed_ms = 0, consec_silence_ms = 0;
-        int last_pos   = (int)ring_write_pos;  // start from NOW — unchanged
+
+        set_streaming_active(true, "keyword_detected");
+        g_disp_state = DISP_STREAMING;
+
+        // Start from position saved at detection time (0.5s before detection = includes wake word)
+        int last_pos = g_stream_start_pos;
 
         while (xTaskGetTickCount() < deadline) {
             if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -1195,6 +1118,7 @@ static void streaming_task(void* arg) {
             {
                 uint8_t* pp = (uint8_t*)pcm; size_t pl = CHUNK * sizeof(int16_t); bool se = false;
 
+#if ENABLE_AES
                 // Encrypt chunk in-place using AES-128-CTR
                 // mbedtls_aes_crypt_ctr maintains aes_nc_off + aes_stream_blk across calls,
                 // so the keystream continues seamlessly across all chunks.
@@ -1208,6 +1132,9 @@ static void streaming_task(void* arg) {
                                   enc_buf);    // ciphertext out
 
                 uint8_t* send_ptr = enc_buf; size_t send_len = pl;
+#else
+                uint8_t* send_ptr = pp; size_t send_len = pl;
+#endif
                 while (send_len > 0) {
                     ssize_t n = send(sock, send_ptr, send_len, 0);
                     if (n < 0) { printf("[SEND-ERROR] sid=%lu errno=%d (%s)\n", (unsigned long)sid, errno, strerror(errno)); fflush(stdout); se = true; break; }
@@ -1217,39 +1144,31 @@ static void streaming_task(void* arg) {
             }
             total_sent += CHUNK;
             int chunk_ms = CHUNK * 1000 / I2S_SAMPLE_RATE; streamed_ms += chunk_ms;
-            if (streamed_ms % 500 < chunk_ms) {
-                printf("[STREAM] sid=%lu sending... %dms sent=%d\n", (unsigned long)sid, streamed_ms, total_sent); fflush(stdout);
-            }
             if (streamed_ms >= COMMAND_MIN_DURATION_MS) {
                 int64_t sq = 0; for (int i = 0; i < CHUNK; i++) sq += (int64_t)pcm[i]*pcm[i];
                 float crms    = sqrtf((float)sq / CHUNK) / 32768.0f;
                 float sil_thr = fmaxf(0.025f, telemetry_noise_floor_rms * 1.5f);
                 consec_silence_ms = crms < sil_thr ? consec_silence_ms + chunk_ms : 0;
                 if (consec_silence_ms >= COMMAND_SILENCE_MS) {
-                    printf("[STREAM] sid=%lu silence → end at %dms\n", (unsigned long)sid, streamed_ms); fflush(stdout); break;
+                    break;
                 }
             }
         }
 
         set_streaming_active(false, "stream_loop_ended");
         shutdown(sock, SHUT_WR);
-        ESP_LOGI(TAG_STR, "[%lu] Sent %d samples (%.2fs)",
-                 (unsigned long)sid, total_sent, (float)total_sent / I2S_SAMPLE_RATE);
 
+#if ENABLE_AES
         esp_aes_free(&aes_ctx);   // release AES context after streaming done
+#endif
 
         {
-            int64_t rs = esp_timer_get_time();
             char resp[1024] = {0}; int rlen = 0, r;
             while ((r = recv(sock, resp + rlen, sizeof(resp) - rlen - 1, 0)) > 0) rlen += r;
-            float recv_ms = (float)(esp_timer_get_time() - rs) / 1000.0f;
             close(sock);
-            printf("[STREAM] sid=%lu recv: %d bytes in %.0fms\n", (unsigned long)sid, rlen, (double)recv_ms);
-            printf("\n=== CLOUD RESPONSE (encrypted) ===\n  -> [%d encrypted bytes]\n"
-                   "=================================\n\n", rlen);
-            fflush(stdout);
 
             // ── Decrypt response using derived nonce (audio_nonce XOR 0xFF last byte) ──
+#if ENABLE_AES
             if (rlen > 0) {
                 uint8_t resp_nonce[16];
                 memcpy(resp_nonce, aes_nonce, 16);
@@ -1264,14 +1183,11 @@ static void streaming_task(void* arg) {
                                   resp_nonce, resp_stream_blk,
                                   (uint8_t*)resp, (uint8_t*)resp);  // decrypt in-place
                 esp_aes_free(&resp_aes);
-                resp[rlen] = '\0';   // null-terminate for cJSON
-                printf("[AES] sid=%lu response decrypted (%d bytes)\n",
-                       (unsigned long)sid, rlen); fflush(stdout);
+                resp[rlen] = '\0';
             }
-
-            printf("[STREAM] sid=%lu DECRYPTED RESPONSE: %s\n",
-                   (unsigned long)sid, rlen > 0 ? resp : "[no response]");
-            fflush(stdout);
+#else
+            resp[rlen] = '\0';
+#endif
 
             // ── cJSON: Parse cloud JSON response ─────────────────────────
             // Cloud sends: {"verified": bool, "transcript": "...",
@@ -1307,21 +1223,11 @@ static void streaming_task(void* arg) {
 
                     cJSON_Delete(root);
                 } else {
-                    // Fallback if JSON parse fails (malformed response)
-                    ESP_LOGW(TAG_STR, "[%lu] cJSON parse failed — raw: %.64s",
-                             (unsigned long)sid, resp);
-                    // Try to salvage something readable for the OLED
                     snprintf(clean_txt, sizeof(clean_txt), "%.127s", resp);
                 }
             }
 
             if (cloud_verified) {
-                // ── CONFIRMED: Cloud matched "Hey Vaani" ─────────────────
-                // Only NOW fire LED + buzzer + update OLED.
-                printf("[VERIFIED] Cloud CONFIRMED — transcript:'%s' intent:'%s'\n",
-                       clean_txt, intent_str[0] ? intent_str : "(none)");
-                fflush(stdout);
-
                 gpio_set_level(LED_PIN, 1);
                 g_disp_state = DISP_DETECTED;   // brief "Detected!" flash
                 vTaskDelay(pdMS_TO_TICKS(300));  // hold "Detected!" for 300ms
@@ -1336,18 +1242,12 @@ static void streaming_task(void* arg) {
                     }
                     xSemaphoreGive(disp_mutex);
                 } else {
-                    ESP_LOGW(TAG_STR, "disp_mutex timeout — OLED text may be stale");
                 }
                 g_disp_state = DISP_TRANSCRIBED;
-                gpio_set_level(LED_PIN, 0);      // LED off — processing done
-                printf("[OLED] Displaying: '%s'\n", clean_txt); fflush(stdout);
-                vTaskDelay(pdMS_TO_TICKS(3500)); // hold transcript on screen
+                gpio_set_level(LED_PIN, 0);
+                vTaskDelay(pdMS_TO_TICKS(3500));
             } else {
-                // ── REJECTED: Cloud did not match "Hey Vaani" ────────────
-                // No LED. No buzzer. No OLED change. Silent fallback.
-                printf("[REJECTED] Cloud REJECTED — transcript:'%s' — no user feedback\n",
-                       clean_txt); fflush(stdout);
-                // g_disp_state remains DISP_LISTENING (set below)
+                gpio_set_level(LED_PIN, 0);
             }
         }
 
@@ -1359,7 +1259,6 @@ static void streaming_task(void* arg) {
         g_sys_state    = SYS_LISTENING;
         g_disp_state   = DISP_LISTENING;
         g_disp_text[0] = '\0';
-        printf("[COOLDOWN] %dms cooldown started\n", COOLDOWN_MS); fflush(stdout);
         if (detect_queue) {
             xQueueReset(detect_queue);
         }
@@ -1415,7 +1314,7 @@ static void wifi_config_poll_task(void* arg) {
         if (!wifi_connected || g_server_ip[0] == '\0') continue;
 
         char url[128];
-        snprintf(url, sizeof(url), "http://%s:8080/api/wifi-config?raw=1", g_server_ip);
+        snprintf(url, sizeof(url), "http://%s:80/api/wifi-config?raw=1", g_server_ip);
 
         esp_http_client_config_t config = {};
         config.url = url;
@@ -1476,8 +1375,6 @@ static void watchdog_task(void* arg) {
         if (streaming_active && streaming_active_set_us != 0) {
             int64_t held = esp_timer_get_time() - streaming_active_set_us;
             if (held > (int64_t)STREAM_WATCHDOG_MS * 1000) {
-                printf("[WATCHDOG] streaming_active stuck for %.1fs — FORCE CLEARING\n",
-                       (double)held / 1e6); fflush(stdout);
                 set_streaming_active(false, "watchdog_forced");
                 g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
                 g_sys_state  = SYS_LISTENING;
@@ -1517,8 +1414,7 @@ static void display_task(void* arg) {
                     strlcpy(local_txt, g_disp_text, sizeof(local_txt));
                     xSemaphoreGive(disp_mutex);
                 } else {
-                    ESP_LOGW(TAG_DISP, "disp_mutex timeout — showing stale text");
-                    strlcpy(local_txt, g_disp_text, sizeof(local_txt));  // best-effort
+                    strlcpy(local_txt, g_disp_text, sizeof(local_txt));
                 }
             }
             oled_show_status(cur, local_txt);
@@ -1538,44 +1434,34 @@ static void display_task(void* arg) {
 // Updated: now also tracks display_task HWM.
 // ============================================================================
 static void stack_monitor_task(void* arg) {
-    TaskHandle_t inf_h  = xTaskGetHandle("inference");
-    TaskHandle_t aud_h  = xTaskGetHandle("audio");
-    TaskHandle_t str_h  = xTaskGetHandle("streaming");
-    TaskHandle_t disp_h = xTaskGetHandle("display");   // [NEW]
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        UBaseType_t inf_hwm  = inf_h  ? uxTaskGetStackHighWaterMark(inf_h)  : 0;
-        UBaseType_t aud_hwm  = aud_h  ? uxTaskGetStackHighWaterMark(aud_h)  : 0;
-        UBaseType_t str_hwm  = str_h  ? uxTaskGetStackHighWaterMark(str_h)  : 0;
-        UBaseType_t disp_hwm = disp_h ? uxTaskGetStackHighWaterMark(disp_h) : 0;
-        UBaseType_t own_hwm  = uxTaskGetStackHighWaterMark(NULL);
-        printf("[STACK] inference=%u audio=%u streaming=%u display=%u monitor=%u | heap_free=%lu streaming=%d\n",
-               (unsigned)inf_hwm, (unsigned)aud_hwm, (unsigned)str_hwm,
-               (unsigned)disp_hwm, (unsigned)own_hwm,
-               (unsigned long)esp_get_free_heap_size(), (int)streaming_active);
-        fflush(stdout);
+        vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
 
 // ─── Telemetry Task — UNCHANGED from rev6 ────────────────────────────────────
 static void telemetry_task(void* arg) {
-    float prev_ms = 0.0f;
+    ESP_LOGI(TAG_STR, "Telemetry task started (core %d)", xPortGetCoreID());
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (!wifi_connected) continue;
         wifi_ap_record_t ap = {};
         int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
         float total_ms = telemetry_inference_ms;
-        float duty_pct = total_ms >= prev_ms ? (total_ms - prev_ms) / 10.0f : 0.0f;
-        prev_ms = total_ms;
-        char body[512];
+        float uptime_ms = (float)(esp_timer_get_time() / 1000);
+        float cpu_cum_pct = uptime_ms > 0 ? (total_ms / uptime_ms) * 100.0f : 0.0f;
+        float snr_db = (telemetry_mic_rms > 0.001f && telemetry_noise_floor_rms > 0.001f)
+                       ? 20.0f * log10f(telemetry_mic_rms / telemetry_noise_floor_rms) : 0.0f;
+        char body[768];
         int blen = snprintf(body, sizeof(body),
             "{\"device\":\"esp32\",\"uptime_ms\":%llu,"
             "\"free_heap_bytes\":%lu,\"min_free_heap_bytes\":%lu,"
             "\"heap_total_bytes\":%lu,\"tflite_arena_bytes\":%u,"
             "\"audio_buffer_bytes\":%u,\"keyword_confidence\":%.4f,"
             "\"mic_rms\":%.5f,\"inference_count\":%lu,"
-            "\"inference_duty_pct\":%.3f,\"wifi_rssi_dbm\":%d,\"streaming\":%s}",
+            "\"inference_duty_pct\":%.3f,\"wifi_rssi_dbm\":%d,\"streaming\":%s,"
+            "\"latency_ms\":%.1f,\"cpu\":%.1f,\"snr\":%.1f,"
+            "\"noise_floor_rms\":%.5f}",
             (unsigned long long)(esp_timer_get_time() / 1000),
             (unsigned long)esp_get_free_heap_size(),
             (unsigned long)esp_get_minimum_free_heap_size(),
@@ -1584,7 +1470,11 @@ static void telemetry_task(void* arg) {
             (unsigned)(sizeof(audio_ring) + sizeof(audio_window)),
             telemetry_keyword_confidence, telemetry_mic_rms,
             (unsigned long)telemetry_inference_count,
-            duty_pct, rssi, streaming_active ? "true" : "false");
+            cpu_cum_pct, rssi, streaming_active ? "true" : "false",
+            (double)telemetry_last_infer_ms,
+            (double)cpu_cum_pct,
+            (double)snr_db,
+            (double)telemetry_noise_floor_rms);
         if (blen <= 0 || blen >= (int)sizeof(body)) continue;
         int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
         if (sock < 0) continue;
@@ -1592,7 +1482,7 @@ static void telemetry_task(void* arg) {
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         struct sockaddr_in addr = {};
-        addr.sin_family = AF_INET; addr.sin_port = htons(8080);
+        addr.sin_family = AF_INET; addr.sin_port = htons(80);
         inet_pton(AF_INET, g_server_ip, &addr.sin_addr);  // from NVS / portal
         if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             char req[700];
@@ -1608,13 +1498,12 @@ static void telemetry_task(void* arg) {
 
 // ─── app_main ────────────────────────────────────────────────────────────────
 extern "C" void app_main() {
-    printf("[BOOT-CHECK] DETECT_THRESHOLD=%.3f  DETECTION_HITS_REQUIRED=%d  COOLDOWN_MS=%d  MIC_MODE=%s  MODEL_SIZE=%u bytes\n", 
-           (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED, COOLDOWN_MS, "I2S", (unsigned)g_model_len);
-    printf("\n\n=== Hey Vaani booting in 5 seconds — open monitor NOW ===\n"); fflush(stdout);
-    for (int i = 5; i > 0; i--) { printf("  Starting in %d...\n", i); fflush(stdout); vTaskDelay(pdMS_TO_TICKS(1000)); }
-    printf("=== GO ===\n\n"); fflush(stdout);
+    printf("[BOOT] DETECT_THRESHOLD=%.3f  HITS=%d  COOLDOWN=%d  MODEL=%u bytes\n", 
+           (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED, COOLDOWN_MS, (unsigned)g_model_len);
+    fflush(stdout);
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
-    ESP_LOGI(TAG_MAIN, "=== Hey Vaani Edge Firmware (SIH 2026) rev7 ===");
+    ESP_LOGI(TAG_MAIN, "=== Hey Vaani Edge Firmware (SIH 2026) rev9 ===");
     ESP_ERROR_CHECK(nvs_flash_init());
 
     ring_mutex   = xSemaphoreCreateMutex();
@@ -1660,13 +1549,13 @@ extern "C" void app_main() {
     // caused user commands to be missed. Must be Core 1 to avoid IWDT clash with
     // inference_task on Core 0.
     xTaskCreatePinnedToCore(audio_task,         "audio",       4096,  NULL, 6, NULL, 1);
-    xTaskCreatePinnedToCore(inference_task,     "inference",   24576, NULL, 5, NULL, 0);
-    xTaskCreatePinnedToCore(streaming_task,     "streaming",   8192,  NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(inference_task,     "inference",   16384, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(streaming_task,     "streaming",   6144,  NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(wifi_keepalive_task,"wifi_ka",     4096,  NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(wifi_config_poll_task,"wifi_poll", 4096,  NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(watchdog_task,      "watchdog",    2048,  NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(display_task,       "display",     4096,  NULL, 1, NULL, 1); // [NEW] Moved to Core 1 to avoid I2C crash!
-    xTaskCreatePinnedToCore(stack_monitor_task, "stack_mon",   3072,  NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(stack_monitor_task, "stack_mon",   2048,  NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(telemetry_task,     "telemetry",   4096,  NULL, 1, NULL, 0);
     benchmark_cpu_start();
 

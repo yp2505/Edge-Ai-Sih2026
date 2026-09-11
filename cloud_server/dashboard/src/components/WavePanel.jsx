@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import { IconWaveform, IconSearch } from './Icons.jsx'
 
 const N = 58
@@ -9,16 +9,42 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
   const timeRef = useRef(0)
   const bars = useRef(Array(N).fill(0.02))
 
-  const active = serverUp && latestEvent && (Date.now() - new Date(latestEvent.timestamp).getTime() < 4000)
-  const isWake = active && latestEvent.status === 'wake_word_detected'
-  const tx = active ? (isWake ? 'HEY VAANI DETECTED — listening for command...' : latestEvent.transcript) : null
-  const conf = active && latestEvent.match_score ? (latestEvent.match_score * 100).toFixed(1) : null
+  const isStreaming = !stale && telemetry && telemetry.streaming === true
+  const isRecentEvent = serverUp && latestEvent && (Date.now() - new Date(latestEvent.timestamp).getTime() < 8000)
+  const isWake = isRecentEvent && latestEvent.status === 'wake_word_detected'
+  const isProcessing = isRecentEvent && latestEvent.status === 'complete' && latestEvent.transcript !== '[silence]'
+  const isRejected = isRecentEvent && latestEvent.verification_status === 'REJECTED'
+
+  const conf = !stale && telemetry && telemetry.keyword_confidence != null
+    ? (telemetry.keyword_confidence * 100).toFixed(1) : null
   const snr = !stale && telemetry && telemetry.snr != null ? telemetry.snr.toFixed(1) : null
 
-  const activeRef = useRef(active)
+  let statusText = 'Waiting for voice input...'
+  let statusColor = 'var(--t4)'
+  let isActive = false
+  if (isStreaming) {
+    statusText = 'Listening for your command...'
+    statusColor = 'var(--c1)'
+    isActive = true
+  } else if (isWake) {
+    statusText = 'HEY VAANI DETECTED — processing...'
+    statusColor = 'var(--green)'
+    isActive = true
+  } else if (isProcessing) {
+    statusText = latestEvent.transcript
+    statusColor = 'var(--c3)'
+    isActive = true
+  } else if (isRejected) {
+    statusText = ` "${latestEvent.matched_variant}" rejected (score ${(latestEvent.match_score * 100).toFixed(0)}%)`
+    statusColor = 'var(--t4)'
+  } else if (!serverUp) {
+    statusText = 'Server offline...'
+  }
+
+  const activeRef = useRef(isActive)
   const micRef = useRef(0)
-  
-  useEffect(() => { activeRef.current = active }, [active])
+
+  useEffect(() => { activeRef.current = isActive }, [isActive])
   useEffect(() => { micRef.current = (!stale && telemetry && telemetry.mic_rms > 0) ? telemetry.mic_rms : 0 }, [telemetry, stale])
 
   useEffect(() => {
@@ -44,18 +70,17 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
         const ph = i * 0.24
         const w1 = Math.sin(t * 1.1 + ph) * 0.5 + 0.5
         const w2 = Math.cos(t * 2.4 + ph * 1.3) * 0.3 + 0.3
-        
-        let tgt = baseVol > 0.01 
+
+        let tgt = baseVol > 0.01
           ? (w1 * 0.4 + w2 * 0.2 + 0.4) * env * baseVol
           : Math.max(0.01, (w1 * 0.03 + w2 * 0.015 + 0.012) * env)
-          
+
         bars.current[i] += (tgt - bars.current[i]) * 0.15
 
         const inten = bars.current[i]
         const hh = inten * maxH / 2
         const x = pad + i * sp + sp * 0.25
         const r = Math.min(bw / 2, hh / 2, 4)
-        // Cyan → teal gradient
         const f = n
         const R = Math.round(0), G = Math.round(210 - f * 20), B = Math.round(255 - f * 60)
         const a = on ? 0.45 + inten * 0.55 : 0.1 + inten * 0.3
@@ -70,7 +95,6 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
           ctx.shadowBlur = 0
         }
       }
-      // Centre divider
       ctx.strokeStyle = on ? 'rgba(0,229,255,0.14)' : 'rgba(255,255,255,0.04)'
       ctx.lineWidth = 1; ctx.setLineDash([4, 9])
       ctx.beginPath(); ctx.moveTo(pad, cy); ctx.lineTo(w - pad, cy); ctx.stroke(); ctx.setLineDash([])
@@ -82,59 +106,47 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
 
   return (
     <div className="wave-panel-content" style={{ display: 'flex', flexDirection: 'column', height: '100%', padding: '16px 20px 20px' }}>
-      
-      {/* Metrics Row */}
+
       <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
-        {[{ l: 'CONFIDENCE', v: active ? `${conf}%` : '--', c: 'var(--c1)' }, { l: 'SNR', v: active ? `${snr} dB` : '--', c: 'var(--c3)' }].map(s => (
+        {[{ l: 'CONFIDENCE', v: conf ? `${conf}%` : '--', c: 'var(--c1)' }, { l: 'SNR', v: snr ? `${snr} dB` : '--', c: 'var(--c3)' }].map(s => (
           <div key={s.l} style={{ flex: 1, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: 12, padding: '10px 14px' }}>
             <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 4 }}>{s.l}</div>
-            <div style={{ fontSize: 16, fontWeight: 700, color: active ? s.c : 'var(--t4)', fontFamily: 'var(--mono)' }}>{s.v}</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: isActive ? s.c : 'var(--t4)', fontFamily: 'var(--mono)' }}>{s.v}</div>
           </div>
         ))}
       </div>
 
-      {/* Waveform Area */}
       <div className="waveform-area" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative', marginBottom: 20 }}>
         <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 8, paddingLeft: 4 }}>LIVE AUDIO</div>
-        <div style={{ flex: 1, position: 'relative', background: 'rgba(255,255,255,0.015)', borderRadius: 12, border: '1px solid rgba(255,255,255,0.04)', overflow: 'hidden', opacity: active ? 1 : 0.25, transition: 'opacity 0.5s' }}>
+        <div style={{ flex: 1, position: 'relative', background: 'rgba(255,255,255,0.015)', borderRadius: 12, border: '1px solid rgba(255,255,255,0.04)', overflow: 'hidden', opacity: isActive ? 1 : 0.25, transition: 'opacity 0.5s' }}>
           <canvas ref={ref} style={{ width: '100%', height: '100%', display: 'block' }} />
-          {active && (
+          {isActive && (
             <div style={{ position: 'absolute', top: 10, right: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-              <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--c1)', boxShadow: '0 0 8px var(--c1)', animation: 'blink 0.8s infinite' }} />
-              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--c1)', letterSpacing: '1.5px', fontFamily: 'var(--mono)' }}>ACTIVE</span>
+              <div style={{ width: 6, height: 6, borderRadius: '50%', background: statusColor, boxShadow: `0 0 8px ${statusColor}`, animation: 'blink 0.8s infinite' }} />
+              <span style={{ fontSize: 9, fontWeight: 700, color: statusColor, letterSpacing: '1.5px', fontFamily: 'var(--mono)' }}>{isStreaming ? 'LISTENING' : 'ACTIVE'}</span>
             </div>
           )}
         </div>
       </div>
 
-      {/* Transcript Card */}
-      <div className="wave-status-card" style={{ 
+      <div className="wave-status-card" style={{
         padding: 16, borderRadius: 14,
-        background: active ? 'rgba(0,229,255,0.06)' : 'rgba(255,255,255,0.03)',
-        border: `1px solid ${active ? 'rgba(0,229,255,0.2)' : 'rgba(255,255,255,0.05)'}`,
-        boxShadow: active ? '0 0 20px rgba(0,229,255,0.05)' : 'none',
+        background: isActive ? 'rgba(0,229,255,0.06)' : 'rgba(255,255,255,0.03)',
+        border: `1px solid ${isActive ? 'rgba(0,229,255,0.2)' : 'rgba(255,255,255,0.05)'}`,
+        boxShadow: isActive ? '0 0 20px rgba(0,229,255,0.05)' : 'none',
         display: 'flex', flexDirection: 'column', transition: 'all 0.3s'
       }}>
         <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t3)', letterSpacing: 1.5, marginBottom: 8 }}>WAKE WORD / AUDIO STATUS</div>
-        {active ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--green)', fontSize: 13, fontWeight: 600 }}>
-              <span style={{ fontSize: 14, textShadow: '0 0 8px var(--green)' }}>✓</span> "Hey Vaani" detected
-            </div>
-            <div style={{ color: 'var(--t1)', fontSize: 15, fontWeight: 500, fontStyle: 'italic' }}>
-              {tx && tx.length > 5 && !tx.startsWith('[') ? `"${tx}"` : 'Processing...'}
-            </div>
-          </div>
-        ) : (
-          <div style={{ display: 'flex', alignItems: 'center', color: 'var(--t4)', fontSize: 13, gap: 8, padding: '4px 0' }}>
-            {!serverUp ? 'Server offline...' : (
-              <>
-                <IconSearch size={14} color="var(--t4)" />
-                Waiting for voice input...
-              </>
-            )}
-          </div>
-        )}
+        <div style={{ display: 'flex', alignItems: 'center', color: statusColor, fontSize: 13, gap: 8, padding: '4px 0' }}>
+          {isStreaming && (
+            <span style={{ fontSize: 14, textShadow: `0 0 8px ${statusColor}` }}>&#9679;</span>
+          )}
+          {isWake && (
+            <span style={{ fontSize: 14, textShadow: '0 0 8px var(--green)' }}>&#10003;</span>
+          )}
+          {!isActive && <IconSearch size={14} color="var(--t4)" />}
+          {statusText}
+        </div>
       </div>
     </div>
   )

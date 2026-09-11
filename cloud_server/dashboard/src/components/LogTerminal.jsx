@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-const API = 'http://localhost:8080'
+const API = import.meta.env.VITE_API_URL || ''
 const colors = { I: '#00d9ff', W: '#ffb020', E: '#ff5a5a', D: '#a7b4c2' }
 
 export default function LogTerminal() {

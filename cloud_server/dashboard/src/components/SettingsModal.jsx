@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { IconSettings, IconX, IconCpu, IconWifi, IconWaveform, IconReport, IconFlash } from './Icons.jsx'
+import { encryptPassword } from '../crypto.js'
 
-const API = 'http://localhost:8080'
+const API = import.meta.env.VITE_API_URL || ''
 
 export default function SettingsModal({ onClose, telemetry, serverUp, health }) {
   const [conf, setConf] = useState(85)
@@ -33,7 +34,11 @@ export default function SettingsModal({ onClose, telemetry, serverUp, health }) 
     setPushingNetwork(true)
     setNetworkStatus(null)
     try {
-      const r = await fetch(`${API}/api/wifi-config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(network) })
+      const payload = { ...network }
+      if (payload.password) {
+        payload.password = await encryptPassword(payload.password)
+      }
+      const r = await fetch(`${API}/api/wifi-config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       const data = await r.json()
       if (!r.ok) throw new Error(data.error || 'Unable to save network configuration')
       setNetwork(current => ({ ...current, password: '' }))
@@ -182,7 +187,7 @@ export default function SettingsModal({ onClose, telemetry, serverUp, health }) 
             
             <div style={S.card}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}><IconReport size={12} color="#00D9FF" /><span style={{...S.label, margin: 0, color: '#E8F1F7'}}>ASR ENGINE</span></div>
-              <div style={{ fontSize: 11, fontWeight: 600, color: '#E8F1F7', fontFamily: 'var(--mono)', marginBottom: 6 }}>Whisper</div>
+              <div style={{ fontSize: 11, fontWeight: 600, color: '#E8F1F7', fontFamily: 'var(--mono)', marginBottom: 6 }}>Vosk</div>
               <div style={{ fontSize: 9, color: '#7F91A3', fontFamily: 'var(--mono)', marginBottom: 2 }}>STATUS <span style={{ color: serverUp ? '#00D37F' : '#FF453A', float: 'right' }}>● {serverUp ? 'READY' : 'OFFLINE'}</span></div>
               {health && <div style={{ fontSize: 9, color: '#7F91A3', fontFamily: 'var(--mono)' }}>MODEL <span style={{ color: '#E8F1F7', float: 'right' }}>{health.asr_engine || 'tiny'}</span></div>}
             </div>

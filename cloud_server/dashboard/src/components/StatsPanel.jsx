@@ -2,13 +2,13 @@ import styles from './StatsPanel.module.css'
 
 // ── CONFIG — edit idle CPU % when you have real measured value ────────────────
 const MODEL = {
-  size:      '46.9 KB',
+  size:      '43.8 KB',
   arena:     '~54 KB',
   idleCpu:   '< 10%',      // ← replace with real value from benchmark_cpu.h serial log
   protocol:  'HVP1 v1',
   tpr:       '99.0%',
   far:       '0.4%',
-  engine:    'faster-whisper tiny INT8',
+  engine:    'Vosk ASR (English)',
 }
 
 function StatCard({ label, value, sub, color, icon }) {

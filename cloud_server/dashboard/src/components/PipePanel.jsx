@@ -16,7 +16,7 @@ export default function PipePanel({ latest, events }) {
   const total = active ? latest?.end_to_end_ms : null
   const tc = active && total > 0 ? (total < 400 ? 'var(--green)' : total < 800 ? 'var(--amber)' : 'var(--red)') : 'var(--t4)'
 
-  const nodes = ['ESP32', 'Wi-Fi', 'Audio Upload', 'Whisper ASR', 'Response']
+  const nodes = ['ESP32', 'Wi-Fi', 'Audio Upload', 'Vosk ASR', 'Response']
 
   return (
     <div className="pipe-panel-content" style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', padding: '4px 20px 16px' }}>
@@ -51,7 +51,7 @@ export default function PipePanel({ latest, events }) {
           {[
             { l: 'ESP32 / Wake → Wi-Fi', v: l_wake },
             { l: 'Audio Upload', v: l_audio },
-            { l: 'Whisper ASR',  v: l_asr },
+            { l: 'Vosk ASR',  v: l_asr },
             { l: 'Response',     v: l_resp }
           ].map(row => (
             <div key={row.l} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingBottom: 2, borderBottom: '1px solid rgba(255,255,255,0.03)' }}>

@@ -11,7 +11,7 @@ export default function InferencePipeline({ latestEvent }) {
     { id: 2, name: 'MFCC & TFLITE', time: active ? 32 : 0, color: 'var(--accent-cyan)' },
     { id: 3, name: 'WIFI TX', time: active ? tx : 0, color: 'var(--accent-magenta)' },
     { id: 4, name: 'SERVER RX', time: active ? rcv : 0, color: 'var(--accent-magenta)' },
-    { id: 5, name: 'WHISPER', time: active ? inf : 0, color: 'var(--accent-purple)' }
+    { id: 5, name: 'VOSK ASR', time: active ? inf : 0, color: 'var(--accent-purple)' }
   ]
 
   return (

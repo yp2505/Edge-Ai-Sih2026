@@ -97,6 +97,30 @@ def _response_nonce(audio_nonce: bytes) -> bytes:
     n[15] ^= 0xFF
     return bytes(n)
 
+
+def _aes_decrypt_password(encrypted: str) -> str:
+    """
+    Decrypt an AES-128-CTR encrypted password string sent by the dashboard.
+    Format: "nonce_hex:ciphertext_hex"
+    Falls back to returning the original string if decryption fails
+    (handles plaintext passwords from ESP32 direct polls).
+    """
+    if not encrypted or ":" not in encrypted:
+        return encrypted
+    if not _CRYPTO_AVAILABLE:
+        return encrypted
+    try:
+        nonce_hex, cipher_hex = encrypted.split(":", 1)
+        nonce = bytes.fromhex(nonce_hex)
+        ciphertext = bytes.fromhex(cipher_hex)
+        cipher = _aes_ctr_cipher(nonce)
+        decryptor = cipher.decryptor()
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        return plaintext.decode("utf-8")
+    except Exception as e:
+        print(f"  ⚠️  Password decryption failed: {e} — using as-is")
+        return encrypted
+
 # ─── Server-side VAD (Silence Detection) ─────────────────────────────────────
 # ⚡ LATENCY-OPTIMISED for <200ms total end-to-end (rev8)
 #   VAD_SILENCE_MS dropped 350→100ms (matches ESP32 COMMAND_SILENCE_MS=100ms)
@@ -252,8 +276,8 @@ OLLAMA_URL    = "http://localhost:11434/api/generate"
 
 
 # ─── Configuration ─────────────────────────────────────────────────────────
-DEFAULT_PORT       = 5000
-DASHBOARD_API_PORT = 8080
+DEFAULT_PORT       = 80
+DASHBOARD_API_PORT = 80
 
 AUDIO_DIR = os.path.join(os.path.dirname(__file__), "received_audio")
 LOG_FILE  = os.path.join(os.path.dirname(__file__), "server_log.json")
@@ -309,15 +333,29 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(data, dict): raise ValueError("expected object")
             if path == "/api/telemetry":
-                data["received_at"] = datetime.now().isoformat()
+                data["received_at"] = datetime.utcnow().isoformat() + "Z"
                 asr = self.server.asr_server
                 with asr._lock: asr.telemetry = data
+                # Log ESP32 telemetry summary
+                cpu_pct    = data.get("cpu", 0)
+                latency_ms = data.get("latency_ms", 0)
+                mic_rms    = data.get("mic_rms", 0)
+                conf       = data.get("keyword_confidence", 0)
+                snr_db     = data.get("snr", 0)
+                heap       = data.get("free_heap_bytes", 0)
+                inf_count  = data.get("inference_count", 0)
+                print(f"  📱 [ESP32] cpu={cpu_pct:.1f}% latency={latency_ms:.0f}ms "
+                      f"mic={mic_rms:.4f} conf={conf:.4f} snr={snr_db:.1f}dB "
+                      f"heap={heap} inf={inf_count}")
                 self._send_json({"ok": True})
             elif path == "/api/wifi-config":
                 # Save WiFi provisioning config to disk
                 global _WIFI_CONFIG
                 allowed = {"ssid", "password", "server_ip", "server_port"}
                 next_config = {k: v for k, v in data.items() if k in allowed}
+                # Decrypt password if it was AES-encrypted by the dashboard
+                if next_config.get("password"):
+                    next_config["password"] = _aes_decrypt_password(next_config["password"])
                 if not next_config.get("password") and _WIFI_CONFIG.get("password"):
                     next_config["password"] = _WIFI_CONFIG["password"]
                 if not next_config.get("ssid") or not next_config.get("server_ip"):
@@ -470,7 +508,13 @@ class ASRServer:
     def start(self):
         self._load_asr()
         os.makedirs(AUDIO_DIR, exist_ok=True)
-        DashboardHTTPServer(self, port=self.dashboard_port).start_in_thread()
+
+        # ── Single-port multiplexer: HTTP + HVP1 on port 80 ──
+        # Mobile hotspots block non-standard ports, so we run both the
+        # dashboard HTTP API and the ESP32 TCP audio stream on port 80.
+        # We peek at the first 4 bytes to detect the protocol:
+        #   "GET " / "POST" → HTTP dashboard handler
+        #   0x48565031      → HVP1 audio stream
 
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -484,6 +528,7 @@ class ASRServer:
         print("=" * 62)
         print(f"  Status:          🟢 RUNNING")
         print(f"  Address:         {local_ip}:{self.port}")
+        print(f"  Mode:            HTTP + TCP audio multiplexed on port {self.port}")
         if self.asr_engine == "aws":
             print(f"  ASR engine:      ☁️  Amazon Transcribe Streaming (en-IN, ap-south-1)")
             print(f"  AWS free tier:   60 min/month — ~1,800 free detections/month")
@@ -492,6 +537,9 @@ class ASRServer:
         print("  Wake word:       custom TFLite Micro model on ESP32 (edge-authoritative)")
         print(f"  Protocol:        HVP1 v1 — 20-byte header, live-stream mode")
         print(f"  Log:             {LOG_FILE}")
+        # Also start a plain HTTP server on port 8080 for Vercel proxy
+        DashboardHTTPServer(self, port=8080).start_in_thread()
+        print(f"  🌐 Vercel proxy API: http://localhost:8080/api/health")
         print("=" * 62)
         print(f"\n  ⚙️  Configure ESP32 with:")
         print(f"      Server IP   = \"{local_ip}\"  (enter this in HeyVaani-Setup portal)")
@@ -501,10 +549,37 @@ class ASRServer:
         try:
             while True:
                 client_socket, client_addr = server_socket.accept()
+                threading.Thread(
+                    target=self._multiplex_connection,
+                    args=(client_socket, client_addr),
+                    daemon=True,
+                ).start()
+        except KeyboardInterrupt:
+            print("\n\n  🛑 Server shutting down...")
+            self._save_log()
+            server_socket.close()
+
+    def _multiplex_connection(self, client_socket: socket.socket, client_addr: tuple):
+        """Peek at first 4 bytes to detect HTTP vs HVP1, then route."""
+        try:
+            client_socket.settimeout(5.0)
+            peek = client_socket.recv(4, socket.MSG_PEEK)
+            if not peek or len(peek) < 4:
+                client_socket.close()
+                return
+
+            # Check if it's an HTTP request (GET / POST / OPTIONS / HEAD)
+            first4_ascii = peek.decode("ascii", errors="ignore").upper()
+            if first4_ascii.startswith(("GET ", "POST", "OPTI", "HEAD")):
+                # ── HTTP request → route to dashboard handler ──
+                self._handle_http(client_socket, client_addr)
+            elif struct.unpack("<I", peek)[0] == MAGIC_NUMBER:
+                # ── HVP1 audio stream → route to audio handler ──
+                # Extend timeout to 30s — ESP32 has 1.5s prompt delay + up to 10s streaming
+                client_socket.settimeout(30.0)
                 with self._lock:
                     self.session_count += 1
                     sid = self.session_count
-                    # Publish the on-device wake-word event before audio finishes streaming.
                     self.log_entries.append({
                         "session_id": sid,
                         "timestamp": datetime.now().isoformat(),
@@ -515,15 +590,33 @@ class ASRServer:
                 _esp_log_append("I", "SESSION", f"Wake word detected from {client_addr[0]} (session {sid})")
                 self._save_log()
                 print(f"  📡 [{sid}] Connection from {client_addr[0]}:{client_addr[1]}")
-                threading.Thread(
-                    target=self._handle_client,
-                    args=(client_socket, client_addr, sid),
-                    daemon=True,
-                ).start()
-        except KeyboardInterrupt:
-            print("\n\n  🛑 Server shutting down...")
-            self._save_log()
-            server_socket.close()
+                self._handle_client(client_socket, client_addr, sid)
+            else:
+                magic_val = struct.unpack("<I", peek)[0]
+                print(f"  ❌ Connection from {client_addr[0]}:{client_addr[1]} — unknown protocol 0x{magic_val:08X}")
+                client_socket.close()
+        except socket.timeout:
+            client_socket.close()
+        except Exception as e:
+            print(f"  ❌ Multiplex error from {client_addr}: {e}")
+            client_socket.close()
+
+    def _handle_http(self, client_socket: socket.socket, client_addr: tuple):
+        """Handle an HTTP request by wrapping the socket for BaseHTTPRequestHandler."""
+        try:
+            class _OneShotServer:
+                """Minimal server shim that holds asr_server reference."""
+                def __init__(self, asr):
+                    self.asr_server = asr
+                    self.socket = client_socket
+                    self.server_address = client_addr
+
+            _DashboardHandler(client_socket, client_addr, _OneShotServer(self))
+            client_socket.close()
+        except Exception as e:
+            print(f"  ❌ HTTP handler error: {e}")
+            try: client_socket.close()
+            except: pass
 
     # ── ASR backend loader ─────────────────────────────────────────────────
     def _load_asr(self):
@@ -632,15 +725,16 @@ class ASRServer:
             # ── Step 1b: Read AES nonce (16 bytes, sent right after HVP1 header) ──
             aes_nonce: bytes | None = None
             aes_decryptor = None
-            if _CRYPTO_AVAILABLE:
-                aes_nonce = self._recv_exact(client_socket, 16)
-                if not aes_nonce or len(aes_nonce) < 16:
-                    print(f"  ⚠️  [{session_id}] Missing AES nonce — falling back to plaintext")
-                    aes_nonce = None
-                else:
-                    aes_decryptor = _aes_ctr_cipher(aes_nonce).decryptor()
-                    print(f"  🔐 [{session_id}] AES-128-CTR decryptor ready "
-                          f"nonce={aes_nonce[:4].hex()}...")
+            raw_nonce = self._recv_exact(client_socket, 16)
+            if not raw_nonce or len(raw_nonce) < 16:
+                print(f"  ⚠️  [{session_id}] Missing AES nonce — plaintext mode")
+            elif raw_nonce == b'\x00' * 16:
+                print(f"  📭 [{session_id}] Zero nonce received — plaintext mode (AES disabled on ESP32)")
+            elif _CRYPTO_AVAILABLE:
+                aes_nonce = raw_nonce
+                aes_decryptor = _aes_ctr_cipher(aes_nonce).decryptor()
+                print(f"  🔐 [{session_id}] AES-128-CTR decryptor ready "
+                      f"nonce={aes_nonce[:4].hex()}...")
             else:
                 print(f"  ⚠️  [{session_id}] cryptography not installed — plaintext mode")
 
