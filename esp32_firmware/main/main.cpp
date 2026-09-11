@@ -1052,7 +1052,8 @@ static void streaming_task(void* arg) {
         const int PRE_BUFFER_MS = 300;             // 300ms pre-buffer before speech
         const int PRE_BUF_SAMPLES = I2S_SAMPLE_RATE * PRE_BUFFER_MS / 1000;  // 4800
         int16_t* pre_buf = (int16_t*)heap_caps_malloc(PRE_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_8BIT);
-        if (!pre_buf) { pre_buf = pcm; /* fallback: no pre-buffer */ }
+        bool pre_buf_ok = (pre_buf != NULL);
+        if (!pre_buf_ok) { pre_buf = pcm; }  // fallback: no pre-buffering (pcm too small)
         int pre_buf_write = 0;
         int pre_buf_count = 0;
 
@@ -1084,12 +1085,14 @@ static void streaming_task(void* arg) {
                 printf("[STREAM] Speech detected! rms=%.4f thr=%.4f after %dms\n",
                        (double)crms, (double)sil_thr, wait_speech_ms); fflush(stdout);
             } else {
-                // Store in circular pre-buffer
-                for (int i = 0; i < CHUNK; i++) {
-                    pre_buf[pre_buf_write] = pcm[i];
-                    pre_buf_write = (pre_buf_write + 1) % PRE_BUF_SAMPLES;
+                // Store in circular pre-buffer (only if heap-allocated, not pcm fallback)
+                if (pre_buf_ok) {
+                    for (int i = 0; i < CHUNK; i++) {
+                        pre_buf[pre_buf_write] = pcm[i];
+                        pre_buf_write = (pre_buf_write + 1) % PRE_BUF_SAMPLES;
+                    }
+                    if (pre_buf_count < PRE_BUF_SAMPLES) pre_buf_count += CHUNK;
                 }
-                if (pre_buf_count < PRE_BUF_SAMPLES) pre_buf_count += CHUNK;
                 wait_speech_ms += CHUNK * 1000 / I2S_SAMPLE_RATE;
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
@@ -1253,7 +1256,11 @@ static void streaming_task(void* arg) {
 
         {
             char resp[1024] = {0}; int rlen = 0, r;
+            // Increase recv timeout to wait for server transcription (Vosk takes 1-3s)
+            struct timeval rcv_tv = { .tv_sec = 10, .tv_usec = 0 };
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
             while ((r = recv(sock, resp + rlen, sizeof(resp) - rlen - 1, 0)) > 0) rlen += r;
+            printf("[STREAM] recv response: %d bytes rlen=%d\n", (int)r, rlen); fflush(stdout);
             close(sock);
 
             // ── Decrypt response using derived nonce (audio_nonce XOR 0xFF last byte) ──
