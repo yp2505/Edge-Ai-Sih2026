@@ -1203,6 +1203,8 @@ static void streaming_task(void* arg) {
         deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
         consec_silence_ms = 0;
         streamed_ms = pre_buf_count * 1000 / I2S_SAMPLE_RATE + CHUNK * 1000 / I2S_SAMPLE_RATE;
+        printf("[CHK-STREAM] loop_start pre_buf_count=%d streamed_ms=%d total_sent=%d\n",
+               pre_buf_count, streamed_ms, total_sent); fflush(stdout);
 
         while (xTaskGetTickCount() < deadline) {
             if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -1242,34 +1244,34 @@ static void streaming_task(void* arg) {
                 float sil_thr = fmaxf(0.015f, telemetry_noise_floor_rms * 2.5f);
                 consec_silence_ms = crms < sil_thr ? consec_silence_ms + chunk_ms : 0;
                 if (consec_silence_ms >= COMMAND_SILENCE_MS) {
+                    printf("[CHK-STREAM] silence_break after %dms\n", streamed_ms); fflush(stdout);
                     break;
                 }
             }
         }
+        printf("[CHK-STREAM] loop_end total_sent=%d streamed_ms=%d\n", total_sent, streamed_ms); fflush(stdout);
 
         set_streaming_active(false, "stream_loop_ended");
         shutdown(sock, SHUT_WR);
 
 #if ENABLE_AES
-        esp_aes_free(&aes_ctx);   // release AES context after streaming done
+        esp_aes_free(&aes_ctx);
 #endif
 
+        // ── CHECKPOINT 2: RECEIVE — read server response ──────────────────
         {
             char resp[1024] = {0}; int rlen = 0, r;
-            // Increase recv timeout to wait for server transcription (Vosk takes 1-3s)
             struct timeval rcv_tv = { .tv_sec = 10, .tv_usec = 0 };
             setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
             while ((r = recv(sock, resp + rlen, sizeof(resp) - rlen - 1, 0)) > 0) rlen += r;
-            printf("[STREAM] recv response: %d bytes rlen=%d\n", (int)r, rlen); fflush(stdout);
+            printf("[CHK2-RECV] rlen=%d final_recv=%d\n", rlen, (int)r); fflush(stdout);
             close(sock);
 
-            // ── Decrypt response using derived nonce (audio_nonce XOR 0xFF last byte) ──
 #if ENABLE_AES
             if (rlen > 0) {
                 uint8_t resp_nonce[16];
                 memcpy(resp_nonce, aes_nonce, 16);
-                resp_nonce[15] ^= 0xFF;   // same derivation as server-side _response_nonce()
-
+                resp_nonce[15] ^= 0xFF;
                 uint8_t resp_stream_blk[16] = {0};
                 size_t  resp_nc_off = 0;
                 esp_aes_context resp_aes;
@@ -1277,36 +1279,26 @@ static void streaming_task(void* arg) {
                 esp_aes_setkey(&resp_aes, AES_KEY, 128);
                 esp_aes_crypt_ctr(&resp_aes, (size_t)rlen, &resp_nc_off,
                                   resp_nonce, resp_stream_blk,
-                                  (uint8_t*)resp, (uint8_t*)resp);  // decrypt in-place
+                                  (uint8_t*)resp, (uint8_t*)resp);
                 esp_aes_free(&resp_aes);
                 resp[rlen] = '\0';
             }
 #else
             resp[rlen] = '\0';
 #endif
+            printf("[CHK2-RECV] raw=%.*s\n", rlen > 200 ? 200 : rlen, resp); fflush(stdout);
 
-            // ── cJSON: Parse cloud JSON response ─────────────────────────
-            // Cloud sends: {"verified": bool, "transcript": "...",
-            //               "intent": {"intent":"...","action":"...", ...}, ...}
-            // Uses ESP-IDF built-in cJSON — no extra dependency.
-            bool cloud_verified = false;
+            // ── CHECKPOINT 3: PARSE — cJSON parsing ───────────────────────
             char clean_txt[128] = "[No Response]";
             char intent_str[64] = "";
 
             if (rlen > 0) {
                 cJSON* root = cJSON_ParseWithLength(resp, (size_t)rlen);
                 if (root) {
-                    // "verified"
-                    cJSON* jv = cJSON_GetObjectItemCaseSensitive(root, "verified");
-                    cloud_verified = cJSON_IsTrue(jv);
-
-                    // "transcript"
                     cJSON* jt = cJSON_GetObjectItemCaseSensitive(root, "transcript");
                     if (cJSON_IsString(jt) && jt->valuestring) {
                         snprintf(clean_txt, sizeof(clean_txt), "%s", jt->valuestring);
                     }
-
-                    // "intent" (optional — only present when --intent flag used)
                     cJSON* ji = cJSON_GetObjectItemCaseSensitive(root, "intent");
                     if (cJSON_IsObject(ji)) {
                         cJSON* ja = cJSON_GetObjectItemCaseSensitive(ji, "intent");
@@ -1316,32 +1308,26 @@ static void streaming_task(void* arg) {
                                      ja->valuestring, jac->valuestring);
                         }
                     }
-
                     cJSON_Delete(root);
                 } else {
                     snprintf(clean_txt, sizeof(clean_txt), "%.127s", resp);
                 }
             }
+            printf("[CHK3-PARSE] clean_txt='%s' intent='%s'\n", clean_txt, intent_str); fflush(stdout);
 
-            if (cloud_verified) {
-                // "Detected!" was already shown at the local KWS stage (inference_task).
-                // Now write the cloud transcript directly to OLED so it is visible immediately.
-                if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    // Prefer intent string when available, otherwise show raw transcript
-                    if (intent_str[0]) {
-                        snprintf(g_disp_text, sizeof(g_disp_text), "%s", intent_str);
-                    } else {
-                        snprintf(g_disp_text, sizeof(g_disp_text), "%s", clean_txt);
-                    }
-                    xSemaphoreGive(disp_mutex);
-                }
-                printf("[TRANSCRIPT] %s\n", clean_txt); fflush(stdout);
-                g_disp_state = DISP_TRANSCRIBED;   // OLED now shows the transcript text
-                gpio_set_level(LED_PIN, 0);         // LED off — transcription complete
-                vTaskDelay(pdMS_TO_TICKS(4000));    // hold transcript visible for 4s
-            } else {
-                gpio_set_level(LED_PIN, 0);
+            // ── CHECKPOINT 4: DISPLAY-SET — write g_disp_text ─────────────
+            const char* show = intent_str[0] ? intent_str : clean_txt;
+            if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                snprintf(g_disp_text, sizeof(g_disp_text), "%s", show);
+                xSemaphoreGive(disp_mutex);
             }
+            printf("[CHK4-DISP-SET] g_disp_text='%s'\n", g_disp_text); fflush(stdout);
+
+            g_disp_state = DISP_TRANSCRIBED;
+            gpio_set_level(LED_PIN, 0);
+            printf("[CHK4-DISP-SET] state=DISP_TRANSCRIBED led=off\n"); fflush(stdout);
+
+            vTaskDelay(pdMS_TO_TICKS(4000));
         }
 
         // ── Return to listening state with cooldown ────────────────────────
@@ -1349,6 +1335,7 @@ static void streaming_task(void* arg) {
         // re-trigger loops.  The OLED shows "Listening" immediately so the
         // user knows the system is ready again after the cooldown expires.
         if (pre_buf && pre_buf != pcm) heap_caps_free(pre_buf);
+        gpio_set_level(LED_PIN, 0);
         g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
         g_sys_state    = SYS_LISTENING;
         g_disp_state   = DISP_LISTENING;
@@ -1495,30 +1482,39 @@ static void watchdog_task(void* arg) {
 // ============================================================================
 static void display_task(void* arg) {
     ESP_LOGI(TAG_DISP, "Display task started (core %d)", xPortGetCoreID());
-    disp_state_t last_state = (disp_state_t)(-1);  // force draw on first iteration
-    char local_txt[256];   // local copy — read under mutex
+    disp_state_t last_state = (disp_state_t)(-1);
+    char local_txt[256];
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(100));
         disp_state_t cur = g_disp_state;
-        if (cur != last_state) {
-            local_txt[0] = '\0';
-            if (cur == DISP_TRANSCRIBED || cur == DISP_PROMPT) {
-                // Take disp_mutex to safely read g_disp_text written by other tasks
-                if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    strlcpy(local_txt, g_disp_text, sizeof(local_txt));
-                    xSemaphoreGive(disp_mutex);
-                } else {
-                    strlcpy(local_txt, g_disp_text, sizeof(local_txt));
+
+        // CHECKPOINT 5: always read g_disp_text under mutex
+        if (cur == DISP_TRANSCRIBED || cur == DISP_PROMPT) {
+            if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                strlcpy(local_txt, g_disp_text, sizeof(local_txt));
+                xSemaphoreGive(disp_mutex);
+            } else {
+                strlcpy(local_txt, g_disp_text, sizeof(local_txt));
+            }
+            printf("[CHK5-DISP-READ] state=%d text='%s'\n", (int)cur, local_txt); fflush(stdout);
+        }
+
+        // CHECKPOINT 6: redraw on state change OR every cycle while TRANSCRIBED
+        // (ensures OLED actually renders the transcript even if state didn't change)
+        if (cur != last_state || cur == DISP_TRANSCRIBED) {
+            if (cur != last_state) {
+                local_txt[0] = '\0';
+                if (cur == DISP_TRANSCRIBED || cur == DISP_PROMPT) {
+                    if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        strlcpy(local_txt, g_disp_text, sizeof(local_txt));
+                        xSemaphoreGive(disp_mutex);
+                    } else {
+                        strlcpy(local_txt, g_disp_text, sizeof(local_txt));
+                    }
                 }
             }
             oled_show_status(cur, local_txt);
             last_state = cur;
-            ESP_LOGI(TAG_DISP, "State → %d  (%s)", (int)cur,
-                     cur==DISP_BOOTING    ? "Booting"   :
-                     cur==DISP_LISTENING  ? "Listening" :
-                     cur==DISP_DETECTED   ? "Detected"  :
-                     cur==DISP_STREAMING  ? "Streaming" :
-                     cur==DISP_PROMPT     ? "Prompt"    : "Transcribed");
         }
     }
 }

@@ -929,6 +929,7 @@ class ASRServer:
             if intent_data:
                 response_dict["intent"] = intent_data
             response: bytes = json.dumps(response_dict).encode("utf-8")
+            print(f"  📤 [{session_id}] Response JSON ({len(response)}B): {response[:300].decode('utf-8', errors='replace')}")
 
             # Encrypt response with derived nonce (audio_nonce XOR 0xFF on last byte)
             if aes_nonce:
@@ -943,8 +944,9 @@ class ASRServer:
                           f"— sending plaintext")
             try:
                 client_socket.sendall(response)
-            except Exception:
-                pass   # ESP32 may have already closed its read side
+                print(f"  ✉️  [{session_id}] Response sent OK: {len(response)}B")
+            except Exception as send_err:
+                print(f"  ❌ [{session_id}] Response send FAILED: {send_err}")
 
             # ── Step 5: Append to server_log.json ─────────────────────────
             log_entry = {
