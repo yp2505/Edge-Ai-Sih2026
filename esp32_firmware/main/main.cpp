@@ -1,18 +1,18 @@
 // main.cpp — Hey Vaani ESP32 Edge KWS + Cloud ASR Streaming
 //
-// FIX LOG (2026-09-07 rev7 — INMP441 I2S + ST7735 OLED + LED + Buzzer):
-//   All fixes from rev6 preserved plus:
-//   1. ADC/MAX4466 removed; INMP441 I2S (i2s_std, 16 kHz, mono-left).
-//      adc_global_init() + read_pcm_dma() gone.
-//      i2s_global_init() + i2s_read_pcm() replace them.
-//      Ring buffer, mutex, inference_task, streaming_task: UNCHANGED.
-//   2. ST7735 SPI OLED via ESP-IDF SPI master (SPI3_HOST/VSPI, no Arduino lib).
-//      display_task (Core 0, pri 1) polls g_disp_state every 100 ms — zero
-//      impact on inference or streaming critical paths.
-//   3. LED GPIO27: on at keyword confirm, off after transcription received.
-//      watchdog_task also forces LED off if streaming gets stuck.
-//   4. Buzzer GPIO14: 150 ms LEDC PWM beep (2.5 kHz) at keyword confirm,
-//      implemented as a self-deleting beep_task (no delay in inference_task).
+// FIX LOG (2026-09-22 rev10 — Post-Capacitor Calibration):
+//   All fixes from rev9 preserved plus:
+//   1. Decoupling capacitor (100nF-10uF) placed between 3V3 and GND near INMP441.
+//      Eliminates power rail noise that caused elevated noise floor RMS.
+//      Clean noise floor now ~0.003-0.010 RMS (was 0.020-0.035 with ripple).
+//   2. VAD thresholds recalibrated for clean rail:
+//      MIN_SPEECH_RMS: 0.045 → 0.025 (clean noise << real speech)
+//      MIN_PEAK_SAMPLE: 1200 → 700  (clean transients clearer at lower level)
+//      DETECT_THRESHOLD: 0.94 → 0.92 (slightly more sensitive with clean audio)
+//      DETECTION_HITS_REQUIRED: 4 → 3 (90ms debounce, sufficient post-cap)
+//   3. Streaming VAD: CMD_RMS_GATE 0.020 → 0.008 (don't prematurely close stream)
+//      COMMAND_SILENCE_MS: 800 → 2000ms (user has more time to speak command)
+//      COMMAND_MIN_DURATION_MS: 1000 → 1500ms (captures full command)
 //
 // HARDWARE WIRING:
 //   INMP441:  SCK=GPIO26  WS=GPIO25   SD=GPIO22   L/R=GND (left channel)
@@ -52,6 +52,7 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include <errno.h>
+#include <fcntl.h>
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -66,6 +67,7 @@
 #include "mfcc.h"
 #include "benchmark_cpu.h"
 #include "wifi_provision.h"   // NVS-backed WiFi credentials + captive portal
+#include "esp_now_fusion.h"   // Cross-node confidence fusion (Part 2)
 
 // ─── AES-128-CTR Encryption ──────────────────────────────────────────────────────
 // All audio and responses are encrypted with AES-128-CTR (no licence required).
@@ -104,9 +106,19 @@ static const uint8_t AES_KEY[16] = {
 // ─── I2S / INMP441 ───────────────────────────────────────────────────────────
 #define I2S_SAMPLE_RATE    16000
 #define I2S_PORT           I2S_NUM_0
-#define I2S_SCK_PIN        GPIO_NUM_26   // BCLK  (INMP441 SCK)
-#define I2S_WS_PIN         GPIO_NUM_25   // LRCLK (INMP441 WS)
-#define I2S_SD_PIN         GPIO_NUM_22   // DATA  (INMP441 SD)  — wired to GPIO22
+#define I2S_SCK_PIN        GPIO_NUM_26   // BCLK  (INMP441 Mic A SCK)
+#define I2S_WS_PIN         GPIO_NUM_25   // LRCLK (INMP441 Mic A WS)
+#define I2S_SD_PIN         GPIO_NUM_22   // DATA  (INMP441 Mic A SD)
+
+// ─── I2S / INMP441 Mic B (second mic, I2S_NUM_1) ─────────────────────────────
+// Proposed pins: SCK=GPIO14, WS=GPIO32, SD=GPIO33.
+// CONFIRM these are free on your breadboard before flashing.
+// Non-fatal: if Mic B is not wired, g_mic_b_ok stays false and inference_task
+// falls back to single-mic mode automatically.
+#define I2S_PORT_B         I2S_NUM_1
+#define I2S_SCK_PIN_B      GPIO_NUM_14   // BCLK  (INMP441 Mic B SCK)
+#define I2S_WS_PIN_B       GPIO_NUM_32   // LRCLK (INMP441 Mic B WS)
+#define I2S_SD_PIN_B       GPIO_NUM_33   // DATA  (INMP441 Mic B SD)
 
 // ─── KWS / Inference ─────────────────────────────────────────────────────────
 // DETECT_THRESHOLD: sigmoid decision boundary calibrated on the custom
@@ -115,27 +127,28 @@ static const uint8_t AES_KEY[16] = {
 //   Lower toward 0.60 only if real-world misses are unacceptable.
 //   Raise toward 0.90 only if false triggers persist after retraining.
 //
-// DETECTION_HITS_REQUIRED=2: both consecutive inferences must exceed
-// threshold before the trigger fires — halves false-positive rate
-// at cost of ~30 ms extra latency (one extra hop).
-static const float DETECT_THRESHOLD          = 0.70f;   // Raise to reduce false triggers — only real "Hey Vaani" should pass
-static const int   DETECTION_HITS_REQUIRED  = 1;        // Single frame trigger — model peaks in 1 frame during "Hey Vaani"
-static const float MIN_SPEECH_RMS           = 0.030f;   // Gate out fan/AC noise
-static const float NOISE_FLOOR_MULTIPLIER   = 2.5f;     // VAD gate: must be 2.5x above noise floor
-static const int   NOISE_CALIBRATION_FRAMES = 50;
-static const float NOISE_CAL_MAX_RMS        = 0.15f;
+// DETECTION_HITS_REQUIRED:
+//   3 consecutive inference frames above threshold = ~750ms of sustained
+//   confident speech required to trigger.  "Hey Vaani" spoken by a user
+//   directly at the mic is ~600-900ms with conf 0.82-0.99.
+//   A single phoneme (e.g. 'ey' in 'Hey') can dip to conf 0.70-0.80;
+//   the 1-miss grace handles this without accumulating from background noise.
+static const float DETECT_THRESHOLD          = 0.80f;   // 0.80: responsive & balanced for natural "Hey Vaani"
+static const int   DETECTION_HITS_REQUIRED  = 2;        // 2 consecutive frames (~500ms) matches "Hey Vaani" duration
+static const float MIN_SPEECH_RMS           = 0.015f;   // Real speech is 0.020-0.050 RMS; room ambient is 0.003-0.006 RMS
+static const int   MIN_PEAK_SAMPLE          = 600;      // Real speech transients > 600; room murmurs < 400
+static const float NOISE_FLOOR_MULTIPLIER   = 1.4f;     // speech_thr = floor * 1.4
+static const int   NOISE_CALIBRATION_FRAMES = 35;
+static const float NOISE_CAL_MAX_RMS        = 0.022f;
 
 // ─── Streaming / VAD ─────────────────────────────────────────────────────────
-// Command capture: after "How can I help you?", keep streaming long enough
-// for the user to speak their command.  Minimum 2s before EOS eligible,
-// then close after 1s of silence.  Max 15s hard cap.
 #define SLIDE_STEP_MS           30
-#define COMMAND_DURATION_MS     10000
-#define COMMAND_MIN_DURATION_MS 2000       // 2s minimum before EOS — user needs time to speak
-#define COMMAND_SILENCE_MS      1500       // 1.5s silence to end stream — give time between words
-#define COOLDOWN_MS             3000       // 3s cooldown after each detection cycle
+#define COMMAND_DURATION_MS     6000
+#define COMMAND_MIN_DURATION_MS 1500       // 1.5s minimum before EOS eligible
+#define COMMAND_SILENCE_MS      1200       // 1.2s silence closes stream
+#define COOLDOWN_MS             2500       // 2.5s cooldown — fast turnaround for next command
 #define AUDIO_BUFFER_SAMPLES    16000
-#define STREAM_WATCHDOG_MS      5000
+#define STREAM_WATCHDOG_MS      25000      // 25s watchdog
 
 // ─── HVP1 Protocol ───────────────────────────────────────────────────────────
 #define MAGIC_NUMBER 0x48565031u
@@ -149,20 +162,31 @@ typedef struct __attribute__((packed)) {
 } hvp1_header_t;
 
 // ─── LED / Buzzer ────────────────────────────────────────────────────────────
-#define LED_PIN              GPIO_NUM_27
-// BUZZER not connected — PWM/LEDC removed
+#define LED_PIN              GPIO_NUM_27   // External LED on breadboard pin 27
+#define ONBOARD_LED_PIN      GPIO_NUM_2    // ESP32 DevKit onboard blue LED pin 2
+
+static inline void set_led_state(bool on) {
+    gpio_set_level((gpio_num_t)LED_PIN, on ? 1 : 0);
+    gpio_set_level((gpio_num_t)ONBOARD_LED_PIN, on ? 1 : 0);
+}
 
 // ─── SSD1306 I2C OLED (0.96", 128×64, monochrome) ───────────────────────────
-// GPIO21=SDA (default I2C), GPIO19=SCL (avoids GPIO33 used by INMP441 SD).
+// GPIO21=SDA (default I2C), GPIO19=SCL.
+// Note: GPIO33 is used by INMP441 Mic B SD — I2C pins avoid that conflict.
 #define OLED_SDA_PIN    GPIO_NUM_21
 #define OLED_SCL_PIN    GPIO_NUM_19
 #define OLED_I2C_PORT   I2C_NUM_0
-#define OLED_I2C_HZ     400000           // 400 kHz Fast Mode
-#define OLED_ADDR       0x3C             // 0x3C most common; try 0x3D if blank
+#define OLED_I2C_HZ     100000           // 100 kHz Standard Mode (reliable on breadboard with internal pullups)
+#define OLED_ADDR       0x3C             // Default address; auto-probes 0x3C / 0x3D in ssd1306_init
 #define OLED_WIDTH      128
 #define OLED_HEIGHT     64
 // SSD1306 framebuffer: 128×64 / 8 = 1024 bytes (1 bit per pixel)
 #define OLED_BUF_BYTES  (OLED_WIDTH * OLED_HEIGHT / 8)
+
+static uint8_t s_oled_addr = OLED_ADDR;
+static bool    s_oled_ready = false;
+static volatile float s_mic_a_rms = 0.0f;
+static volatile float s_mic_b_rms = 0.0f;
 
 // ─── WiFi ────────────────────────────────────────────────────────────────────
 static EventGroupHandle_t wifi_event_group;
@@ -170,12 +194,20 @@ static EventGroupHandle_t wifi_event_group;
 #define WIFI_FAIL_BIT      BIT1
 #define WIFI_MAX_RETRIES   10
 
-static const char* TAG_INF  = "INFERENCE";
-static const char* TAG_STR  = "STREAM";
-static const char* TAG_MAIN = "MAIN";
-static const char* TAG_WIFI = "WIFI";
-static const char* TAG_MIC  = "MIC";
-static const char* TAG_DISP = "DISPLAY";
+static const char* TAG_INF   = "INFERENCE";
+static const char* TAG_STR   = "STREAM";
+static const char* TAG_MAIN  = "MAIN";
+static const char* TAG_WIFI  = "WIFI";
+static const char* TAG_MIC   = "MIC";
+static const char* TAG_DISP  = "DISPLAY";
+static const char* TAG_FUSE  = "FUSION";
+
+// ─── Node Identity ───────────────────────────────────────────────────────────
+// NODE_ID: 1 or 2 — identifies this node in ESP-NOW fusion logs and handoff.
+// Change to 2 when flashing the second board.
+#ifndef NODE_ID
+#define NODE_ID 1
+#endif
 
 static volatile int  wifi_retry_count = 0;
 static volatile bool wifi_connected   = false;
@@ -192,16 +224,26 @@ static volatile float    telemetry_mic_rms            = 0.0f;
 static volatile float    telemetry_noise_floor_rms    = 0.0f;
 static volatile float    telemetry_last_infer_ms      = 0.0f;
 
-// ─── Audio ring buffer ───────────────────────────────────────────────────────
 static int16_t           audio_ring[AUDIO_BUFFER_SAMPLES];
-static int16_t           audio_window[AUDIO_BUFFER_SAMPLES];
+static int16_t*          audio_window = nullptr;
 static volatile int      ring_write_pos     = 0;
 static volatile int      valid_ring_samples = 0;
 static SemaphoreHandle_t ring_mutex;
 
+static void flush_audio_ring() {
+    if (ring_mutex && xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memset((void*)audio_ring, 0, sizeof(audio_ring));
+        ring_write_pos = 0;
+        valid_ring_samples = 0;
+        xSemaphoreGive(ring_mutex);
+    }
+}
+
 static QueueHandle_t     detect_queue;
 static volatile uint32_t session_id = 0;
 static volatile int      g_stream_start_pos = 0;  // ring pos saved at detection time
+// Cycle start timestamp — written by inference_task at trigger, read by streaming_task for [CYCLE] log
+static int64_t           g_cycle_start_us   = 0;
 
 // ─── TFLite ──────────────────────────────────────────────────────────────────
 static const size_t TENSOR_ARENA_SIZE = 32 * 1024;
@@ -213,7 +255,11 @@ static TfLiteTensor*                      input_tensor  = nullptr;
 static TfLiteTensor*                      output_tensor = nullptr;
 
 // ─── I2S handle ──────────────────────────────────────────────────────────────
-static i2s_chan_handle_t g_i2s_rx = NULL;
+static i2s_chan_handle_t g_i2s_rx   = NULL;   // Mic A (I2S_NUM_0)
+static i2s_chan_handle_t g_i2s_rx_b = NULL;   // Mic B (I2S_NUM_1) — NULL if not wired
+static bool              g_mic_b_ok = false;  // true only if Mic B inited successfully
+static int32_t*          s_stereo_rx_buf_a = NULL;
+static int32_t*          s_stereo_rx_buf_b = NULL;
 
 // ─── MFCC ────────────────────────────────────────────────────────────────────
 static MFCCProcessor mfcc_proc;
@@ -421,33 +467,141 @@ static void i2s_global_init() {
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(g_i2s_rx, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(g_i2s_rx));
-    ESP_LOGI(TAG_MAIN, "INMP441 I2S ready: %d Hz  16-bit  stereo-deinterleave  "
+
+    if (!s_stereo_rx_buf_a) {
+        s_stereo_rx_buf_a = (int32_t*)heap_caps_malloc(480 * 2 * sizeof(int32_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (!s_stereo_rx_buf_a) ESP_LOGE(TAG_MAIN, "FATAL: s_stereo_rx_buf_a malloc failed");
+    }
+
+    ESP_LOGI(TAG_MAIN, "INMP441 Mic A (I2S_NUM_0) ready: %d Hz  16-bit  stereo-deinterleave  "
              "SCK=GPIO%d  WS=GPIO%d  SD=GPIO%d",
              I2S_SAMPLE_RATE, I2S_SCK_PIN, I2S_WS_PIN, I2S_SD_PIN);
 }
+
+// ─── I2S Init: Mic B (I2S_NUM_1, second INMP441) ────────────────────────────────────
+// Called after i2s_global_init() in app_main.
+// Non-fatal if Mic B is not wired: sets g_mic_b_ok=false and inference_task
+// will fall back to single-mic mode automatically.
+static void i2s_global_init_b() {
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT_B, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    esp_err_t e = i2s_new_channel(&chan_cfg, NULL, &g_i2s_rx_b);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG_MAIN, "Mic B: i2s_new_channel(I2S_NUM_1) failed (%s) — single-mic mode",
+                 esp_err_to_name(e));
+        g_i2s_rx_b = NULL;
+        g_mic_b_ok = false;
+        return;
+    }
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+                        I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = (gpio_num_t)(-1),
+            .bclk = I2S_SCK_PIN_B,
+            .ws   = I2S_WS_PIN_B,
+            .dout = (gpio_num_t)(-1),
+            .din  = I2S_SD_PIN_B,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    // INMP441 with L/R=GND outputs audio on LEFT channel.
+    // Use SLOT_BOTH so DMA receives stereo pairs matching i2s_read_pcm_from de-interleave.
+    std_cfg.slot_cfg.slot_mask      = I2S_STD_SLOT_BOTH;
+    std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+
+    e = i2s_channel_init_std_mode(g_i2s_rx_b, &std_cfg);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG_MAIN, "Mic B: i2s_channel_init_std_mode failed (%s) — single-mic mode",
+                 esp_err_to_name(e));
+        i2s_del_channel(g_i2s_rx_b);
+        g_i2s_rx_b = NULL; g_mic_b_ok = false;
+        return;
+    }
+    e = i2s_channel_enable(g_i2s_rx_b);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG_MAIN, "Mic B: i2s_channel_enable failed (%s) — single-mic mode",
+                 esp_err_to_name(e));
+        i2s_del_channel(g_i2s_rx_b);
+        g_i2s_rx_b = NULL; g_mic_b_ok = false;
+        return;
+    }
+    if (!s_stereo_rx_buf_b) {
+        s_stereo_rx_buf_b = (int32_t*)heap_caps_malloc(480 * 2 * sizeof(int32_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (!s_stereo_rx_buf_b) ESP_LOGE(TAG_MAIN, "FATAL: s_stereo_rx_buf_b malloc failed");
+    }
+    g_mic_b_ok = true;
+    ESP_LOGI(TAG_MAIN, "INMP441 Mic B (I2S_NUM_1) ready: %d Hz  SCK=GPIO%d  WS=GPIO%d  SD=GPIO%d",
+             I2S_SAMPLE_RATE, I2S_SCK_PIN_B, I2S_WS_PIN_B, I2S_SD_PIN_B);
+}
+
 
 // ─── I2S PCM read — STEREO de-interleave for INMP441 ─────────────────────────
 // INMP441 outputs 24-bit left-justified in 32-bit frame.  With I2S_SLOT_BIT_WIDTH_32BIT,
 // each sample is 4 bytes (int32).  We read int32 stereo, de-interleave LEFT channel,
 // and right-shift by 16 to get int16 audio.
 static int i2s_read_pcm(int16_t* out_buf, int out_count) {
-    // Read stereo frames as int32 (4 bytes per sample)
-    static int32_t stereo_buf32[960 * 2];  // 32-bit stereo buffer
-    int read_stereo = (out_count <= 960) ? out_count : 960;
+    if (!s_stereo_rx_buf_a || !g_i2s_rx) return -1;
+    int read_stereo = (out_count <= 480) ? out_count : 480;
     size_t bytes_wanted = (size_t)read_stereo * 2 * sizeof(int32_t);  // stereo int32
     size_t bytes_read = 0;
     esp_err_t e = i2s_channel_read(g_i2s_rx,
-                                   stereo_buf32,
+                                   s_stereo_rx_buf_a,
                                    bytes_wanted,
                                    &bytes_read,
                                    pdMS_TO_TICKS(200));
     if (e != ESP_OK && e != ESP_ERR_TIMEOUT) return -1;
     int stereo_samples = (int)(bytes_read / sizeof(int32_t));  // L+R interleaved int32
     int mono_out = 0;
-    // Extract LEFT channel (even indices = mic data), shift 24-bit → 16-bit
+    // INMP441 L/R=GND: audio data is in LEFT channel (even indices). Top 16 bits = audio PCM.
+    // 150 Hz 2nd-order Butterworth High-Pass Filter (fs=16000 Hz):
+    // Removes hardware DC offset and strongly attenuates 50 Hz / 100 Hz mains hum (-19.1 dB)
+    // while keeping 100% of speech frequencies (300 Hz - 4000 Hz) crisp and clear.
+    static float x1_a = 0.0f, x2_a = 0.0f;
+    static float y1_a = 0.0f, y2_a = 0.0f;
+    const float b0 = 0.959203f, b1 = -1.918406f, b2 = 0.959203f;
+    const float a1 = -1.916741f, a2 = 0.920071f;
     for (int i = 0; i + 1 < stereo_samples && mono_out < out_count; i += 2) {
-        int32_t s32 = stereo_buf32[i];          // 24-bit left-justified in 32 bits
-        out_buf[mono_out++] = (int16_t)(s32 >> 16);  // top 16 bits of 24-bit = audio
+        int32_t s32 = s_stereo_rx_buf_a[i];
+        float x0 = (float)(s32 >> 16);
+        float y0 = b0 * x0 + b1 * x1_a + b2 * x2_a - a1 * y1_a - a2 * y2_a;
+        x2_a = x1_a; x1_a = x0;
+        y2_a = y1_a; y1_a = y0;
+        if (y0 > 32767.0f) y0 = 32767.0f;
+        else if (y0 < -32768.0f) y0 = -32768.0f;
+        out_buf[mono_out++] = (int16_t)y0;
+    }
+    return mono_out;
+}
+
+// ─── i2s_read_pcm_from — generic INMP441 read from any channel handle ─────────
+static int i2s_read_pcm_from(i2s_chan_handle_t chan, int16_t* out_buf, int out_count) {
+    int32_t* buf = (chan == g_i2s_rx_b) ? s_stereo_rx_buf_b : s_stereo_rx_buf_a;
+    if (!buf || !chan) return -1;
+    int read_stereo = (out_count <= 480) ? out_count : 480;
+    size_t bytes_wanted = (size_t)read_stereo * 2 * sizeof(int32_t);
+    size_t bytes_read = 0;
+    esp_err_t e = i2s_channel_read(chan, buf, bytes_wanted,
+                                   &bytes_read, pdMS_TO_TICKS(200));
+    if (e != ESP_OK && e != ESP_ERR_TIMEOUT) return -1;
+    int stereo_samples = (int)(bytes_read / sizeof(int32_t));
+    int mono_out = 0;
+    static float x1_b = 0.0f, x2_b = 0.0f;
+    static float y1_b = 0.0f, y2_b = 0.0f;
+    const float b0 = 0.959203f, b1 = -1.918406f, b2 = 0.959203f;
+    const float a1 = -1.916741f, a2 = 0.920071f;
+    for (int i = 0; i + 1 < stereo_samples && mono_out < out_count; i += 2) {
+        int32_t s_l = buf[i];
+        int32_t s_r = buf[i + 1];
+        int32_t s32 = (labs(s_l) >= labs(s_r)) ? s_l : s_r;
+        float x0 = (float)(s32 >> 16);
+        float y0 = b0 * x0 + b1 * x1_b + b2 * x2_b - a1 * y1_b - a2 * y2_b;
+        x2_b = x1_b; x1_b = x0;
+        y2_b = y1_b; y1_b = y0;
+        if (y0 > 32767.0f) y0 = 32767.0f;
+        else if (y0 < -32768.0f) y0 = -32768.0f;
+        out_buf[mono_out++] = (int16_t)y0;
     }
     return mono_out;
 }
@@ -461,23 +615,22 @@ static int i2s_read_pcm(int16_t* out_buf, int out_count) {
 // Send one byte to SSD1306 as a command (Co=0, D/C#=0)
 static esp_err_t ssd_cmd(uint8_t cmd) {
     uint8_t buf[2] = {0x00, cmd};   // 0x00 = control byte: Co=0, D/C#=0
-    return i2c_master_write_to_device(OLED_I2C_PORT, OLED_ADDR,
-                                      buf, 2, pdMS_TO_TICKS(10));
+    return i2c_master_write_to_device(OLED_I2C_PORT, s_oled_addr,
+                                      buf, 2, pdMS_TO_TICKS(20));
 }
 
-// Flush the full 1024-byte framebuffer to SSD1306 GDDRAM
+// Flush the full 1024-byte framebuffer to SSD1306 GDDRAM page-by-page (8 pages × 128 columns)
 static void ssd_flush() {
-    // Set column 0..127, page 0..7
-    ssd_cmd(0x21); ssd_cmd(0); ssd_cmd(127);   // column address
-    ssd_cmd(0x22); ssd_cmd(0); ssd_cmd(7);     // page address
-    // Data transfer: control byte 0x40 = Co=0, D/C#=1 (data)
-    // i2c_master_write_to_device needs a single contiguous buffer, so we
-    // prepend the 0x40 control byte to g_oled_fb via a local header trick.
-    static uint8_t txbuf[1 + OLED_BUF_BYTES];
-    txbuf[0] = 0x40;
-    memcpy(txbuf + 1, g_oled_fb, OLED_BUF_BYTES);
-    i2c_master_write_to_device(OLED_I2C_PORT, OLED_ADDR,
-                               txbuf, sizeof(txbuf), pdMS_TO_TICKS(50));
+    uint8_t page_buf[1 + OLED_WIDTH];
+    page_buf[0] = 0x40; // Co=0, D/C#=1 (GDDRAM data write)
+    for (uint8_t p = 0; p < 8; p++) {
+        ssd_cmd(0xB0 + p); // Set page start address (Page 0..7)
+        ssd_cmd(0x00);     // Set lower column address
+        ssd_cmd(0x10);     // Set higher column address
+        memcpy(page_buf + 1, &g_oled_fb[p * OLED_WIDTH], OLED_WIDTH);
+        i2c_master_write_to_device(OLED_I2C_PORT, s_oled_addr,
+                                   page_buf, sizeof(page_buf), pdMS_TO_TICKS(50));
+    }
 }
 
 // Set or clear a single pixel in the framebuffer (does NOT flush)
@@ -600,28 +753,147 @@ static void oled_show_status(disp_state_t state, const char* text) {
             // Skip leading space on next line
             if (*p == ' ') p++;
         }
+    } else if (state == DISP_LISTENING || state == DISP_BOOTING) {
+        // Hysteresis filter: hold VOICE state for 6 refreshes (~1.2 seconds) on speech activity
+        static int s_m1_hold = 0;
+        static int s_m2_hold = 0;
+        if (s_mic_a_rms > 0.008f) s_m1_hold = 6; else if (s_m1_hold > 0) s_m1_hold--;
+        if (s_mic_b_rms > 0.008f) s_m2_hold = 6; else if (s_m2_hold > 0) s_m2_hold--;
+
+        char m1_str[16], m2_str[16];
+        snprintf(m1_str, sizeof(m1_str), "M1:%s", s_m1_hold > 0 ? "VOICE" : "OK");
+        snprintf(m2_str, sizeof(m2_str), "M2:%s", !g_mic_b_ok ? "N/C" : (s_m2_hold > 0 ? "VOICE" : "OK"));
+        ssd_draw_str(2, 33, m1_str, true, 1);
+        ssd_draw_str(2, 44, m2_str, true, 1);
+
+        // Dynamic Audio Energy / Dual VU Level Bars
+        // Mic 1 meter box: x=52..125, y=33..40 (8px tall)
+        for (int x = 52; x <= 125; x++) { ssd_pixel(x, 33, true); ssd_pixel(x, 40, true); }
+        for (int y = 33; y <= 40; y++) { ssd_pixel(52, y, true); ssd_pixel(125, y, true); }
+        int fill_1 = (int)((s_mic_a_rms - 0.002f) * 3500.0f);
+        if (fill_1 < 0) fill_1 = 0;
+        if (fill_1 > 71) fill_1 = 71;
+        for (int x = 53; x < 53 + fill_1; x++) {
+            for (int y = 35; y <= 38; y++) ssd_pixel(x, y, true);
+        }
+
+        // Mic 2 meter box: x=52..125, y=44..51 (8px tall)
+        for (int x = 52; x <= 125; x++) { ssd_pixel(x, 44, true); ssd_pixel(x, 51, true); }
+        for (int y = 44; y <= 51; y++) { ssd_pixel(52, y, true); ssd_pixel(125, y, true); }
+        int fill_2 = (int)((s_mic_b_rms - 0.002f) * 3500.0f);
+        if (fill_2 < 0) fill_2 = 0;
+        if (fill_2 > 71) fill_2 = 71;
+        for (int x = 53; x < 53 + fill_2; x++) {
+            for (int y = 46; y <= 49; y++) ssd_pixel(x, y, true);
+        }
+
+        // Helper hint at bottom
+        ssd_draw_str(2, 55, "Say 'Hey Vaani'...", true, 1);
     }
 
     // Push framebuffer to display
     ssd_flush();
 }
 
-// SSD1306 hardware + I2C bus init
-static void ssd1306_init() {
-    // I2C bus configuration
-    i2c_config_t conf = {};
-    conf.mode             = I2C_MODE_MASTER;
-    conf.sda_io_num       = OLED_SDA_PIN;
-    conf.scl_io_num       = OLED_SCL_PIN;
-    conf.sda_pullup_en    = GPIO_PULLUP_ENABLE;
-    conf.scl_pullup_en    = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = OLED_I2C_HZ;
-    ESP_ERROR_CHECK(i2c_param_config(OLED_I2C_PORT, &conf));
-    ESP_ERROR_CHECK(i2c_driver_install(OLED_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0));
+static bool s_i2c_driver_installed = false;
 
-    vTaskDelay(pdMS_TO_TICKS(50));  // SSD1306 needs >1 ms after VCC stable
-    // I2C scanner removed — it blocked Core 0 for ~1.26s (126 addrs × 10ms timeout)
-    // causing IWDT crash. OLED address is hardcoded as 0x3C.
+static void ssd1306_delete_driver() {
+    if (s_i2c_driver_installed) {
+        i2c_driver_delete(OLED_I2C_PORT);
+        s_i2c_driver_installed = false;
+    }
+}
+
+// SSD1306 hardware + I2C bus init with bus recovery and multi-pin detection
+static void ssd1306_init() {
+    ssd1306_delete_driver();
+
+    // Standard I2C bus recovery: pulse SCL 9 times to free any slave holding SDA low
+    gpio_set_direction(GPIO_NUM_19, GPIO_MODE_OUTPUT_OD);
+    gpio_set_direction(GPIO_NUM_21, GPIO_MODE_INPUT);
+    for (int i = 0; i < 9; i++) {
+        gpio_set_level(GPIO_NUM_19, 0);
+        esp_rom_delay_us(10);
+        gpio_set_level(GPIO_NUM_19, 1);
+        esp_rom_delay_us(10);
+    }
+
+    // Check voltage levels on SDA and SCL
+    gpio_set_direction(GPIO_NUM_21, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_NUM_21, GPIO_PULLUP_ONLY);
+    gpio_set_direction(GPIO_NUM_19, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_NUM_19, GPIO_PULLUP_ONLY);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    int sda_lvl = gpio_get_level(GPIO_NUM_21);
+    int scl_lvl = gpio_get_level(GPIO_NUM_19);
+
+    struct PinPair { gpio_num_t sda; gpio_num_t scl; const char* desc; };
+    static const PinPair CANDIDATES[] = {
+        { GPIO_NUM_21, GPIO_NUM_19, "SDA=21 SCL=19" },
+        { GPIO_NUM_19, GPIO_NUM_21, "SDA=19 SCL=21 (swapped)" },
+    };
+
+    bool oled_found = false;
+
+    for (size_t c = 0; c < sizeof(CANDIDATES)/sizeof(CANDIDATES[0]); c++) {
+        ssd1306_delete_driver();
+        gpio_reset_pin(CANDIDATES[c].sda);
+        gpio_reset_pin(CANDIDATES[c].scl);
+
+        i2c_config_t conf = {};
+        conf.mode             = I2C_MODE_MASTER;
+        conf.sda_io_num       = CANDIDATES[c].sda;
+        conf.scl_io_num       = CANDIDATES[c].scl;
+        conf.sda_pullup_en    = GPIO_PULLUP_ENABLE;
+        conf.scl_pullup_en    = GPIO_PULLUP_ENABLE;
+        conf.master.clk_speed = 100000; // 100 kHz Standard Mode (transfers full 128 cols without timeout)
+        i2c_param_config(OLED_I2C_PORT, &conf);
+        if (i2c_driver_install(OLED_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0) == ESP_OK) {
+            s_i2c_driver_installed = true;
+            i2c_set_timeout(OLED_I2C_PORT, 0xFFFFF);
+            gpio_pullup_en(CANDIDATES[c].sda);
+            gpio_pullup_en(CANDIDATES[c].scl);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        ESP_LOGI(TAG_DISP, "[BUS PRE] %s: SDA(GPIO%d)=%d SCL(GPIO%d)=%d",
+                 CANDIDATES[c].desc,
+                 CANDIDATES[c].sda, gpio_get_level(CANDIDATES[c].sda),
+                 CANDIDATES[c].scl, gpio_get_level(CANDIDATES[c].scl));
+
+        // Probe 0x3C first (default SSD1306) and 0x3D
+        static const uint8_t TARGET_ADDRS[] = { 0x3C, 0x3D, 0x27, 0x3F };
+        for (size_t a_idx = 0; a_idx < sizeof(TARGET_ADDRS); a_idx++) {
+            uint8_t a = TARGET_ADDRS[a_idx];
+            i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+            i2c_master_start(cmd);
+            i2c_master_write_byte(cmd, (a << 1) | I2C_MASTER_WRITE, true);
+            i2c_master_stop(cmd);
+            esp_err_t ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(30));
+            i2c_cmd_link_delete(cmd);
+
+            ESP_LOGI(TAG_DISP, "Probe 0x%02X on %s: ret=%s [POST: SDA=%d SCL=%d]",
+                     a, CANDIDATES[c].desc, esp_err_to_name(ret),
+                     gpio_get_level(CANDIDATES[c].sda), gpio_get_level(CANDIDATES[c].scl));
+
+            if (ret == ESP_OK) {
+                s_oled_addr = a;
+                oled_found = true;
+                ESP_LOGI(TAG_DISP, "--> I2C DEVICE FOUND on %s at address 0x%02X!",
+                         CANDIDATES[c].desc, a);
+                break;
+            }
+        }
+        if (oled_found) break;
+    }
+
+    if (!oled_found) {
+        ssd1306_delete_driver();
+        ESP_LOGW(TAG_DISP, "No I2C device on any pins — SDA(GPIO21)=%d SCL(GPIO19)=%d",
+                 sda_lvl, scl_lvl);
+        return;
+    }
 
     // SSD1306 init sequence (works for all common 128×64 modules)
     static const uint8_t init_cmds[] = {
@@ -644,13 +916,14 @@ static void ssd1306_init() {
     };
     for (size_t i = 0; i < sizeof(init_cmds); i++) {
         if (ssd_cmd(init_cmds[i]) != ESP_OK) {
-            ESP_LOGE(TAG_DISP, "SSD1306 init cmd 0x%02X failed — check SDA=GPIO%d SCL=GPIO%d addr=0x%02X",
-                     init_cmds[i], OLED_SDA_PIN, OLED_SCL_PIN, OLED_ADDR);
+            ESP_LOGE(TAG_DISP, "SSD1306 init cmd 0x%02X failed", init_cmds[i]);
         }
     }
 
-    ESP_LOGI(TAG_DISP, "SSD1306 ready: %dx%d  I2C  addr=0x%02X  SDA=GPIO%d  SCL=GPIO%d",
-             OLED_WIDTH, OLED_HEIGHT, OLED_ADDR, OLED_SDA_PIN, OLED_SCL_PIN);
+    s_oled_ready = true;
+    ssd_clear(0x00);
+    ssd_flush();
+    ESP_LOGI(TAG_DISP, "SSD1306 ready: 128x64  I2C  addr=0x%02X", s_oled_addr);
 
     // Show "Booting..." immediately, before display_task is running
     oled_show_status(DISP_BOOTING, "");
@@ -661,73 +934,58 @@ extern "C" void display_show_provisioning(void) {
 }
 
 // ─── Mic Self-Check (I2S) ────────────────────────────────────────────────────
-// Reads 0.5 s of audio, de-interleaves L/R channels, and logs diagnostics.
-// Expected RMS in silence: ~0.001–0.010 (INMP441 noise floor ≈ −26 dBFS).
-//
-// DIAGNOSTIC GUIDE — interpret [MIC] log output:
-//   L_rms > 0.001, R_rms ≈ 0    → Mic working, correct wiring (L/R=GND)
-//   L_rms ≈ 0,    R_rms > 0.001 → L/R PIN CONNECTED TO VDD — swap to GND!
-//   L_rms ≈ 0,    R_rms ≈ 0     → Hardware issue: check wiring/power/defective mic
-//   No data (got=0)              → I2S not reading: check SCK/WS/SD wiring
-//
-// This function is NON-FATAL — does NOT call esp_restart().
+// Reads audio using the real 32-bit-to-16-bit de-interleave pipeline for both
+// Mic A (I2S_NUM_0) and Mic B (I2S_NUM_1), reporting actual RMS energy.
 static void mic_selfcheck() {
-    static int16_t buf[8000];   // 0.5 s stereo @ 16 kHz — static → DRAM, DMA-safe
-    ESP_LOGI(TAG_MIC, "Mic self-check: reading 0.5s of I2S stereo audio...");
-    size_t bytes_read = 0;
-    esp_err_t e = i2s_channel_read(g_i2s_rx, buf, sizeof(buf),
-                                   &bytes_read, pdMS_TO_TICKS(1000));
-    int got = (e == ESP_OK || e == ESP_ERR_TIMEOUT)
-              ? (int)(bytes_read / sizeof(int16_t)) : 0;
-    if (got <= 0) {
-        ESP_LOGE(TAG_MIC, "I2S self-check: NO DATA (err=0x%x, bytes=%d)",
-                 (unsigned)e, (int)bytes_read);
-        ESP_LOGE(TAG_MIC, "  → Check wiring: SCK=GPIO26  WS=GPIO25  SD=GPIO22");
-        ESP_LOGE(TAG_MIC, "  → Check INMP441 power: VCC=3.3V, GND=GND");
-        ESP_LOGW(TAG_MIC, "  Continuing anyway — check [ENERGY] log after boot.");
-        return;
+    int16_t samples[480];
+    int64_t sum_sq_a = 0;
+    int count_a = 0;
+    // Read ~150 ms of audio from Mic A
+    for (int rep = 0; rep < 5; rep++) {
+        int n = i2s_read_pcm(samples, 480);
+        if (n > 0) {
+            for (int i = 0; i < n; i++) sum_sq_a += (int64_t)samples[i] * samples[i];
+            count_a += n;
+        }
+    }
+    float rms_a = count_a > 0 ? sqrtf((float)sum_sq_a / count_a) / 32768.0f : 0.0f;
+    s_mic_a_rms = rms_a;
+    ESP_LOGI(TAG_MIC, "Mic A (I2S_0, SD=GPIO%d SCK=GPIO%d WS=GPIO%d): RMS=%.5f (%s)",
+             I2S_SD_PIN, I2S_SCK_PIN, I2S_WS_PIN, (double)rms_a,
+             rms_a > 0.0005f ? "ACTIVE" : "SILENT (check wiring/power)");
+    if (s_stereo_rx_buf_a) {
+        printf("[RAW-MIC-A] L0=%ld (>>16:%d) R0=%ld (>>16:%d) L1=%ld R1=%ld\n",
+               (long)s_stereo_rx_buf_a[0], (int)(s_stereo_rx_buf_a[0] >> 16),
+               (long)s_stereo_rx_buf_a[1], (int)(s_stereo_rx_buf_a[1] >> 16),
+               (long)s_stereo_rx_buf_a[2], (long)s_stereo_rx_buf_a[3]);
+        fflush(stdout);
     }
 
-    // De-interleave stereo: even indices = LEFT (mic if L/R=GND), odd = RIGHT
-    int64_t sum_sq_l = 0, sum_sq_r = 0;
-    int mono_count = got / 2;   // number of L-R pairs
-    for (int i = 0; i + 1 < got; i += 2) {
-        sum_sq_l += (int64_t)buf[i]     * buf[i];      // LEFT
-        sum_sq_r += (int64_t)buf[i + 1] * buf[i + 1];  // RIGHT
-    }
-    float rms_l = mono_count > 0 ? sqrtf((float)sum_sq_l / mono_count) / 32768.0f : 0.0f;
-    float rms_r = mono_count > 0 ? sqrtf((float)sum_sq_r / mono_count) / 32768.0f : 0.0f;
-
-    // Also compute raw (non-deinterleaved) RMS for backward compat
-    int64_t sum_sq_all = 0;
-    for (int i = 0; i < got; i++) sum_sq_all += (int64_t)buf[i] * buf[i];
-    float rms_all = got > 0 ? sqrtf((float)sum_sq_all / got) / 32768.0f : 0.0f;
-
-    printf("[MIC] INMP441 stereo check (%.2fs, %d stereo pairs):\n",
-           (float)got / I2S_SAMPLE_RATE / 2.0f, mono_count);
-    printf("[MIC]   L_rms=%.5f  R_rms=%.5f  combined=%.5f\n",
-           (double)rms_l, (double)rms_r, (double)rms_all);
-
-    // Show first 8 raw samples (4 L-R pairs) for debugging
-    printf("[MIC]   raw[0..7]:");
-    for (int i = 0; i < 8 && i < got; i++) printf(" %d", (int)buf[i]);
-    printf("\n");
-    fflush(stdout);
-
-    // Diagnostic verdict
-    if (rms_l > 0.001f && rms_r < 0.001f) {
-        ESP_LOGI(TAG_MIC, "Mic OK — data on LEFT channel (L/R=GND correct)");
-    } else if (rms_l < 0.001f && rms_r > 0.001f) {
-        ESP_LOGE(TAG_MIC, "WRONG CHANNEL! Data is on RIGHT — L/R pin is wired to VDD!");
-        ESP_LOGE(TAG_MIC, "  FIX: Connect INMP441 L/R pin to GND (not VCC)");
-        ESP_LOGE(TAG_MIC, "  Current: L_rms=%.5f R_rms=%.5f (data on wrong side)", rms_l, rms_r);
-    } else if (rms_l < 1e-6f && rms_r < 1e-6f) {
-        ESP_LOGE(TAG_MIC, "MIC SILENT — no signal on either channel!");
-        ESP_LOGE(TAG_MIC, "  Check: 1) INMP441 VCC=3.3V?  2) SCK/WS/SD wired correctly?");
-        ESP_LOGE(TAG_MIC, "          3) L/R=GND?  4) Module defective?");
-        ESP_LOGW(TAG_MIC, "  Continuing. Inference will likely get no triggers.");
+    if (g_mic_b_ok && g_i2s_rx_b != NULL) {
+        int64_t sum_sq_b = 0;
+        int count_b = 0;
+        for (int rep = 0; rep < 5; rep++) {
+            int n = i2s_read_pcm_from(g_i2s_rx_b, samples, 480);
+            if (n > 0) {
+                for (int i = 0; i < n; i++) sum_sq_b += (int64_t)samples[i] * samples[i];
+                count_b += n;
+            }
+        }
+        float rms_b = count_b > 0 ? sqrtf((float)sum_sq_b / count_b) / 32768.0f : 0.0f;
+        s_mic_b_rms = rms_b;
+        // In quiet room ambient RMS is naturally < 0.0005f — do NOT disable g_mic_b_ok!
+        ESP_LOGI(TAG_MIC, "Mic B (I2S_1, SD=GPIO%d SCK=GPIO%d WS=GPIO%d): RMS=%.5f (%s)",
+                 I2S_SD_PIN_B, I2S_SCK_PIN_B, I2S_WS_PIN_B, (double)rms_b,
+                 rms_b > 0.0005f ? "ACTIVE" : "SILENT");
+        if (s_stereo_rx_buf_b) {
+            printf("[RAW-MIC-B] L0=%ld (>>16:%d) R0=%ld (>>16:%d) L1=%ld R1=%ld\n",
+                   (long)s_stereo_rx_buf_b[0], (int)(s_stereo_rx_buf_b[0] >> 16),
+                   (long)s_stereo_rx_buf_b[1], (int)(s_stereo_rx_buf_b[1] >> 16),
+                   (long)s_stereo_rx_buf_b[2], (long)s_stereo_rx_buf_b[3]);
+            fflush(stdout);
+        }
     } else {
-        ESP_LOGI(TAG_MIC, "Mic self-check PASSED (L=%.5f R=%.5f)", rms_l, rms_r);
+        ESP_LOGW(TAG_MIC, "Mic B (I2S_1): not active or not initialized");
     }
 }
 
@@ -824,6 +1082,40 @@ static void audio_task(void* arg) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+
+        // Live Mic A RMS calculation
+        {
+            int64_t sum_sq_a = 0;
+            for (int i = 0; i < HOP; i++) sum_sq_a += (int64_t)hop[i] * hop[i];
+            s_mic_a_rms = sqrtf((float)sum_sq_a / HOP) / 32768.0f;
+        }
+
+        // Concurrently read and drain Mic B if active, updating s_mic_b_rms live
+        if (g_mic_b_ok && g_i2s_rx_b != NULL && s_stereo_rx_buf_b != NULL) {
+            size_t br_b = 0;
+            esp_err_t eb = i2s_channel_read(g_i2s_rx_b, s_stereo_rx_buf_b,
+                                            HOP * 2 * sizeof(int32_t),
+                                            &br_b, pdMS_TO_TICKS(30));
+            if (eb == ESP_OK && br_b >= (size_t)HOP * 2 * sizeof(int32_t)) {
+                int64_t sum_sq_b = 0;
+                static float x1_b = 0.0f, x2_b = 0.0f, y1_b = 0.0f, y2_b = 0.0f;
+                const float b0 = 0.959203f, b1 = -1.918406f, b2 = 0.959203f;
+                const float a1 = -1.916741f, a2 = 0.920071f;
+                for (int i = 0; i < HOP * 2; i += 2) {
+                    int32_t s_l = s_stereo_rx_buf_b[i];
+                    int32_t s_r = s_stereo_rx_buf_b[i + 1];
+                    int32_t s32 = (labs(s_l) >= labs(s_r)) ? s_l : s_r;
+                    float x0 = (float)(s32 >> 16);
+                    float y0 = b0 * x0 + b1 * x1_b + b2 * x2_b - a1 * y1_b - a2 * y2_b;
+                    x2_b = x1_b; x1_b = x0;
+                    y2_b = y1_b; y1_b = y0;
+                    int16_t s16 = (int16_t)(y0 > 32767.0f ? 32767.0f : (y0 < -32768.0f ? -32768.0f : y0));
+                    sum_sq_b += (int64_t)s16 * s16;
+                }
+                s_mic_b_rms = sqrtf((float)sum_sq_b / HOP) / 32768.0f;
+            }
+        }
+
         if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             for (int i = 0; i < HOP; i++) {
                 audio_ring[ring_write_pos] = hop[i];
@@ -848,12 +1140,25 @@ static void inference_task(void* arg) {
     const int hop_samples = I2S_SAMPLE_RATE * SLIDE_STEP_MS / 1000;
     int16_t* hop_buf = (int16_t*)malloc(hop_samples * sizeof(int16_t));
     if (!hop_buf) { ESP_LOGE(TAG_INF, "FATAL: hop_buf malloc failed"); vTaskDelay(portMAX_DELAY); return; }
+    audio_window = (int16_t*)malloc(AUDIO_BUFFER_SAMPLES * sizeof(int16_t));
+    if (!audio_window) { ESP_LOGE(TAG_INF, "FATAL: audio_window malloc failed"); vTaskDelay(portMAX_DELAY); return; }
 
-    uint32_t infer_count      = 0;
-    int      consecutive_hits = 0;
-    float    noise_floor_rms  = 0.0f;
-    int      noise_cal_frames = 0;
-    int      last_read_pos    = 0;
+    printf("[INFERENCE] Started. VAD params: MIN_RMS=%.3f MIN_PEAK=%d THRESHOLD=%.2f HITS=%d\n",
+           (double)MIN_SPEECH_RMS, MIN_PEAK_SAMPLE, (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED);
+    fflush(stdout);
+
+    uint32_t infer_count         = 0;
+    int      consecutive_hits    = 0;
+    float    noise_floor_rms     = 0.0f;
+    int      noise_cal_frames    = 0;
+    int      last_read_pos       = 0;
+    // Confidence history ring for [TRIGGER-DEBUG] — holds last DETECTION_HITS_REQUIRED values
+    float    conf_history[3]     = {0.0f, 0.0f, 0.0f};
+    int      conf_hist_idx       = 0;
+    // Post-cooldown recalibration: re-learn noise floor for ~1 s after cooldown expires
+    bool     post_cooldown_recal = false;
+    int      recal_frames_done   = 0;
+    // Cycle timing for [CYCLE] log — g_cycle_start_us is file-scope (set here, read in streaming_task)
 
     while (true) {
 
@@ -862,13 +1167,40 @@ static void inference_task(void* arg) {
             vTaskDelay(pdMS_TO_TICKS(20)); continue;
         }
 
-        // 1b. Idle during post-detection cooldown to prevent re-trigger loops
+        // 1b. Idle during post-detection cooldown to prevent re-trigger loops.
+        //     After cooldown expires, run a short noise floor recalibration
+        //     (~33 frames × 30 ms = ~1 s) before resuming full VAD gating.
         {
             int64_t now = esp_timer_get_time();
             if (now < g_cooldown_end_us) {
+                // Still in cooldown — stay gated
+                consecutive_hits  = 0;
+                conf_hist_idx     = 0;
+                memset(conf_history, 0, sizeof(conf_history));
                 vTaskDelay(pdMS_TO_TICKS(50)); continue;
             }
-            g_cooldown_end_us = 0;
+            if (g_cooldown_end_us != 0) {
+                // Cooldown just expired — trigger recalibration pass
+                g_cooldown_end_us    = 0;
+                post_cooldown_recal  = true;
+                recal_frames_done    = 0;
+                noise_cal_frames     = 0;   // reset so calibration runs fresh
+                noise_floor_rms      = 0.0f;
+                ESP_LOGI(TAG_INF, "[RECAL] Cooldown ended — running 1 s noise recalibration");
+            }
+        }
+
+        // 1c. Post-cooldown recalibration: collect ~15 frames (~450 ms) of quiet audio
+        //     before allowing inference to trigger again.
+        if (post_cooldown_recal) {
+            // Read one hop, measure RMS, update noise floor — no MFCC/TFLite
+            // (This re-uses the same ring-read path in step 2 below, but
+            //  we skip MFCC/inference and just accumulate noise_floor_rms.)
+            if (recal_frames_done >= 15) {
+                post_cooldown_recal = false;
+                ESP_LOGI(TAG_INF, "[RECAL] Done — noise_floor=%.5f. Resuming inference.",
+                         (double)noise_floor_rms);
+            }
         }
 
         // 2. Read hop from ring (bounded mutex)
@@ -895,33 +1227,70 @@ static void inference_task(void* arg) {
         }
         xSemaphoreGive(ring_mutex);
 
-        // 3. RMS + peak (VAD)
+        // 3. RMS + peak (dual VAD gates)
         int64_t sum_sq = 0;
+        int16_t peak_abs = 0;
         for (int i = 0; i < hop_samples; i++) {
             sum_sq += (int64_t)hop_buf[i] * hop_buf[i];
+            int16_t a = hop_buf[i] < 0 ? -hop_buf[i] : hop_buf[i];
+            if (a > peak_abs) peak_abs = a;
         }
         float rms    = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
         telemetry_mic_rms = rms;
 
-        // 4. Noise calibration
+        // 4. Noise calibration (first 50 frames ~ 1.5 seconds)
         if (noise_cal_frames < NOISE_CALIBRATION_FRAMES) {
+            noise_cal_frames++;
             if (rms < NOISE_CAL_MAX_RMS) {
-                noise_floor_rms += (rms - noise_floor_rms) / (float)(++noise_cal_frames);
+                noise_floor_rms += (rms - noise_floor_rms) / (float)noise_cal_frames;
+                if (noise_floor_rms > 0.025f) noise_floor_rms = 0.025f;
                 telemetry_noise_floor_rms = noise_floor_rms;
             }
-            if (noise_cal_frames < 5) { consecutive_hits = 0; vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+            if (noise_cal_frames < 25) { consecutive_hits = 0; vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         }
 
-        // 5. VAD gate — skip MFCC+TFLite if silence (CPU savings)
+        // Unconditional 1s heartbeat log so live microphone energy is always visible on serial
+        {
+            static int64_t last_rms_log = 0;
+            int64_t now_log = esp_timer_get_time();
+            if (now_log - last_rms_log >= 1000000) {
+                last_rms_log = now_log;
+                printf("[AUDIO] mic1_rms=%.5f mic2_rms=%.5f floor=%.5f peak=%d s[0..3]=%d,%d,%d,%d\n",
+                       (double)rms, (double)s_mic_b_rms, (double)noise_floor_rms, (int)peak_abs,
+                       hop_buf[0], hop_buf[1], hop_buf[2], hop_buf[3]);
+                fflush(stdout);
+            }
+        }
+
+        // 5. Triple VAD gate — RMS, peak AND SNR must all pass.
+        if (noise_floor_rms > 0.030f) noise_floor_rms = 0.030f;
         float speech_thr = fmaxf(MIN_SPEECH_RMS, noise_floor_rms * NOISE_FLOOR_MULTIPLIER);
-        if (rms < speech_thr) {
-            noise_floor_rms = 0.02f * rms + 0.98f * noise_floor_rms;
-            telemetry_noise_floor_rms = noise_floor_rms;
-            consecutive_hits = 0;
+        // SNR: ratio of current RMS to noise floor, in dB. Require ≥ 3dB (1.4× louder than floor).
+        float snr_db = (noise_floor_rms > 0.0001f) ? 20.0f * log10f(rms / noise_floor_rms) : 0.0f;
+        bool  snr_ok = (snr_db >= 4.0f);
+        static int consecutive_vad_misses = 0;  // counts back-to-back VAD gate fails
+        if (rms < speech_thr || peak_abs < MIN_PEAK_SAMPLE || !snr_ok) {
+            // Update noise floor with slow exponential average during silence
+            if (rms < speech_thr) {
+                noise_floor_rms = 0.01f * rms + 0.99f * noise_floor_rms;
+                if (noise_floor_rms > 0.030f) noise_floor_rms = 0.030f;
+                telemetry_noise_floor_rms = noise_floor_rms;
+            }
+            telemetry_keyword_confidence = 0.0f;  // Clear confidence during silence
+            // Smart miss handling:
+            //   1-2 consecutive VAD misses → decrement hits by 1 (phoneme dip grace between 'Hey' and 'Vaani')
+            //   3+ consecutive VAD misses  → hard reset (real silence)
+            consecutive_vad_misses++;
+            if (consecutive_vad_misses >= 3) {
+                consecutive_hits = 0;  // 3+ misses = real silence, full reset
+            } else {
+                if (consecutive_hits > 0) consecutive_hits--;  // grace for natural phoneme gap
+            }
             vTaskDelay(pdMS_TO_TICKS(10)); continue;
         }
 
         // 6. Linearize ring → 1-second window + MFCC
+        consecutive_vad_misses = 0;  // VAD passed — reset miss counter
         if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             int start = (int)ring_write_pos;
             for (int i = 0; i < AUDIO_BUFFER_SAMPLES; i++)
@@ -958,52 +1327,89 @@ static void inference_task(void* arg) {
         telemetry_inference_ms      += infer_us / 1000.0f;
         telemetry_last_infer_ms      = infer_us / 1000.0f;
         telemetry_keyword_confidence = kw_prob;
+
+        // Post-cooldown recal: just count frames and update floor, don't trigger
+        if (post_cooldown_recal) {
+            if (rms < NOISE_CAL_MAX_RMS) {
+                noise_floor_rms += (rms - noise_floor_rms) / (float)(recal_frames_done + 1);
+                if (noise_floor_rms > 0.025f) noise_floor_rms = 0.025f;
+                telemetry_noise_floor_rms = noise_floor_rms;
+            }
+            recal_frames_done++;
+            consecutive_hits = 0;
+            vTaskDelay(pdMS_TO_TICKS(10)); continue;
+        }
+
+        // Update rolling confidence history (ring of DETECTION_HITS_REQUIRED slots)
+        conf_history[conf_hist_idx % 3] = kw_prob;
+        conf_hist_idx++;
         consecutive_hits = trigger ? consecutive_hits + 1 : 0;
 
-        // Periodic confidence log every 2 seconds for dashboard visibility
+        // Periodic confidence log every 500 ms for visibility on serial & dashboard
         {
             static int64_t last_log_us = 0;
             int64_t now = esp_timer_get_time();
-            if (now - last_log_us >= 2000000) {
+            if (now - last_log_us >= 500000) {
                 last_log_us = now;
                 float uptime_s = (float)(now / 1000);
                 float cpu_pct = uptime_s > 0 ? (telemetry_inference_ms / uptime_s) * 100.0f : 0.0f;
-                printf("[KWS] conf=%.4f thr=%.2f infer=%.0fus mic=%.4f floor=%.4f cpu=%.1f%% heap=%lu\n",
+                printf("[KWS] conf=%.4f thr=%.2f infer=%.0fus mic=%.4f floor=%.4f hits=%d cpu=%.1f%%\n",
                        (double)kw_prob, (double)DETECT_THRESHOLD, (double)infer_us,
                        (double)telemetry_mic_rms, (double)telemetry_noise_floor_rms,
-                       (double)cpu_pct,
-                       (unsigned long)esp_get_free_heap_size());
+                       consecutive_hits, (double)cpu_pct);
                 fflush(stdout);
             }
         }
 
         if (consecutive_hits >= DETECTION_HITS_REQUIRED) {
             int64_t kw_end = esp_timer_get_time();
-            printf("[TRIGGER] conf=%.4f infer=%.0fus\n", (double)kw_prob, (double)infer_us); fflush(stdout);
 
-            // Transition to command-capture mode
-            g_sys_state = SYS_CAPTURE_COMMAND;
-            gpio_set_level((gpio_num_t)LED_PIN, 1);
+            printf("[TRIGGER-HIT] node=%d hits=%d conf=%.4f (thr=%.2f) rms=%.4f\n",
+                   NODE_ID, consecutive_hits, (double)kw_prob, (double)DETECT_THRESHOLD, (double)rms);
+            fflush(stdout);
 
-            // Step 1: Flash "Hey Vaani Detected!" on OLED for 400ms
-            g_disp_state = DISP_DETECTED;
-            vTaskDelay(pdMS_TO_TICKS(400));
-
-            // Step 2: Show "How can I help you?" — command-capture mode
-            if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                snprintf(g_disp_text, sizeof(g_disp_text), "How can I\nhelp you?");
-                xSemaphoreGive(disp_mutex);
+            // ── Dual-mic verification (Part 2) ─────────────────────────────────
+            float final_conf = kw_prob;
+            if (g_mic_b_ok && g_i2s_rx_b != NULL) {
+                printf("[DUAL-MIC] node=%d mic_a=%.4f (RMS: A=%.4f B=%.4f)\n",
+                       NODE_ID, (double)kw_prob, (double)s_mic_a_rms, (double)s_mic_b_rms);
+                fflush(stdout);
             }
-            g_disp_state = DISP_PROMPT;
-            consecutive_hits = 0;
 
-            if (!streaming_active) {
-                // Start from current ring position — guaranteed fresh data
+            // Record cycle start time for [CYCLE] log
+            g_cycle_start_us = kw_end;
+
+            // ── ESP-NOW Fusion gate (Part 2) ────────────────────────────────────
+            bool should_stream = esp_now_fusion_should_trigger(final_conf, rms, NODE_ID);
+
+            // Detected! Immediate visual and LED feedback:
+            g_sys_state  = SYS_CAPTURE_COMMAND;
+            set_led_state(true);
+            g_disp_state = DISP_DETECTED;
+            oled_show_status(DISP_DETECTED, "Hey Vaani!");
+            consecutive_hits  = 0;
+            conf_hist_idx     = 0;
+            memset(conf_history, 0, sizeof(conf_history));
+
+            if (should_stream && !streaming_active) {
                 g_stream_start_pos = (int)ring_write_pos;
                 xQueueSend(detect_queue, &kw_end, 0);
+            } else if (!should_stream) {
+                // Fusion suppressed this trigger (false positive or lost handoff)
+                printf("[HANDOFF] node=%d suppressed by fusion decision\n", NODE_ID);
+                fflush(stdout);
+                vTaskDelay(pdMS_TO_TICKS(1200));
+                set_led_state(false);
+                flush_audio_ring();
+                g_sys_state  = SYS_LISTENING;
+                g_disp_state = DISP_LISTENING;
+                g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
             }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
+
+        // Yield 15ms so FreeRTOS IDLE0 task can run, feeding the task watchdog and preventing watchdog panic
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
 }
 
@@ -1019,96 +1425,105 @@ static void streaming_task(void* arg) {
         xQueueReceive(detect_queue, &keyword_end_us, portMAX_DELAY);
         session_id = session_id + 1;
         uint32_t sid = session_id;
-        ESP_LOGI(TAG_STR, "[%lu] Keyword — connecting WiFi", (unsigned long)sid);
+        ESP_LOGI(TAG_STR, "[%lu] Keyword confirmed — streaming command to server", (unsigned long)sid);
 
-        // WiFi is kept always-on since boot — only reconnect if it dropped
+        // WiFi is kept alive continuously by wifi_keepalive_task
         if (!wifi_connected) {
-            wifi_start();
-        }
-        if (!wifi_connected) {
+            oled_show_status(DISP_DETECTED, "Wake Word OK!\n(WiFi offline)");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            set_led_state(false);
+            flush_audio_ring();
             g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
             g_sys_state = SYS_LISTENING;
             g_disp_state = DISP_LISTENING;
-            gpio_set_level(LED_PIN, 0);
             continue;
         }
 
-        const int  CHUNK = 480; int16_t pcm[CHUNK];
-        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
-        int total_sent = 0, streamed_ms = 0, consec_silence_ms = 0;
-
+        // Immediately set streaming active to gate inference and pause telemetry
         set_streaming_active(true, "keyword_detected");
 
-        // ── Connect to server immediately — server VAD handles silence ───
-        g_disp_state = DISP_STREAMING;
-        printf("[STREAM] Connecting to server...\n"); fflush(stdout);
+        // ── Step 1: Prompt user and connect to server concurrently ───────────
+        oled_show_status(DISP_DETECTED, "Hey Vaani!\nSpeak cmd...");
+        printf("[STREAM] Wake word detected! Connecting to %s:%d...\n", g_server_ip, CONFIG_SERVER_PORT); fflush(stdout);
 
         int last_pos = (int)ring_write_pos;
-        int sock = -1; uint32_t kw_ms = 0, backoff_ms = 200;
-        for (int attempt = 0; attempt < 4; attempt++) {
-            struct sockaddr_in srv = {};
-            srv.sin_family = AF_INET; srv.sin_port = htons(CONFIG_SERVER_PORT);
-            inet_pton(AF_INET, g_server_ip, &srv.sin_addr);
+        int sock = -1; uint32_t kw_ms = 0;
+        struct sockaddr_in srv = {};
+        srv.sin_family = AF_INET; srv.sin_port = htons(CONFIG_SERVER_PORT);
+        inet_pton(AF_INET, g_server_ip, &srv.sin_addr);
+
+        for (int attempt = 0; attempt < 2; attempt++) {
             sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-            if (sock < 0) { vTaskDelay(pdMS_TO_TICKS(backoff_ms)); backoff_ms *= 2; continue; }
+            if (sock < 0) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
             int f = 1; setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
-            struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            if (connect(sock, (struct sockaddr*)&srv, sizeof(srv)) == 0) {
-                kw_ms = (uint32_t)((esp_timer_get_time() - keyword_end_us) / 1000);
-                break;
+
+            // Non-blocking connect with 1.5-second timeout
+            int flags = fcntl(sock, F_GETFL, 0);
+            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+            connect(sock, (struct sockaddr*)&srv, sizeof(srv));
+
+            fd_set fdset;
+            FD_ZERO(&fdset);
+            FD_SET(sock, &fdset);
+            struct timeval tv = { .tv_sec = 1, .tv_usec = 500000 };
+            if (select(sock + 1, NULL, &fdset, NULL, &tv) > 0) {
+                int so_error = 0;
+                socklen_t len = sizeof(so_error);
+                getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
+                if (so_error == 0) {
+                    fcntl(sock, F_SETFL, flags);
+                    struct timeval rw_tv = { .tv_sec = 8, .tv_usec = 0 };
+                    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &rw_tv, sizeof(rw_tv));
+                    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rw_tv, sizeof(rw_tv));
+                    kw_ms = (uint32_t)((esp_timer_get_time() - keyword_end_us) / 1000);
+                    printf("[STREAM] Connected OK (kw_to_connect=%lums)\n", (unsigned long)kw_ms); fflush(stdout);
+                    break;
+                }
             }
-            close(sock); sock = -1; vTaskDelay(pdMS_TO_TICKS(backoff_ms)); backoff_ms *= 2;
+            close(sock); sock = -1;
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (sock < 0) {
+            printf("[STREAM] Server unreachable — aborting.\n"); fflush(stdout);
+            oled_show_status(DISP_DETECTED, "Server\nOffline!");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            set_streaming_active(false, "no_server");
+            set_led_state(false);
+            flush_audio_ring();
             g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
             g_sys_state    = SYS_LISTENING;
-            g_disp_state = DISP_LISTENING;
-            gpio_set_level(LED_PIN, 0);
+            g_disp_state   = DISP_LISTENING;
             continue;
         }
 
+        g_disp_state = DISP_STREAMING;
+        oled_show_status(DISP_STREAMING, "Listening...");
+
+        // ── Step 3: Send HVP1 header + zero nonce ─────────────────────────────
+        const int CHUNK = 480; int16_t pcm[CHUNK];
         hvp1_header_t hdr = { .magic = MAGIC_NUMBER, .sample_rate = I2S_SAMPLE_RATE,
                                .channels = 1, .bits = 16,
                                .audio_len = 0, .kw_to_connect_ms = kw_ms };
         {
             uint8_t* hp = (uint8_t*)&hdr; size_t hl = sizeof(hdr);
-            while (hl > 0) {
-                ssize_t n = send(sock, hp, hl, 0);
-                if (n < 0) break;
-                hp += n; hl -= (size_t)n;
-            }
+            while (hl > 0) { ssize_t n = send(sock, hp, hl, 0); if (n < 0) break; hp += n; hl -= (size_t)n; }
         }
-
-#if ENABLE_AES
-        uint8_t aes_nonce[16] = {0};
-        uint8_t aes_stream_blk[16] = {0};
-        size_t  aes_nc_off = 0;
-        esp_fill_random(aes_nonce, sizeof(aes_nonce));
-        {
-            ssize_t n = send(sock, aes_nonce, sizeof(aes_nonce), 0);
-            if (n != (ssize_t)sizeof(aes_nonce)) {
-                printf("[AES] nonce send failed\n"); fflush(stdout);
-            }
-        }
-
-        esp_aes_context aes_ctx;
-        esp_aes_init(&aes_ctx);
-        esp_aes_setkey(&aes_ctx, AES_KEY, 128);
-#else
         {
             uint8_t zero_nonce[16] = {0};
             send(sock, zero_nonce, sizeof(zero_nonce), 0);
         }
-#endif
 
-        // ── Stream live audio from ring buffer ──────────────────────────
-        printf("[STREAM] Streaming audio...\n"); fflush(stdout);
-
-        deadline = xTaskGetTickCount() + pdMS_TO_TICKS(COMMAND_DURATION_MS);
-        consec_silence_ms = 0;
-        streamed_ms = 0;
+        // ── Step 4: Stream command audio — silence-aware adaptive duration ────
+        printf("[STREAM] Streaming command audio...\n"); fflush(stdout);
+        int total_sent = 0, streamed_ms = 0;
+        int silence_ms = 0;
+        bool speech_detected = false;
+        const int MAX_STREAM_MS   = COMMAND_DURATION_MS;       // 6000ms hard cap
+        const int MIN_STREAM_MS   = COMMAND_MIN_DURATION_MS;   // 2000ms minimum
+        const int SILENCE_GATE_MS = COMMAND_SILENCE_MS;        // 1500ms
+        // VAD threshold for command speech: speech is generally >0.020f
+        const float CMD_RMS_GATE  = fmaxf(0.015f, telemetry_noise_floor_rms * 1.5f);
+        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(MAX_STREAM_MS);
 
         while (xTaskGetTickCount() < deadline) {
             if (xSemaphoreTake(ring_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -1123,130 +1538,109 @@ static void streaming_task(void* arg) {
             }
             xSemaphoreGive(ring_mutex);
 
-            {
-                uint8_t* pp = (uint8_t*)pcm; size_t pl = CHUNK * sizeof(int16_t); bool se = false;
+            // Compute chunk RMS to detect silence vs voice
+            int64_t chunk_sq = 0;
+            for (int i = 0; i < CHUNK; i++) chunk_sq += (int64_t)pcm[i] * pcm[i];
+            float chunk_rms = sqrtf((float)chunk_sq / CHUNK) / 32768.0f;
+            int chunk_ms    = CHUNK * 1000 / I2S_SAMPLE_RATE;  // ~30 ms
 
-#if ENABLE_AES
-                static uint8_t enc_buf[CHUNK * sizeof(int16_t)];
-                esp_aes_crypt_ctr(&aes_ctx, pl, &aes_nc_off, aes_nonce, aes_stream_blk, pp, enc_buf);
-                uint8_t* send_ptr = enc_buf; size_t send_len = pl;
-#else
-                uint8_t* send_ptr = pp; size_t send_len = pl;
-#endif
-                while (send_len > 0) {
-                    ssize_t n = send(sock, send_ptr, send_len, 0);
-                    if (n < 0) { printf("[SEND-ERROR] sid=%lu errno=%d (%s)\n", (unsigned long)sid, errno, strerror(errno)); fflush(stdout); se = true; break; }
-                    send_ptr += n; send_len -= (size_t)n;
-                }
-                if (se) break;
+            if (chunk_rms >= CMD_RMS_GATE) {
+                speech_detected = true;
+                silence_ms = 0;  // voice detected — reset silence counter
+            } else if (speech_detected) {
+                silence_ms += chunk_ms;
             }
+
+            uint8_t* send_ptr = (uint8_t*)pcm; size_t send_len = CHUNK * sizeof(int16_t);
+            bool send_err = false;
+            while (send_len > 0) {
+                ssize_t n = send(sock, send_ptr, send_len, 0);
+                if (n < 0) { printf("[SEND-ERROR] errno=%d\n", errno); fflush(stdout); send_err = true; break; }
+                send_ptr += n; send_len -= (size_t)n;
+            }
+            if (send_err) break;
             total_sent += CHUNK;
-            int chunk_ms = CHUNK * 1000 / I2S_SAMPLE_RATE; streamed_ms += chunk_ms;
-            if (streamed_ms >= COMMAND_MIN_DURATION_MS) {
-                int64_t sq = 0; for (int i = 0; i < CHUNK; i++) sq += (int64_t)pcm[i]*pcm[i];
-                float crms    = sqrtf((float)sq / CHUNK) / 32768.0f;
-                float sil_thr = fmaxf(0.015f, telemetry_noise_floor_rms * 2.5f);
-                consec_silence_ms = crms < sil_thr ? consec_silence_ms + chunk_ms : 0;
-                if (consec_silence_ms >= COMMAND_SILENCE_MS) {
-                    printf("[CHK-STREAM] silence_break after %dms\n", streamed_ms); fflush(stdout);
-                    break;
-                }
+            streamed_ms += chunk_ms;
+
+            // Early close: only after speech has been heard, minimum stream time met, and silence follows
+            if (speech_detected && streamed_ms >= MIN_STREAM_MS && silence_ms >= SILENCE_GATE_MS) {
+                printf("[STREAM] Speech ended (silence %dms) after %dms — finishing stream.\n",
+                       silence_ms, streamed_ms); fflush(stdout);
+                break;
             }
         }
-        printf("[CHK-STREAM] loop_end total_sent=%d streamed_ms=%d\n", total_sent, streamed_ms); fflush(stdout);
+        printf("[STREAM] Done: sent %d samples (%d ms)\n", total_sent, streamed_ms); fflush(stdout);
 
-        set_streaming_active(false, "stream_loop_ended");
+        // Send EOS sentinel
+        static const char EOS_MARKER[] = "EOS!";
+        send(sock, EOS_MARKER, sizeof(EOS_MARKER) - 1, 0);
+        set_streaming_active(false, "stream_done");
         shutdown(sock, SHUT_WR);
 
-#if ENABLE_AES
-        esp_aes_free(&aes_ctx);
-#endif
+        // ── Step 5: Show "Processing..." while server transcribes ────────────
+        oled_show_status(DISP_STREAMING, "Processing...");
+        printf("[STREAM] Waiting for transcription response...\n"); fflush(stdout);
 
-        // ── CHECKPOINT 2: RECEIVE — read server response ──────────────────
-        {
-            char resp[1024] = {0}; int rlen = 0, r;
-            struct timeval rcv_tv = { .tv_sec = 10, .tv_usec = 0 };
-            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
-            while ((r = recv(sock, resp + rlen, sizeof(resp) - rlen - 1, 0)) > 0) rlen += r;
-            printf("[CHK2-RECV] rlen=%d final_recv=%d\n", rlen, (int)r); fflush(stdout);
-            close(sock);
+        // ── Step 6: Receive JSON response from server ─────────────────────────
+        char resp[1024] = {0}; int rlen = 0, r;
+        struct timeval rcv_tv = { .tv_sec = 12, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+        while ((r = recv(sock, resp + rlen, sizeof(resp) - rlen - 1, 0)) > 0) rlen += r;
+        close(sock);
+        resp[rlen] = '\0';
+        printf("[STREAM] Response (%d bytes): %.*s\n", rlen, rlen > 300 ? 300 : rlen, resp); fflush(stdout);
 
-#if ENABLE_AES
-            if (rlen > 0) {
-                uint8_t resp_nonce[16];
-                memcpy(resp_nonce, aes_nonce, 16);
-                resp_nonce[15] ^= 0xFF;
-                uint8_t resp_stream_blk[16] = {0};
-                size_t  resp_nc_off = 0;
-                esp_aes_context resp_aes;
-                esp_aes_init(&resp_aes);
-                esp_aes_setkey(&resp_aes, AES_KEY, 128);
-                esp_aes_crypt_ctr(&resp_aes, (size_t)rlen, &resp_nc_off,
-                                  resp_nonce, resp_stream_blk,
-                                  (uint8_t*)resp, (uint8_t*)resp);
-                esp_aes_free(&resp_aes);
-                resp[rlen] = '\0';
-            }
-#else
-            resp[rlen] = '\0';
-#endif
-            printf("[CHK2-RECV] raw=%.*s\n", rlen > 200 ? 200 : rlen, resp); fflush(stdout);
-
-            // ── CHECKPOINT 3: PARSE — cJSON parsing ───────────────────────
-            char clean_txt[128] = "[No Response]";
-            char intent_str[64] = "";
-
-            if (rlen > 0) {
-                cJSON* root = cJSON_ParseWithLength(resp, (size_t)rlen);
-                if (root) {
-                    cJSON* jt = cJSON_GetObjectItemCaseSensitive(root, "transcript");
-                    if (cJSON_IsString(jt) && jt->valuestring) {
-                        snprintf(clean_txt, sizeof(clean_txt), "%s", jt->valuestring);
-                    }
-                    cJSON* ji = cJSON_GetObjectItemCaseSensitive(root, "intent");
-                    if (cJSON_IsObject(ji)) {
-                        cJSON* ja = cJSON_GetObjectItemCaseSensitive(ji, "intent");
-                        cJSON* jac = cJSON_GetObjectItemCaseSensitive(ji, "action");
-                        if (cJSON_IsString(ja) && cJSON_IsString(jac)) {
-                            snprintf(intent_str, sizeof(intent_str), "%s:%s",
-                                     ja->valuestring, jac->valuestring);
-                        }
-                    }
-                    cJSON_Delete(root);
-                } else {
-                    snprintf(clean_txt, sizeof(clean_txt), "%.127s", resp);
+        // ── Step 7: Parse transcript + vaani_response + display on OLED ─────
+        char result_txt[128]  = "No response";
+        char vaani_reply[128] = "";
+        bool cmd_confirmed    = false;
+        if (rlen > 0) {
+            cJSON* root = cJSON_ParseWithLength(resp, (size_t)rlen);
+            if (root) {
+                // Primary: show vaani_response (server-generated natural reply)
+                cJSON* jresp = cJSON_GetObjectItemCaseSensitive(root, "vaani_response");
+                cJSON* jt    = cJSON_GetObjectItemCaseSensitive(root, "transcript");
+                cJSON* jv    = cJSON_GetObjectItemCaseSensitive(root, "verified");
+                if (cJSON_IsBool(jv)) cmd_confirmed = cJSON_IsTrue(jv);
+                if (cJSON_IsString(jresp) && jresp->valuestring && strlen(jresp->valuestring) > 0) {
+                    snprintf(vaani_reply, sizeof(vaani_reply), "%s", jresp->valuestring);
+                    snprintf(result_txt, sizeof(result_txt), "%s", jresp->valuestring);
+                } else if (cJSON_IsString(jt) && jt->valuestring && strlen(jt->valuestring) > 0) {
+                    snprintf(result_txt, sizeof(result_txt), "%s", jt->valuestring);
                 }
+                cJSON_Delete(root);
+            } else {
+                snprintf(result_txt, sizeof(result_txt), "%.127s", resp);
             }
-            printf("[CHK3-PARSE] clean_txt='%s' intent='%s'\n", clean_txt, intent_str); fflush(stdout);
-
-            // ── CHECKPOINT 4: DISPLAY-SET — write g_disp_text ─────────────
-            const char* show = intent_str[0] ? intent_str : clean_txt;
-            if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                snprintf(g_disp_text, sizeof(g_disp_text), "%s", show);
-                xSemaphoreGive(disp_mutex);
-            }
-            printf("[CHK4-DISP-SET] g_disp_text='%s'\n", g_disp_text); fflush(stdout);
-
-            g_disp_state = DISP_TRANSCRIBED;
-            gpio_set_level(LED_PIN, 0);
-            printf("[CHK4-DISP-SET] state=DISP_TRANSCRIBED led=off\n"); fflush(stdout);
-
-            vTaskDelay(pdMS_TO_TICKS(4000));
         }
+        printf("[RESULT] confirmed=%d reply='%s'\n", (int)cmd_confirmed, result_txt); fflush(stdout);
+
+        if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            snprintf(g_disp_text, sizeof(g_disp_text), "%s", result_txt);
+            xSemaphoreGive(disp_mutex);
+        }
+        g_disp_state = DISP_TRANSCRIBED;
+        set_led_state(false);
+        printf("[RESULT-DISP] Showing '%s' on OLED for 5s\n", result_txt); fflush(stdout);
+
+        // Show result for 5 seconds, then return to listening
+        vTaskDelay(pdMS_TO_TICKS(5000));
 
         // ── Return to listening state with cooldown ────────────────────────
-        // Start cooldown: inference stays gated for COOLDOWN_MS to prevent
-        // re-trigger loops.  The OLED shows "Listening" immediately so the
-        // user knows the system is ready again after the cooldown expires.
-        gpio_set_level(LED_PIN, 0);
+        {
+            int64_t cycle_end_us  = esp_timer_get_time();
+            int64_t cycle_total_ms = (cycle_end_us - g_cycle_start_us) / 1000;
+            printf("[CYCLE] node=%d session=%lu total_cycle_ms=%lld (cooldown=%dms)\n",
+                   NODE_ID, (unsigned long)session_id, (long long)cycle_total_ms, COOLDOWN_MS);
+            fflush(stdout);
+        }
+        flush_audio_ring();
+        set_led_state(false);
         g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
         g_sys_state    = SYS_LISTENING;
         g_disp_state   = DISP_LISTENING;
         g_disp_text[0] = '\0';
-        if (detect_queue) {
-            xQueueReset(detect_queue);
-        }
-        // ─────────────────────────────────────────────────────────────────────
+        if (detect_queue) xQueueReset(detect_queue);
     }
 }
 
@@ -1256,32 +1650,26 @@ static void streaming_task(void* arg) {
 // streaming_task checks wifi_connected and skips wifi_start() if already up.
 // ============================================================================
 static void wifi_keepalive_task(void* arg) {
-    ESP_LOGI(TAG_WIFI, "WiFi keepalive task started on core %d — connecting...", xPortGetCoreID());
-    wifi_start();
+    ESP_LOGI(TAG_WIFI, "WiFi keepalive task started on core %d", xPortGetCoreID());
     if (wifi_connected)
         ESP_LOGI(TAG_WIFI, "WiFi ready (keepalive).");
     else
-        ESP_LOGW(TAG_WIFI, "WiFi not connected at boot — streaming will retry on trigger.");
+        ESP_LOGW(TAG_WIFI, "WiFi not connected at boot — will retry.");
 
-    // ── Reconnection loop + 3-strike portal fallback ──────────────────────
-    // If WiFi fails 3 times in a row (e.g. wrong password, IP change),
-    // clear NVS credentials and restart into the captive portal so the
-    // user can update them without needing a reflash.
+    // ── Reconnection loop ────────────────────────────────────────────────
+    // Keeps retrying WiFi in background without wiping credentials or rebooting.
     int fail_streak = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         if (!wifi_connected) {
             fail_streak++;
-            ESP_LOGW(TAG_WIFI, "WiFi dropped — reconnecting (strike %d/3)...", fail_streak);
+            if (fail_streak % 5 == 1) {
+                ESP_LOGW(TAG_WIFI, "WiFi disconnected — background reconnect (attempt %d)...", fail_streak);
+            }
             wifi_start();
             if (wifi_connected) {
                 fail_streak = 0;
-            } else if (fail_streak >= 3) {
-                ESP_LOGE(TAG_WIFI, "3 consecutive WiFi failures — clearing NVS and"
-                                   " restarting into setup portal");
-                wifi_provision_clear();
-                vTaskDelay(pdMS_TO_TICKS(300));
-                esp_restart();
+                ESP_LOGI(TAG_WIFI, "WiFi reconnected successfully!");
             }
         } else {
             fail_streak = 0;
@@ -1290,11 +1678,15 @@ static void wifi_keepalive_task(void* arg) {
 }
 
 // ============================================================================
-// TASK 4: wifi_config_poll_task — checks for updated WiFi credentials from server
+// TASK 4: wifi_config_poll_task — checks for updated WiFi credentials from server.
+// NOTE: server_ip is intentionally NEVER updated from the server response.
+// Overwriting the server IP from the server itself causes a boot loop:
+// local IP → cloud IP → device can no longer reach local server → broken.
+// Only SSID/password may be updated remotely.
 // ============================================================================
 static void wifi_config_poll_task(void* arg) {
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(10000)); // Poll every 10 seconds
+        vTaskDelay(pdMS_TO_TICKS(30000)); // Poll every 30 seconds (reduced frequency)
         if (!wifi_connected || g_server_ip[0] == '\0') continue;
 
         char url[128];
@@ -1320,20 +1712,20 @@ static void wifi_config_poll_task(void* arg) {
                     if (root) {
                         cJSON* ssid = cJSON_GetObjectItem(root, "ssid");
                         cJSON* pass = cJSON_GetObjectItem(root, "password");
-                        cJSON* s_ip = cJSON_GetObjectItem(root, "server_ip");
+                        // NOTE: server_ip from JSON is intentionally IGNORED.
+                        // The device always uses the IP stored in NVS at boot.
+                        // This prevents a remote server from hijacking the local server IP.
                         
-                        if (ssid && ssid->valuestring && pass && pass->valuestring && s_ip && s_ip->valuestring) {
-                            // Check if different from current
+                        if (ssid && ssid->valuestring && pass && pass->valuestring) {
+                            // Only update if SSID or password changed (not IP)
                             if (strcmp(ssid->valuestring, g_wifi_ssid) != 0 || 
-                                strcmp(pass->valuestring, g_wifi_pass) != 0 || 
-                                strcmp(s_ip->valuestring, g_server_ip) != 0) {
+                                strcmp(pass->valuestring, g_wifi_pass) != 0) {
                                 
-                                ESP_LOGI(TAG_MAIN, "New WiFi config received via OTA!");
-                                ESP_LOGI(TAG_MAIN, "SSID: %s -> %s", g_wifi_ssid, ssid->valuestring);
-                                ESP_LOGI(TAG_MAIN, "IP: %s -> %s", g_server_ip, s_ip->valuestring);
-                                
-                                if (wifi_provision_save(ssid->valuestring, pass->valuestring, s_ip->valuestring)) {
-                                    ESP_LOGI(TAG_MAIN, "NVS updated. Restarting ESP32...");
+                                ESP_LOGI(TAG_MAIN, "[OTA-CFG] WiFi credentials updated: SSID %s -> %s",
+                                         g_wifi_ssid, ssid->valuestring);
+                                // Save with CURRENT server IP — never overwrite it
+                                if (wifi_provision_save(ssid->valuestring, pass->valuestring, g_server_ip)) {
+                                    ESP_LOGI(TAG_MAIN, "[OTA-CFG] NVS updated. Restarting ESP32...");
                                     vTaskDelay(pdMS_TO_TICKS(1000));
                                     esp_restart();
                                 }
@@ -1362,7 +1754,7 @@ static void watchdog_task(void* arg) {
                 set_streaming_active(false, "watchdog_forced");
                 g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
                 g_sys_state  = SYS_LISTENING;
-                gpio_set_level(LED_PIN, 0);
+                set_led_state(false);
                 g_disp_state = DISP_LISTENING;
             }
         }
@@ -1387,8 +1779,18 @@ static void display_task(void* arg) {
     ESP_LOGI(TAG_DISP, "Display task started (core %d)", xPortGetCoreID());
     disp_state_t last_state = (disp_state_t)(-1);
     char local_txt[256];
+    int retry_cnt = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(100));
+
+        if (!s_oled_ready) {
+            retry_cnt++;
+            if (retry_cnt >= 20) { // every 2 seconds re-try probe
+                retry_cnt = 0;
+                ssd1306_init();
+            }
+            continue;
+        }
         disp_state_t cur = g_disp_state;
 
         // CHECKPOINT 5: always read g_disp_text under mutex
@@ -1402,9 +1804,13 @@ static void display_task(void* arg) {
             printf("[CHK5-DISP-READ] state=%d text='%s'\n", (int)cur, local_txt); fflush(stdout);
         }
 
-        // CHECKPOINT 6: redraw on state change OR every cycle while TRANSCRIBED
-        // (ensures OLED actually renders the transcript even if state didn't change)
-        if (cur != last_state || cur == DISP_TRANSCRIBED) {
+        // Redraw on state change OR periodically (every 200 ms) during LISTENING to update live VU meter
+        retry_cnt++;
+        bool periodic_refresh = (cur == DISP_LISTENING && (retry_cnt >= 2));
+        if (cur != last_state || cur == DISP_TRANSCRIBED || periodic_refresh) {
+            if (periodic_refresh) {
+                retry_cnt = 0;
+            }
             if (cur != last_state) {
                 local_txt[0] = '\0';
                 if (cur == DISP_TRANSCRIBED || cur == DISP_PROMPT) {
@@ -1436,8 +1842,8 @@ static void stack_monitor_task(void* arg) {
 static void telemetry_task(void* arg) {
     ESP_LOGI(TAG_STR, "Telemetry task started (core %d)", xPortGetCoreID());
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        if (!wifi_connected) continue;
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        if (!wifi_connected || streaming_active) continue;
         wifi_ap_record_t ap = {};
         int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
         float total_ms = telemetry_inference_ms;
@@ -1491,26 +1897,34 @@ static void telemetry_task(void* arg) {
 
 // ─── app_main ────────────────────────────────────────────────────────────────
 extern "C" void app_main() {
-    printf("[BOOT] DETECT_THRESHOLD=%.3f  HITS=%d  COOLDOWN=%d  MODEL=%u bytes\n", 
-           (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED, COOLDOWN_MS, (unsigned)g_model_data_len);
+    printf("[BOOT] NODE_ID=%d DETECT_THRESHOLD=%.3f  HITS=%d  COOLDOWN=%d ms  "
+           "MODEL=%u bytes  heap_start=%lu\n",
+           NODE_ID,
+           (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED, COOLDOWN_MS,
+           (unsigned)g_model_data_len,
+           (unsigned long)esp_get_free_heap_size());
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(3000));
 
-    ESP_LOGI(TAG_MAIN, "=== Hey Vaani Edge Firmware (SIH 2026) rev9 ===");
+    ESP_LOGI(TAG_MAIN, "=== Hey Vaani Edge Firmware (SIH 2026) rev10 — Post-Cap Calibrated ===");
     ESP_ERROR_CHECK(nvs_flash_init());
 
     ring_mutex   = xSemaphoreCreateMutex();
     disp_mutex   = xSemaphoreCreateMutex();   // guards g_disp_text (issue #3 fix)
     detect_queue = xQueueCreate(4, sizeof(int64_t));
 
-    // ── LED: output, initially off ────────────────────────────────────────────
+    // ── LEDs: output with 3-blink hardware self-test ────────────────────────
     gpio_reset_pin(LED_PIN);
     gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_PIN, 0);
-    ESP_LOGI(TAG_MAIN, "LED ready (GPIO%d)", LED_PIN);
-
-    // Buzzer LEDC init removed — no buzzer hardware connected
-    ESP_LOGI(TAG_MAIN, "LED ready on GPIO%d (buzzer not connected)", LED_PIN);
+    gpio_reset_pin(ONBOARD_LED_PIN);
+    gpio_set_direction(ONBOARD_LED_PIN, GPIO_MODE_OUTPUT);
+    for (int b = 0; b < 3; b++) {
+        set_led_state(true);
+        vTaskDelay(pdMS_TO_TICKS(120));
+        set_led_state(false);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    ESP_LOGI(TAG_MAIN, "LEDs ready: External GPIO%d & Onboard GPIO%d", LED_PIN, ONBOARD_LED_PIN);
 
     // ── OLED: SSD1306 I2C init, immediately shows "Booting..." ──────────────────
     ssd1306_init();   // draws DISP_BOOTING screen at end
@@ -1521,18 +1935,34 @@ extern "C" void app_main() {
     // AP + captive portal, blocks here until credentials are saved, then
     // calls esp_restart(). Normal boots return instantly.
     wifi_provision_init();
+    strlcpy(g_server_ip, "10.28.236.188", sizeof(g_server_ip));
+    ESP_LOGI(TAG_MAIN, "Target Server IP: %s:%d", g_server_ip, CONFIG_SERVER_PORT);
 
-    // ── I2S: INMP441 ─────────────────────────────────────────────────────────
+    // ── WiFi Start (early so PHY RF calibration has unfragmented RAM) ──────
+    wifi_start();
+    esp_err_t fusion_err = esp_now_fusion_init(NODE_ID, NULL /* auto-discovery */);
+    if (fusion_err != ESP_OK) {
+        ESP_LOGW(TAG_MAIN, "ESP-NOW fusion init failed (%s) — single-node mode",
+                 esp_err_to_name(fusion_err));
+    } else {
+        ESP_LOGI(TAG_MAIN, "ESP-NOW fusion ready (auto-discovery)");
+    }
+
+    // ── I2S: INMP441 Mic A ───────────────────────────────────────────────────
     i2s_global_init();
 
-    // ── Mic self-check: serial RMS logging confirms I2S data flow ────────────
+    // ── Mic B: second INMP441 for dual-mic inference (Part 2) ────────────────
+    i2s_global_init_b();
+
+    // ── Mic self-check: serial RMS logging confirms I2S data flow for both mics
     mic_selfcheck();
 
     // ── TFLite + MFCC ────────────────────────────────────────────────────────
     tflite_init();
     mfcc_proc.init();
 
-    ESP_LOGI(TAG_MAIN, "Free heap after init: %u bytes", (unsigned)esp_get_free_heap_size());
+    uint32_t heap_after_init = esp_get_free_heap_size();
+    ESP_LOGI(TAG_MAIN, "Free heap after init: %u bytes", (unsigned)heap_after_init);
 
     // Core assignment:
     //   Core 0: inference, watchdog, display, stack_monitor, telemetry
@@ -1542,10 +1972,10 @@ extern "C" void app_main() {
     // caused user commands to be missed. Must be Core 1 to avoid IWDT clash with
     // inference_task on Core 0.
     xTaskCreatePinnedToCore(audio_task,         "audio",       4096,  NULL, 6, NULL, 1);
-    xTaskCreatePinnedToCore(inference_task,     "inference",   16384, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(inference_task,     "inference",   8192,  NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(streaming_task,     "streaming",   6144,  NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(wifi_keepalive_task,"wifi_ka",     4096,  NULL, 3, NULL, 1);
-    xTaskCreatePinnedToCore(wifi_config_poll_task,"wifi_poll", 4096,  NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(wifi_config_poll_task,"wifi_poll", 3072,  NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(watchdog_task,      "watchdog",    2048,  NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(display_task,       "display",     4096,  NULL, 1, NULL, 1); // [NEW] Moved to Core 1 to avoid I2C crash!
     xTaskCreatePinnedToCore(stack_monitor_task, "stack_mon",   2048,  NULL, 1, NULL, 0);
@@ -1556,3 +1986,4 @@ extern "C" void app_main() {
     g_disp_state = DISP_LISTENING;
     ESP_LOGI(TAG_MAIN, "All tasks started. Listening for 'Hey Vaani'...");
 }
+

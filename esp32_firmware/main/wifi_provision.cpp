@@ -52,7 +52,7 @@ static const char* TAG = "PROV";
 // ─── Exported globals ────────────────────────────────────────────────────────
 char g_wifi_ssid[PROV_SSID_MAX] = "Khush's A55";
 char g_wifi_pass[PROV_PASS_MAX] = "khush2073";
-char g_server_ip[PROV_IP_MAX]   = "13.233.154.18";
+char g_server_ip[PROV_IP_MAX]   = "10.28.236.188";
 
 
 // ─── Setup portal HTML ───────────────────────────────────────────────────────
@@ -169,16 +169,11 @@ static void parse_field(const char* body, const char* key,
  * Returns true only if SSID is non-empty (i.e. credentials were stored).
  */
 static bool nvs_load_credentials(void) {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
-
-    size_t sl = PROV_SSID_MAX, pl = PROV_PASS_MAX, il = PROV_IP_MAX;
-    bool ok = (nvs_get_str(h, NVS_KEY_SSID, g_wifi_ssid, &sl) == ESP_OK) &&
-              (nvs_get_str(h, NVS_KEY_PASS, g_wifi_pass, &pl) == ESP_OK) &&
-              (nvs_get_str(h, NVS_KEY_IP,   g_server_ip, &il) == ESP_OK) &&
-              (g_wifi_ssid[0] != '\0');
-    nvs_close(h);
-    return ok;
+    // Force hardcoded credentials for testing
+    strncpy(g_wifi_ssid, "Khush's A55", PROV_SSID_MAX);
+    strncpy(g_wifi_pass, "khush2073", PROV_PASS_MAX);
+    strncpy(g_server_ip, "10.28.236.188", PROV_IP_MAX);
+    return true;
 }
 
 /** Save SSID / password / server IP to NVS. Returns true on success. */

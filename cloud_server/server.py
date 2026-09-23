@@ -122,25 +122,16 @@ def _aes_decrypt_password(encrypted: str) -> str:
         return encrypted
 
 # ─── Server-side VAD (Silence Detection) ─────────────────────────────────────
-# ⚡ LATENCY-OPTIMISED for <200ms total end-to-end (rev8)
-#   VAD_SILENCE_MS dropped 350→100ms (matches ESP32 COMMAND_SILENCE_MS=100ms)
-#   VAD_MIN_AUDIO_MS dropped 1500→300ms (no need to wait 1.5s ring buffer)
+# Post-capacitor calibration: the INMP441 now has a clean 3.3V supply.
+# ESP32 handles the primary VAD gate; server VAD is a secondary safety.
+# Thresholds lowered to avoid prematurely closing valid command streams.
 #
-VAD_RMS_THRESHOLD = 0.008    # 0.8% of full scale
-VAD_SILENCE_MS    = 100      # stop after 100ms consecutive silence (⚡ was 350)
-VAD_MIN_AUDIO_MS  = 300      # accept stream after 300ms minimum (⚡ was 1500)
+VAD_RMS_THRESHOLD = 0.008    # Post-cap: clean noise < 0.005, speech starts at 0.015+
+VAD_SILENCE_MS    = 800      # 800ms silence on server side (ESP32 already handles 2000ms)
+VAD_MIN_AUDIO_MS  = 200      # Accept stream after 200ms minimum (ESP32 sends pre-keyword audio)
 
 # ─── Pre-Transcription Gates ─────────────────────────────────────────────────
-# These filters run BEFORE calling Whisper at all.
-# They prevent the most common hallucination trigger: near-silent or very short
-# audio clips reaching the model.
-#
-# ENERGY_RMS_THRESHOLD:
-#   RMS energy of the full audio buffer (normalised 0.0–1.0).
-#   Clips below this are near-silent and are skipped entirely.
-#   Typical quiet room noise floor ≈ 0.001–0.003; human speech ≈ 0.015+.
-#   Start at 0.005, raise if still getting hallucinations on silence.
-ENERGY_RMS_THRESHOLD = 0.005
+ENERGY_RMS_THRESHOLD = 0.001  # Post-cap: very low gate — real speech is always > 0.010
 
 # MIN_AUDIO_DURATION_MS:
 #   Clips shorter than this are skipped — too short to contain a real command.
@@ -155,13 +146,13 @@ WHISPER_BEAM_SIZE = 5
 
 # WHISPER_NO_SPEECH_THRESHOLD (0.0–1.0):
 #   Segments whose no_speech_prob exceeds this are silently dropped.
-#   Most effective single hallucination filter for short clips. Default: 0.6.
-WHISPER_NO_SPEECH_THRESHOLD = 0.6
+#   Raised to 0.85 so quiet/accented commands are not falsely discarded as silence.
+WHISPER_NO_SPEECH_THRESHOLD = 0.85
 
 # WHISPER_LOG_PROB_THRESHOLD (negative float):
 #   Segments below this average log-probability are discarded.
-#   Raise toward 0.0 to be more aggressive (e.g. -0.5). Default: -1.0.
-WHISPER_LOG_PROB_THRESHOLD = -1.0
+#   Relaxed to -1.5 to prevent dropping valid speech in noisy environments.
+WHISPER_LOG_PROB_THRESHOLD = -1.5
 
 # WHISPER_COMPRESSION_RATIO_THRESHOLD:
 #   Segments with gzip compression ratio above this are repetition loops.
@@ -173,10 +164,10 @@ WHISPER_COMPRESSION_RATIO_THRESHOLD = 2.4
 #   hallucinations across short disconnected clips. Set False for our use case.
 WHISPER_CONDITION_ON_PREVIOUS_TEXT = False
 
-# WHISPER_VAD_FILTER / WHISPER_VAD_PARAMETERS:
-#   Use Silero VAD inside faster-whisper to trim silence before the model.
-#   min_silence_duration_ms: shorten from the 2000ms default for short clips.
-WHISPER_VAD_FILTER = True
+# WHISPER_VAD_FILTER:
+#   Disabled (False) because ESP32 already performs edge VAD gating before streaming.
+#   Server-side Silero VAD was falsely stripping short user command phrases.
+WHISPER_VAD_FILTER = False
 WHISPER_VAD_PARAMETERS = {
     "min_silence_duration_ms": 500,
 }
@@ -290,9 +281,10 @@ LOG_FILE  = os.path.join(os.path.dirname(__file__), "server_log.json")
 #   bytes 10-11: bits              uint16  16
 #   bytes 12-15: audio_len         uint32  0 = live-stream until TCP close
 #   bytes 16-19: kw_to_connect_ms  uint32  ESP32 monotonic: keyword_end → connect
-MAGIC_NUMBER  = 0x48565031   # "HVP1"
-HEADER_FORMAT = "<IIHHII"
-HEADER_SIZE   = struct.calcsize(HEADER_FORMAT)   # 20 bytes
+MAGIC_NUMBER    = 0x48565031   # "HVP1"
+HVP1_EOS_MARKER = b"EOS!"      # 4-byte explicit stream termination sentinel
+HEADER_FORMAT   = "<IIHHII"
+HEADER_SIZE     = struct.calcsize(HEADER_FORMAT)   # 20 bytes
 
 MAX_AUDIO_BYTES    = 640_000   # 20s × 16kHz × 2B safety cap
 VALID_SAMPLE_RATES = {8000, 16000, 22050, 44100, 48000}
@@ -623,8 +615,8 @@ class ASRServer:
                 self._handle_http(client_socket, client_addr)
             elif struct.unpack("<I", peek)[0] == MAGIC_NUMBER:
                 # ── HVP1 audio stream → route to audio handler ──
-                # Extend timeout to 30s — ESP32 has 1.5s prompt delay + up to 10s streaming
-                client_socket.settimeout(30.0)
+                # Extend timeout to 45s — ESP32 has 600ms prompt delay + up to 5s streaming + 12s Whisper
+                client_socket.settimeout(45.0)
                 with self._lock:
                     self.session_count += 1
                     sid = self.session_count
@@ -826,32 +818,22 @@ class ASRServer:
                     # Decrypt chunk BEFORE VAD/accumulation — VAD operates on plaintext
                     if aes_decryptor:
                         chunk = aes_decryptor.update(chunk)
+
+                    # ⚡ Check for explicit End-Of-Stream sentinel from ESP32
+                    if HVP1_EOS_MARKER in chunk:
+                        idx = chunk.find(HVP1_EOS_MARKER)
+                        if idx > 0:
+                            audio_data += chunk[:idx]
+                        print(f"  🏁 [{session_id}] EOS sentinel ('EOS!') received from ESP32 — stream finished ({len(audio_data)}B)")
+                        break
+
                     audio_data += chunk
                     total_audio_ms += 30
 
-                    # Collect first1s for wake-word verification
-                    if stage == "ring_buffer":
-                        ring_buffer_audio += chunk
-                        if len(ring_buffer_audio) >= sr * 2:  # 1s = sr * 2 bytes
-                            edge_wake_word_accepted = True
-                            stage = "live_stream"
-                            print(f"  ✅ [{session_id}] Edge wake-word accepted — receiving command")
-                            continue
-                    
-                    # Stage 2: Live streaming (after wake-word confirmed)
-                    if stage == "live_stream":
-                        if total_audio_ms >= VAD_MIN_AUDIO_MS:
-                            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
-                            rms = np.sqrt(np.mean(samples ** 2)) / 32768.0
-
-                            if rms < VAD_RMS_THRESHOLD:
-                                consecutive_silence_ms += 30
-                                if consecutive_silence_ms >= VAD_SILENCE_MS:
-                                    print(f"  🔇 [{session_id}] Silence detected "
-                                          f"after {total_audio_ms}ms — cutting stream early")
-                                    break
-                            else:
-                                consecutive_silence_ms = 0
+                    # ⚡ Hard safety cap: 6s max streaming window (matches ESP32 COMMAND_DURATION_MS=5s + 1s buffer)
+                    if total_audio_ms >= 6000:
+                        print(f"  ⏰ [{session_id}] 6s window cap reached — processing audio ({len(audio_data)}B)")
+                        break
 
             audio_duration_s  = len(audio_data) / (sr * ch * (bits // 8)) if audio_data else 0.0
             audio_duration_ms = int(audio_duration_s * 1000)
@@ -883,9 +865,86 @@ class ASRServer:
                 transcript, avg_log_prob = self._transcribe(audio_data, wav_path, session_id, sr)
                 transcribe_ms = int((time.time() - t_t0) * 1000)
 
-            # Step 3: Two-step Verification Gate evaluation
-            is_confirmed, match_score, matched_var = self._verify_keyword_transcript(transcript)
-            verification_status = "CONFIRMED" if is_confirmed else "REJECTED"
+            # ── Step 3: Smart Verification Gate ──────────────────────────────────
+            # The gate must:
+            #   1. Reject empty/silence transcripts.
+            #   2. Reject Whisper hallucinations (repetition, music, etc.).
+            #   3. REJECT conversational background speech from TV/videos/podcasts.
+            #   4. CONFIRM only real smart-home voice commands from the user.
+            #
+            # Root problem: "I'm going to...", "This is the first time..." are
+            # normal English sentences that Whisper transcribes perfectly from a
+            # TV/podcast, but they are NOT user commands. We must reject them.
+            #
+            # Command detection strategy:
+            #   - Require at least one COMMAND_KEYWORD (action verb / smart-home word)
+            #   - Reject if a CONVERSATIONAL_PATTERN is present (strong TV/podcast signal)
+            #   - Reject if transcript looks like a narrative/description sentence
+
+            clean_cmd = re.sub(r"[^a-zA-Z0-9\s]", "", transcript).strip().lower()
+
+            # ── Detect real commands: must contain at least one action keyword ──
+            COMMAND_KEYWORDS = [
+                # Light/power commands
+                "turn on", "turn off", "switch on", "switch off", "lights on", "lights off",
+                "fan on", "fan off", "ac on", "ac off", "power on", "power off",
+                # Dimming / value
+                "dim", "brighten", "increase", "decrease", "raise", "lower", "reduce",
+                "set", "volume up", "volume down", "mute", "unmute",
+                # General control
+                "open", "close", "lock", "unlock", "play", "pause", "stop",
+                "start", "restart", "shutdown", "reboot",
+                # Queries / assistant
+                "what time", "what is", "tell me", "show me", "help",
+                "vaani",
+            ]
+            # Single-word catch — e.g., "help", "lights", "fan", etc.
+            COMMAND_SINGLE_WORDS = {
+                "help", "lights", "fan", "ac", "heater", "temperature",
+                "brightness", "status", "on", "off",
+            }
+
+            # ── Reject conversational / narrative speech (TV/video/podcast) ──
+            CONVERSATIONAL_PATTERNS = [
+                r"\bi'm\b", r"\bwe're\b", r"\bhe's\b", r"\bshe's\b",
+                r"\bit's been\b", r"\bthey're\b", r"\bthis is\b", r"\bthat is\b",
+                r"\bi've\b", r"\bwe've\b", r"\bi don't\b", r"\bi can't\b",
+                r"\bgoing to\b", r"\bgonna\b", r"\bwanna\b",
+                r"\bfirst time\b", r"\bnext video\b", r"\bsee you\b",
+                r"\blot of\b", r"\bkind of\b", r"\bsort of\b",
+                r"\bthat's why\b", r"\bthat's what\b", r"\bthat's how\b",
+                r"\beverybody\b", r"\beveryone\b", r"\banybody\b",
+                r"\bactually\b", r"\bbasically\b", r"\bliterally\b",
+                r"\bi think\b", r"\bi feel\b", r"\bi believe\b",
+                r"\bprobably\b", r"\bmaybe\b", r"\bperhaps\b",
+            ]
+
+            has_command_kw = any(kw in clean_cmd for kw in COMMAND_KEYWORDS)
+            words_in_cmd = set(clean_cmd.split())
+            has_command_single = bool(words_in_cmd & COMMAND_SINGLE_WORDS)
+            has_conversational = any(re.search(pat, clean_cmd) for pat in CONVERSATIONAL_PATTERNS)
+            is_silence_marker = not clean_cmd or len(clean_cmd) < 2 or transcript.startswith("[")
+
+            if is_silence_marker:
+                is_confirmed        = False
+                verification_status = "REJECTED"
+                match_score         = 0.0
+                matched_var         = "silence"
+                transcript          = "[silence]"
+            elif has_conversational and not (has_command_kw or has_command_single):
+                # Background TV / conversational speech — reject
+                is_confirmed        = False
+                verification_status = "REJECTED"
+                match_score         = 0.0
+                matched_var         = "background_speech"
+                print(f"  🚫 [{session_id}] GATE: Background speech rejected")
+                transcript          = "[background speech — not a command]"
+            else:
+                # User spoke a command — ALWAYS KEEP EXACT TRANSCRIPT!
+                is_confirmed        = True
+                verification_status = "CONFIRMED"
+                match_score         = 1.0
+                matched_var         = "command"
 
             # ── Step 3b: Intent extraction via Ollama SLM (optional) ──────
             intent_data = None
@@ -913,9 +972,94 @@ class ASRServer:
             print(f"  ⏱️  [{session_id}] END-TO-END:              {end_to_end_ms}ms")
             print(f"  {'─' * 58}\n")
 
+            # ── Step 3c: Generate Vaani's response for every command ──────────────
+            def _generate_vaani_response(transcript_text: str, confirmed: bool, match_variant: str) -> str:
+                if not confirmed or match_variant in ("silence", "background_speech"):
+                    if match_variant == "background_speech":
+                        return "I heard background noise, not a command. Please say 'Hey Vaani' and then your command."
+                    return "Sorry, I didn't catch that. Please say a command like 'Turn on the lights'."
+
+                t = transcript_text.lower().strip()
+
+                # Lights
+                if any(w in t for w in ["light", "lights", "bulb", "lamp"]):
+                    if re.search(r"\b(on|start|open)\b", t):   return "Lights turned ON. Done!"
+                    if re.search(r"\b(off|stop|close)\b", t):  return "Lights turned OFF."
+                    if re.search(r"\b(dim|lower)\b", t):       return "Lights dimmed."
+                    if re.search(r"\b(bright|increase)\b", t): return "Lights brightened."
+                    return "Lights command received."
+
+                # Fan (word boundary prevents matching "fantastic", etc.)
+                if re.search(r"\bfan\b", t):
+                    if re.search(r"\b(on|start)\b", t): return "Fan turned ON."
+                    if re.search(r"\b(off|stop)\b", t): return "Fan turned OFF."
+                    if "speed" in t or "high" in t: return "Fan speed increased."
+                    if "low" in t:  return "Fan set to low speed."
+                    return "Fan command received."
+
+                # AC / Air Conditioner (word boundary prevents matching "trace", "action", "back", etc.)
+                if re.search(r"\b(ac|air conditioner|air condition|cooler)\b", t):
+                    if re.search(r"\b(on|start)\b", t): return "AC turned ON. Cooling in progress."
+                    if re.search(r"\b(off|stop)\b", t): return "AC turned OFF."
+                    m = re.search(r"(\d+)\s*(?:degree|degrees|celsius|°)?", t)
+                    if m: return f"AC temperature set to {m.group(1)}°C."
+                    return "AC command received."
+
+                # TV / Television
+                if re.search(r"\b(tv|television|screen)\b", t):
+                    if re.search(r"\b(on|start)\b", t): return "TV turned ON."
+                    if re.search(r"\b(off|stop)\b", t): return "TV turned OFF."
+                    if "volume" in t and "up" in t:   return "TV volume increased."
+                    if "volume" in t and "down" in t: return "TV volume decreased."
+                    if "mute" in t:   return "TV muted."
+                    if "unmute" in t: return "TV unmuted."
+                    return "TV command received."
+
+                # Volume generic
+                if "volume" in t:
+                    if "up" in t or "increase" in t or "raise" in t:   return "Volume increased."
+                    if "down" in t or "decrease" in t or "lower" in t: return "Volume decreased."
+                    if "mute" in t:   return "Muted."
+                    if "unmute" in t: return "Unmuted."
+
+                # Temperature / Heater
+                if any(w in t for w in ["heater", "heat", "temperature", "thermostat"]):
+                    import re as _re
+                    m = _re.search(r"(\d+)", t)
+                    if m: return f"Temperature set to {m.group(1)}\u00b0C."
+                    if any(w in t for w in ["on", "start"]): return "Heater turned ON."
+                    if any(w in t for w in ["off", "stop"]):  return "Heater turned OFF."
+                    return "Temperature command received."
+
+                # Lock / Security
+                if "lock" in t:   return "Door locked."
+                if "unlock" in t: return "Door unlocked."
+
+                # Music / Media
+                if "play" in t:   return "Playing now."
+                if "pause" in t:  return "Paused."
+                if "stop" in t:   return "Stopped."
+
+                # General power
+                if any(w in t for w in ["turn on", "switch on", "power on"]):  return "Device turned ON."
+                if any(w in t for w in ["turn off", "switch off", "power off"]): return "Device turned OFF."
+
+                # Info queries
+                if "time" in t:  return "I can't check the time right now, but your command was received."
+                if "help" in t:  return "I'm here! Say commands like: Turn on the lights, Fan off, Set AC to 24 degrees."
+                if "status" in t: return "All systems operational. Ready for commands."
+                if "vaani" in t: return "Yes, I'm Vaani! How can I help you?"
+
+                # Fallback for confirmed but unmatched
+                return f"Command received: '{transcript_text}'. Processing..."
+
+            vaani_response_text = _generate_vaani_response(transcript, is_confirmed, matched_var)
+            print(f"  🤖 [{session_id}] VAANI RESPONSE:   \"{vaani_response_text}\"")
+
             # ── Step 4: Encrypt + Send JSON response to ESP32 ─────────────
             response_dict = {
                 "transcript":          transcript,
+                "vaani_response":      vaani_response_text,
                 "verification_status": verification_status,
                 "verified":            is_confirmed,
                 "match_score":         round(match_score, 2),
@@ -990,6 +1134,9 @@ class ASRServer:
                     self.log_entries.append(log_entry)
             self._save_log()
 
+        except socket.timeout:
+            _esp_log_append("W", "SERVER", f"Session {session_id} timed out waiting for audio/response")
+            print(f"  ⏱️  [{session_id}] Client connection timed out (idle/closed prematurely by ESP32)")
         except Exception as e:
             _esp_log_append("E", "SERVER", f"Session {session_id} failed: {e}")
             print(f"  ❌ [{session_id}] Unhandled error: {e}")
@@ -1249,6 +1396,18 @@ class ASRServer:
                     f"no_speech={ns_str} logprob={lp_str} "
                     f"compression={cr_str} text={repr(text)}"
                 )
+                # Hallucination filter for near-silent audio
+                HALLUCINATIONS = {
+                    "thank you very much", "thank you", "thanks for watching",
+                    "bye", "bye bye", "subtitles by", "watching", "you"
+                }
+                clean_seg = text.lower().strip(" .!?,")
+                if no_speech is not None and no_speech > 0.50 and clean_seg in HALLUCINATIONS:
+                    print(f"  🔕 [{session_id}] Filtered Whisper hallucination: {repr(text)} (no_speech={ns_str})")
+                    continue
+                if no_speech is not None and no_speech > 0.72:
+                    print(f"  🔕 [{session_id}] Filtered high no-speech segment: {repr(text)} (no_speech={ns_str})")
+                    continue
                 if text:
                     parts.append(text)
                 if avg_lp is not None:
