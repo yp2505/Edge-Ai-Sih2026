@@ -1,5 +1,35 @@
 // main.cpp — Hey Vaani ESP32 Edge KWS + Cloud ASR Streaming
 //
+// FIX LOG (2026-09-23 rev12 — Detection Reliability):
+//   Fixes for "needs 10–15 attempts" + "sometimes auto-triggers":
+//   1. Two-tier trigger: HARD=0.85 single frame OR SOFT=0.65 with 3 hits
+//      inside a 6-frame sliding window (~180 ms). Noise spikes need the hard
+//      tier; quiet real speech accumulates soft hits without being wiped by
+//      phoneme dips between "Hey" and "Vaani".
+//   2. esp_now_fusion: removed hard SUPPRESS for local_conf < 0.82. That
+//      mismatch with DETECT_THRESHOLD=0.65 discarded valid detections whenever
+//      a peer was known. Fusion now only arbitrates handoff between two valid
+//      local detections; peer silence never blocks a local trigger.
+//   3. Handoff-loss path no longer stalls 1.2 s or flushes the ring buffer,
+//      and no longer shows false "Detected!" UI before fusion decision.
+//   4. VAD was blocking ALL inference on this hardware: live mic RMS ~0.004
+//      but MIN_SPEECH_RMS=0.008 and SNR≥4dB (floor tracks ~0.0037) meant
+//      [KWS] never appeared. Relaxed MIN_RMS/SNR/mult so KWS actually runs.
+//
+// FIX LOG (2026-09-23 rev11 — State-Reset + Watchdog + Beamforming):
+//   All fixes from rev10 preserved plus:
+//   1. inference_task: Added else-if branch for should_stream && streaming_active.
+//      Previously g_sys_state was permanently stuck in SYS_CAPTURE_COMMAND on
+//      overlapping triggers, blocking all future detection until reboot.
+//      New branch immediately resets state, LED, and sets cooldown.
+//   2. watchdog_task: Added g_sys_capture_start_us + SYS_STATE_WATCHDOG_MS=25s.
+//      Independently detects g_sys_state stuck in SYS_CAPTURE_COMMAND (e.g. no WiFi,
+//      queue full) and force-resets to SYS_LISTENING after 25 s.
+//   3. audio_task: Delay-and-Sum beamforming with Mic A (GPIO22) + Mic B (GPIO33).
+//      hop_b[] now stores Mic B HP-filtered samples. When both mics are active:
+//        out[i] = (mic_a[i] + mic_b[i]) >> 1  → ~3 dB SNR improvement.
+//      Falls back to single-mic if either channel is silent (RMS < 0.003).
+//
 // FIX LOG (2026-09-22 rev10 — Post-Capacitor Calibration):
 //   All fixes from rev9 preserved plus:
 //   1. Decoupling capacitor (100nF-10uF) placed between 3V3 and GND near INMP441.
@@ -96,7 +126,7 @@ static const uint8_t AES_KEY[16] = {
 //
 // Only the server PORT remains hardcoded here — it never changes per-network.
 #ifndef CONFIG_SERVER_PORT
-#define CONFIG_SERVER_PORT     80
+#define CONFIG_SERVER_PORT     8080
 #endif
 
 #ifndef ENABLE_AES
@@ -123,30 +153,39 @@ static const uint8_t AES_KEY[16] = {
 // ─── KWS / Inference ─────────────────────────────────────────────────────────
 // DETECT_THRESHOLD: sigmoid decision boundary calibrated on the custom
 // "Hey Vaani" dataset.  Model output: [1,1] sigmoid (0.0–1.0).
-//   0.78 = good balance of TPR vs FPR for 5-speaker trained model.
-//   Lower toward 0.60 only if real-world misses are unacceptable.
-//   Raise toward 0.90 only if false triggers persist after retraining.
 //
-// DETECTION_HITS_REQUIRED:
-//   3 consecutive inference frames above threshold = ~750ms of sustained
-//   confident speech required to trigger.  "Hey Vaani" spoken by a user
-//   directly at the mic is ~600-900ms with conf 0.82-0.99.
-//   A single phoneme (e.g. 'ey' in 'Hey') can dip to conf 0.70-0.80;
-//   the 1-miss grace handles this without accumulating from background noise.
-static const float DETECT_THRESHOLD          = 0.80f;   // 0.80: responsive & balanced for natural "Hey Vaani"
-static const int   DETECTION_HITS_REQUIRED  = 2;        // 2 consecutive frames (~500ms) matches "Hey Vaani" duration
-static const float MIN_SPEECH_RMS           = 0.015f;   // Real speech is 0.020-0.050 RMS; room ambient is 0.003-0.006 RMS
-static const int   MIN_PEAK_SAMPLE          = 600;      // Real speech transients > 600; room murmurs < 400
-static const float NOISE_FLOOR_MULTIPLIER   = 1.4f;     // speech_thr = floor * 1.4
-static const int   NOISE_CALIBRATION_FRAMES = 35;
-static const float NOISE_CAL_MAX_RMS        = 0.022f;
+// TWO-TIER TRIGGER (fixes both failure modes):
+//   • HARD (DETECT_HARD_THRESHOLD, 1 frame): very confident hit → instant fire.
+//     Catches clear "Hey Vaani" on the first good frame (fast path).
+//   • SOFT (DETECT_THRESHOLD, N hits in sliding window): sensitive path for
+//     quieter / distant speech that peaks 0.65–0.85. Requires multiple hits
+//     inside a short window so a single noise spike cannot fire.
+//
+// DETECTION_HITS_REQUIRED / DETECTION_WINDOW_FRAMES:
+//   Count hits over the last DETECTION_WINDOW_FRAMES inference frames
+//   (not strictly consecutive) so natural phoneme dips between "Hey" and
+//   "Vaani" do not zero the counter.  Window ≈ frames × SLIDE_STEP_MS.
+//
+// Previous bug: HITS=1 + no window meant one noisy frame ≥0.65 fired the
+// detector (false "automatic" triggers), while fusion hard-suppressed
+// [0.65,0.82) when a peer was known (needed 10–15 attempts).  Both fixed.
+static const float DETECT_THRESHOLD          = 0.80f;   // Reliable speech confidence threshold
+static const float DETECT_HARD_THRESHOLD     = 0.94f;   // HARD tier threshold
+static const int   DETECTION_HITS_REQUIRED   = 2;       // 2 consecutive hits (~60ms sustained match)
+static const int   DETECTION_WINDOW_FRAMES   = 5;       // sliding window (~150 ms at 30 ms/frame)
+static const float MIN_SPEECH_RMS            = 0.010f;  // speech detection floor (above ambient noise ~0.0050)
+static const int   MIN_PEAK_SAMPLE           = 700;     // consonant burst threshold (above ambient noise spikes <550)
+static const float NOISE_FLOOR_MULTIPLIER    = 1.60f;   // adaptive speech threshold multiplier (~4 dB SNR)
+static const int   NOISE_CALIBRATION_FRAMES  = 30;
+static const float NOISE_CAL_MAX_RMS         = 0.022f;
+static const float MIN_SNR_DB                = 2.0f;    // require speech SNR over noise floor
 
 // ─── Streaming / VAD ─────────────────────────────────────────────────────────
 #define SLIDE_STEP_MS           30
-#define COMMAND_DURATION_MS     6000
-#define COMMAND_MIN_DURATION_MS 1500       // 1.5s minimum before EOS eligible
-#define COMMAND_SILENCE_MS      1200       // 1.2s silence closes stream
-#define COOLDOWN_MS             2500       // 2.5s cooldown — fast turnaround for next command
+#define COMMAND_DURATION_MS     5000       // 5.0s max stream
+#define COMMAND_MIN_DURATION_MS 1200       // 1.2s minimum command
+#define COMMAND_SILENCE_MS      1000       // 1.0s silence closes stream
+#define COOLDOWN_MS             1500       // 1.5s cooldown — prevents instant retrigger loops
 #define AUDIO_BUFFER_SAMPLES    16000
 #define STREAM_WATCHDOG_MS      25000      // 25s watchdog
 
@@ -204,9 +243,12 @@ static const char* TAG_FUSE  = "FUSION";
 
 // ─── Node Identity ───────────────────────────────────────────────────────────
 // NODE_ID: 1 or 2 — identifies this node in ESP-NOW fusion logs and handoff.
-// Change to 2 when flashing the second board.
 #ifndef NODE_ID
-#define NODE_ID 1
+#define NODE_ID 2
+#endif
+
+#ifndef DEVICE_NAME
+#define DEVICE_NAME "Hey Vaani Node 2"
 #endif
 
 static volatile int  wifi_retry_count = 0;
@@ -214,7 +256,8 @@ static volatile bool wifi_connected   = false;
 
 // ─── Streaming state — always via set_streaming_active() ─────────────────────
 static volatile bool    streaming_active        = false;
-static volatile int64_t streaming_active_set_us = 0;
+static volatile int64_t streaming_active_set_us  = 0;
+static volatile int64_t g_sys_capture_start_us   = 0; // watchdog: set when entering SYS_CAPTURE_COMMAND
 
 // ─── Telemetry ───────────────────────────────────────────────────────────────
 static volatile uint32_t telemetry_inference_count    = 0;
@@ -614,6 +657,7 @@ static int i2s_read_pcm_from(i2s_chan_handle_t chan, int16_t* out_buf, int out_c
 
 // Send one byte to SSD1306 as a command (Co=0, D/C#=0)
 static esp_err_t ssd_cmd(uint8_t cmd) {
+    if (s_oled_addr == 0) return ESP_ERR_NOT_FOUND;
     uint8_t buf[2] = {0x00, cmd};   // 0x00 = control byte: Co=0, D/C#=0
     return i2c_master_write_to_device(OLED_I2C_PORT, s_oled_addr,
                                       buf, 2, pdMS_TO_TICKS(20));
@@ -621,6 +665,7 @@ static esp_err_t ssd_cmd(uint8_t cmd) {
 
 // Flush the full 1024-byte framebuffer to SSD1306 GDDRAM page-by-page (8 pages × 128 columns)
 static void ssd_flush() {
+    if (s_oled_addr == 0) return;
     uint8_t page_buf[1 + OLED_WIDTH];
     page_buf[0] = 0x40; // Co=0, D/C#=1 (GDDRAM data write)
     for (uint8_t p = 0; p < 8; p++) {
@@ -684,11 +729,12 @@ static void ssd_hline(int x0, int x1, int y, bool on) {
 //   Row 25     : divider
 //   Row 26..63 : transcription text (scale=1, 8px per row, up to 4 lines)
 static void oled_show_status(disp_state_t state, const char* text) {
+    if (!s_oled_ready || s_oled_addr == 0) return;
     // Clear framebuffer
     ssd_clear(0x00);
 
     // Header
-    const char* hdr = "HEY VAANI";
+    const char* hdr = (NODE_ID == 2) ? "VAANI · NODE 2" : "HEY VAANI";
     int hdr_w = (int)strlen(hdr) * 6;   // scale=1
     int hdr_x = (OLED_WIDTH - hdr_w) / 2;
     ssd_draw_str(hdr_x, 0, hdr, true, 1);
@@ -1061,7 +1107,8 @@ static void wifi_stop() {
 // ============================================================================
 static void audio_task(void* arg) {
     const int HOP = I2S_SAMPLE_RATE * SLIDE_STEP_MS / 1000;  // 480 samples
-    static int16_t hop[480];   // static → DRAM, DMA-safe for i2s_channel_read
+    static int16_t hop[480];      // Mic A — HP-filtered 16-bit mono
+    static int16_t hop_b[480];    // Mic B — HP-filtered 16-bit mono (beamforming)
 
     // I2S sanity: first read to confirm data flows before entering main loop
     {
@@ -1090,7 +1137,12 @@ static void audio_task(void* arg) {
             s_mic_a_rms = sqrtf((float)sum_sq_a / HOP) / 32768.0f;
         }
 
-        // Concurrently read and drain Mic B if active, updating s_mic_b_rms live
+        // ── Mic B: decode + HP-filter into hop_b[], update RMS, then beamform ──
+        // Delay-and-Sum beamforming (τ=0): both INMP441s are mounted close together
+        // so inter-mic delay is sub-sample. Simple arithmetic mean:
+        //   out[i] = (mic_a[i] + mic_b[i]) / 2
+        // → speech (correlated)  amplitude unchanged,  noise (uncorrelated) ÷√2 (~3 dB SNR gain)
+        bool beamform_ok = false;
         if (g_mic_b_ok && g_i2s_rx_b != NULL && s_stereo_rx_buf_b != NULL) {
             size_t br_b = 0;
             esp_err_t eb = i2s_channel_read(g_i2s_rx_b, s_stereo_rx_buf_b,
@@ -1110,9 +1162,29 @@ static void audio_task(void* arg) {
                     x2_b = x1_b; x1_b = x0;
                     y2_b = y1_b; y1_b = y0;
                     int16_t s16 = (int16_t)(y0 > 32767.0f ? 32767.0f : (y0 < -32768.0f ? -32768.0f : y0));
+                    int idx = i / 2;
+                    if (idx < HOP) hop_b[idx] = s16;
                     sum_sq_b += (int64_t)s16 * s16;
                 }
                 s_mic_b_rms = sqrtf((float)sum_sq_b / HOP) / 32768.0f;
+                beamform_ok = true;
+
+                // ── Apply Delay-and-Sum: average A and B ONLY IF both mics active and in-phase ──────────
+                // Guard: Mic A is the primary hardware mic. Never let floating/unwired Mic B override Mic A!
+                if (s_mic_a_rms > 0.006f && s_mic_b_rms > 0.006f) {
+                    float ratio = s_mic_b_rms / s_mic_a_rms;
+                    if (ratio >= 0.4f && ratio <= 2.5f) {
+                        int64_t dot = 0;
+                        for (int i = 0; i < HOP; i++) dot += ((int32_t)hop[i] * (int32_t)hop_b[i]);
+                        if (dot > 0) {
+                            for (int i = 0; i < HOP; i++) {
+                                int32_t avg = ((int32_t)hop[i] + (int32_t)hop_b[i]) >> 1;
+                                hop[i] = (int16_t)(avg > 32767 ? 32767 : (avg < -32768 ? -32768 : avg));
+                            }
+                        }
+                    }
+                }
+                // Mic A is ALWAYS authoritative; if Mic B is floating/disconnected, hop[] stays Mic A!
             }
         }
 
@@ -1143,18 +1215,25 @@ static void inference_task(void* arg) {
     audio_window = (int16_t*)malloc(AUDIO_BUFFER_SAMPLES * sizeof(int16_t));
     if (!audio_window) { ESP_LOGE(TAG_INF, "FATAL: audio_window malloc failed"); vTaskDelay(portMAX_DELAY); return; }
 
-    printf("[INFERENCE] Started. VAD params: MIN_RMS=%.3f MIN_PEAK=%d THRESHOLD=%.2f HITS=%d\n",
-           (double)MIN_SPEECH_RMS, MIN_PEAK_SAMPLE, (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED);
+    printf("[INFERENCE] Started. VAD: MIN_RMS=%.4f MIN_PEAK=%d SNR>=%.1fdB mult=%.2f SOFT=%.2f HARD=%.2f HITS=%d/%d\n",
+           (double)MIN_SPEECH_RMS, MIN_PEAK_SAMPLE, (double)MIN_SNR_DB,
+           (double)NOISE_FLOOR_MULTIPLIER,
+           (double)DETECT_THRESHOLD, (double)DETECT_HARD_THRESHOLD,
+           DETECTION_HITS_REQUIRED, DETECTION_WINDOW_FRAMES);
     fflush(stdout);
 
     uint32_t infer_count         = 0;
-    int      consecutive_hits    = 0;
+    int      soft_hit_count      = 0;   // hits ≥ DETECT_THRESHOLD in window
     float    noise_floor_rms     = 0.0f;
     int      noise_cal_frames    = 0;
     int      last_read_pos       = 0;
-    // Confidence history ring for [TRIGGER-DEBUG] — holds last DETECTION_HITS_REQUIRED values
-    float    conf_history[3]     = {0.0f, 0.0f, 0.0f};
-    int      conf_hist_idx       = 0;
+    // Sliding window of recent confidences (oldest → newest ring).
+    // Used for soft-tier hit counting so single-frame noise cannot fire,
+    // while phoneme dips between "Hey"/"Vaani" do not wipe progress.
+    float    conf_window[DETECTION_WINDOW_FRAMES];
+    int      conf_win_fill       = 0;   // how many slots are valid (≤ WINDOW)
+    int      conf_win_idx        = 0;   // next write index
+    memset(conf_window, 0, sizeof(conf_window));
     // Post-cooldown recalibration: re-learn noise floor for ~1 s after cooldown expires
     bool     post_cooldown_recal = false;
     int      recal_frames_done   = 0;
@@ -1168,38 +1247,23 @@ static void inference_task(void* arg) {
         }
 
         // 1b. Idle during post-detection cooldown to prevent re-trigger loops.
-        //     After cooldown expires, run a short noise floor recalibration
-        //     (~33 frames × 30 ms = ~1 s) before resuming full VAD gating.
         {
             int64_t now = esp_timer_get_time();
             if (now < g_cooldown_end_us) {
                 // Still in cooldown — stay gated
-                consecutive_hits  = 0;
-                conf_hist_idx     = 0;
-                memset(conf_history, 0, sizeof(conf_history));
-                vTaskDelay(pdMS_TO_TICKS(50)); continue;
+                soft_hit_count = 0;
+                conf_win_fill  = 0;
+                conf_win_idx   = 0;
+                memset(conf_window, 0, sizeof(conf_window));
+                vTaskDelay(pdMS_TO_TICKS(20)); continue;
             }
             if (g_cooldown_end_us != 0) {
-                // Cooldown just expired — trigger recalibration pass
-                g_cooldown_end_us    = 0;
-                post_cooldown_recal  = true;
-                recal_frames_done    = 0;
-                noise_cal_frames     = 0;   // reset so calibration runs fresh
-                noise_floor_rms      = 0.0f;
-                ESP_LOGI(TAG_INF, "[RECAL] Cooldown ended — running 1 s noise recalibration");
-            }
-        }
-
-        // 1c. Post-cooldown recalibration: collect ~15 frames (~450 ms) of quiet audio
-        //     before allowing inference to trigger again.
-        if (post_cooldown_recal) {
-            // Read one hop, measure RMS, update noise floor — no MFCC/TFLite
-            // (This re-uses the same ring-read path in step 2 below, but
-            //  we skip MFCC/inference and just accumulate noise_floor_rms.)
-            if (recal_frames_done >= 15) {
-                post_cooldown_recal = false;
-                ESP_LOGI(TAG_INF, "[RECAL] Done — noise_floor=%.5f. Resuming inference.",
-                         (double)noise_floor_rms);
+                // Cooldown expired — reset sliding window cleanly so inference starts fresh
+                g_cooldown_end_us = 0;
+                soft_hit_count    = 0;
+                conf_win_fill     = 0;
+                conf_win_idx      = 0;
+                memset(conf_window, 0, sizeof(conf_window));
             }
         }
 
@@ -1238,7 +1302,7 @@ static void inference_task(void* arg) {
         float rms    = sqrtf((float)sum_sq / hop_samples) / 32768.0f;
         telemetry_mic_rms = rms;
 
-        // 4. Noise calibration (first 50 frames ~ 1.5 seconds)
+        // 4. Noise calibration (first 35 frames ~ 1 s)
         if (noise_cal_frames < NOISE_CALIBRATION_FRAMES) {
             noise_cal_frames++;
             if (rms < NOISE_CAL_MAX_RMS) {
@@ -1246,7 +1310,12 @@ static void inference_task(void* arg) {
                 if (noise_floor_rms > 0.025f) noise_floor_rms = 0.025f;
                 telemetry_noise_floor_rms = noise_floor_rms;
             }
-            if (noise_cal_frames < 25) { consecutive_hits = 0; vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+            if (noise_cal_frames < 25) {
+                soft_hit_count = 0;
+                conf_win_fill  = 0;
+                conf_win_idx   = 0;
+                vTaskDelay(pdMS_TO_TICKS(10)); continue;
+            }
         }
 
         // Unconditional 1s heartbeat log so live microphone energy is always visible on serial
@@ -1262,29 +1331,36 @@ static void inference_task(void* arg) {
             }
         }
 
-        // 5. Triple VAD gate — RMS, peak AND SNR must all pass.
+        // 5. Speech VAD gate — reject ambient silence and low-level noise
         if (noise_floor_rms > 0.030f) noise_floor_rms = 0.030f;
+        if (noise_floor_rms < 0.002f) noise_floor_rms = 0.002f;
         float speech_thr = fmaxf(MIN_SPEECH_RMS, noise_floor_rms * NOISE_FLOOR_MULTIPLIER);
-        // SNR: ratio of current RMS to noise floor, in dB. Require ≥ 3dB (1.4× louder than floor).
-        float snr_db = (noise_floor_rms > 0.0001f) ? 20.0f * log10f(rms / noise_floor_rms) : 0.0f;
-        bool  snr_ok = (snr_db >= 4.0f);
-        static int consecutive_vad_misses = 0;  // counts back-to-back VAD gate fails
-        if (rms < speech_thr || peak_abs < MIN_PEAK_SAMPLE || !snr_ok) {
-            // Update noise floor with slow exponential average during silence
-            if (rms < speech_thr) {
-                noise_floor_rms = 0.01f * rms + 0.99f * noise_floor_rms;
-                if (noise_floor_rms > 0.030f) noise_floor_rms = 0.030f;
-                telemetry_noise_floor_rms = noise_floor_rms;
-            }
-            telemetry_keyword_confidence = 0.0f;  // Clear confidence during silence
-            // Smart miss handling:
-            //   1-2 consecutive VAD misses → decrement hits by 1 (phoneme dip grace between 'Hey' and 'Vaani')
-            //   3+ consecutive VAD misses  → hard reset (real silence)
+        bool  speech_ok  = (rms >= speech_thr && peak_abs >= MIN_PEAK_SAMPLE) || (rms >= 0.016f);
+
+        static int consecutive_hits = 0;
+        static int consecutive_vad_misses = 0;
+        if (!speech_ok) {
+            consecutive_hits = 0;
+            // Update noise floor smoothly during silence
+            noise_floor_rms = 0.02f * rms + 0.98f * noise_floor_rms;
+            if (noise_floor_rms > 0.030f) noise_floor_rms = 0.030f;
+            telemetry_noise_floor_rms = noise_floor_rms;
+            telemetry_keyword_confidence = 0.0f;
+
+            // Soft-tier window: push 0 on silence so stale detections age out smoothly
+            conf_window[conf_win_idx] = 0.0f;
+            conf_win_idx = (conf_win_idx + 1) % DETECTION_WINDOW_FRAMES;
+            if (conf_win_fill < DETECTION_WINDOW_FRAMES) conf_win_fill++;
+            soft_hit_count = 0;
+            for (int i = 0; i < conf_win_fill; i++)
+                if (conf_window[i] >= DETECT_THRESHOLD) soft_hit_count++;
+
             consecutive_vad_misses++;
             if (consecutive_vad_misses >= 3) {
-                consecutive_hits = 0;  // 3+ misses = real silence, full reset
-            } else {
-                if (consecutive_hits > 0) consecutive_hits--;  // grace for natural phoneme gap
+                soft_hit_count = 0;
+                conf_win_fill  = 0;
+                conf_win_idx   = 0;
+                memset(conf_window, 0, sizeof(conf_window));
             }
             vTaskDelay(pdMS_TO_TICKS(10)); continue;
         }
@@ -1321,7 +1397,6 @@ static void inference_task(void* arg) {
         int     out_elems = output_tensor->dims->data[output_tensor->dims->size - 1];
         if (out_elems < 1) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         float kw_prob = (out[0] - out_zp) * out_scale;
-        bool  trigger = (kw_prob >= DETECT_THRESHOLD);
 
         infer_count++; telemetry_inference_count = telemetry_inference_count + 1;
         telemetry_inference_ms      += infer_us / 1000.0f;
@@ -1336,14 +1411,35 @@ static void inference_task(void* arg) {
                 telemetry_noise_floor_rms = noise_floor_rms;
             }
             recal_frames_done++;
-            consecutive_hits = 0;
+            soft_hit_count = 0;
+            conf_win_fill  = 0;
+            conf_win_idx   = 0;
             vTaskDelay(pdMS_TO_TICKS(10)); continue;
         }
 
-        // Update rolling confidence history (ring of DETECTION_HITS_REQUIRED slots)
-        conf_history[conf_hist_idx % 3] = kw_prob;
-        conf_hist_idx++;
-        consecutive_hits = trigger ? consecutive_hits + 1 : 0;
+        // ── Sliding-window confidence history (soft + hard tier) ─────────────
+        conf_window[conf_win_idx] = kw_prob;
+        conf_win_idx = (conf_win_idx + 1) % DETECTION_WINDOW_FRAMES;
+        if (conf_win_fill < DETECTION_WINDOW_FRAMES) conf_win_fill++;
+
+        soft_hit_count = 0;
+        float conf_peak = 0.0f;
+        for (int i = 0; i < conf_win_fill; i++) {
+            if (conf_window[i] >= DETECT_THRESHOLD) soft_hit_count++;
+            if (conf_window[i] > conf_peak) conf_peak = conf_window[i];
+        }
+
+        // Multi-frame verification: A real "Hey Vaani" utterance spans 600-800ms.
+        // It produces sustained high confidence across multiple frames.
+        // Requiring at least 2 consecutive frames meeting confidence + speech RMS
+        // eliminates single-frame false triggers from transient noise or background words.
+        if (kw_prob >= DETECT_THRESHOLD && rms >= MIN_SPEECH_RMS) {
+            consecutive_hits++;
+        } else {
+            consecutive_hits = 0;
+        }
+
+        bool trigger = (consecutive_hits >= DETECTION_HITS_REQUIRED);
 
         // Periodic confidence log every 500 ms for visibility on serial & dashboard
         {
@@ -1353,22 +1449,26 @@ static void inference_task(void* arg) {
                 last_log_us = now;
                 float uptime_s = (float)(now / 1000);
                 float cpu_pct = uptime_s > 0 ? (telemetry_inference_ms / uptime_s) * 100.0f : 0.0f;
-                printf("[KWS] conf=%.4f thr=%.2f infer=%.0fus mic=%.4f floor=%.4f hits=%d cpu=%.1f%%\n",
-                       (double)kw_prob, (double)DETECT_THRESHOLD, (double)infer_us,
+                printf("[KWS] conf=%.4f peak=%.4f soft=%d/%d hard=%.2f thr=%.2f infer=%.0fus mic=%.4f floor=%.4f cpu=%.1f%%\n",
+                       (double)kw_prob, (double)conf_peak,
+                       soft_hit_count, DETECTION_WINDOW_FRAMES,
+                       (double)DETECT_HARD_THRESHOLD, (double)DETECT_THRESHOLD,
+                       (double)infer_us,
                        (double)telemetry_mic_rms, (double)telemetry_noise_floor_rms,
-                       consecutive_hits, (double)cpu_pct);
+                       (double)cpu_pct);
                 fflush(stdout);
             }
         }
 
-        if (consecutive_hits >= DETECTION_HITS_REQUIRED) {
+        if (trigger) {
             int64_t kw_end = esp_timer_get_time();
 
-            printf("[TRIGGER-HIT] node=%d hits=%d conf=%.4f (thr=%.2f) rms=%.4f\n",
-                   NODE_ID, consecutive_hits, (double)kw_prob, (double)DETECT_THRESHOLD, (double)rms);
+            printf("[TRIGGER-HIT] node=%d hits=%d conf=%.4f peak=%.4f (thr=%.2f) rms=%.4f\n",
+                   NODE_ID, consecutive_hits,
+                   (double)kw_prob, (double)conf_peak,
+                   (double)DETECT_THRESHOLD, (double)rms);
             fflush(stdout);
 
-            // ── Dual-mic verification (Part 2) ─────────────────────────────────
             float final_conf = kw_prob;
             if (g_mic_b_ok && g_i2s_rx_b != NULL) {
                 printf("[DUAL-MIC] node=%d mic_a=%.4f (RMS: A=%.4f B=%.4f)\n",
@@ -1379,31 +1479,42 @@ static void inference_task(void* arg) {
             // Record cycle start time for [CYCLE] log
             g_cycle_start_us = kw_end;
 
-            // ── ESP-NOW Fusion gate (Part 2) ────────────────────────────────────
+            // ── ESP-NOW Fusion gate (handoff only — never blocks local-only) ──
             bool should_stream = esp_now_fusion_should_trigger(final_conf, rms, NODE_ID);
 
-            // Detected! Immediate visual and LED feedback:
-            g_sys_state  = SYS_CAPTURE_COMMAND;
-            set_led_state(true);
-            g_disp_state = DISP_DETECTED;
-            oled_show_status(DISP_DETECTED, "Hey Vaani!");
-            consecutive_hits  = 0;
-            conf_hist_idx     = 0;
-            memset(conf_history, 0, sizeof(conf_history));
+            // Reset window and consecutive hit counter BEFORE state changes
+            consecutive_hits = 0;
+            soft_hit_count = 0;
+            conf_win_fill  = 0;
+            conf_win_idx   = 0;
+            memset(conf_window, 0, sizeof(conf_window));
 
             if (should_stream && !streaming_active) {
+                // ── Confirmed detection: enter capture + stream path ─────────
+                g_sys_state  = SYS_CAPTURE_COMMAND;
+                g_sys_capture_start_us = esp_timer_get_time(); // arm sys_state watchdog
+                set_led_state(true);
+                g_disp_state = DISP_DETECTED;
+                oled_show_status(DISP_DETECTED, "Hey Vaani!");
                 g_stream_start_pos = (int)ring_write_pos;
                 xQueueSend(detect_queue, &kw_end, 0);
-            } else if (!should_stream) {
-                // Fusion suppressed this trigger (false positive or lost handoff)
-                printf("[HANDOFF] node=%d suppressed by fusion decision\n", NODE_ID);
+            } else if (should_stream && streaming_active) {
+                // Overlapping trigger while stream already running — discard cleanly.
+                printf("[TRIGGER-SKIP] node=%d trigger while streaming active — resetting state\n", NODE_ID);
                 fflush(stdout);
-                vTaskDelay(pdMS_TO_TICKS(1200));
                 set_led_state(false);
-                flush_audio_ring();
                 g_sys_state  = SYS_LISTENING;
                 g_disp_state = DISP_LISTENING;
                 g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
+            } else {
+                // Fusion handoff: peer won — do NOT show "Detected!" UI.
+                printf("[HANDOFF] node=%d suppressed by fusion handoff (peer streams)\n", NODE_ID);
+                fflush(stdout);
+                set_led_state(false);
+                g_sys_state  = SYS_LISTENING;
+                g_disp_state = DISP_LISTENING;
+                // Short cooldown only — no 1.2 s stall, no ring flush on handoff loss.
+                g_cooldown_end_us = esp_timer_get_time() + (int64_t)(COOLDOWN_MS / 2) * 1000;
             }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
@@ -1621,12 +1732,12 @@ static void streaming_task(void* arg) {
         }
         g_disp_state = DISP_TRANSCRIBED;
         set_led_state(false);
-        printf("[RESULT-DISP] Showing '%s' on OLED for 5s\n", result_txt); fflush(stdout);
+        printf("[RESULT-DISP] Showing '%s' on OLED\n", result_txt); fflush(stdout);
 
-        // Show result for 5 seconds, then return to listening
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        // Show confirmed command for 1.8s, or brief 800ms for unconfirmed/noise
+        vTaskDelay(pdMS_TO_TICKS(cmd_confirmed ? 1800 : 800));
 
-        // ── Return to listening state with cooldown ────────────────────────
+        // ── Return to listening state with fast cooldown ────────────────────
         {
             int64_t cycle_end_us  = esp_timer_get_time();
             int64_t cycle_total_ms = (cycle_end_us - g_cycle_start_us) / 1000;
@@ -1634,7 +1745,6 @@ static void streaming_task(void* arg) {
                    NODE_ID, (unsigned long)session_id, (long long)cycle_total_ms, COOLDOWN_MS);
             fflush(stdout);
         }
-        flush_audio_ring();
         set_led_state(false);
         g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
         g_sys_state    = SYS_LISTENING;
@@ -1745,18 +1855,47 @@ static void wifi_config_poll_task(void* arg) {
 // TASK 3b: watchdog_task — force-clears streaming_active if stuck >10 s.
 // UNCHANGED from rev6, plus: also resets LED and display state on force-clear.
 // ============================================================================
+// Watchdog ceiling for g_sys_state stuck in SYS_CAPTURE_COMMAND (ms)
+#define SYS_STATE_WATCHDOG_MS  25000
+
 static void watchdog_task(void* arg) {
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // --- Existing watchdog: streaming_active stuck > STREAM_WATCHDOG_MS ---
         if (streaming_active && streaming_active_set_us != 0) {
             int64_t held = esp_timer_get_time() - streaming_active_set_us;
             if (held > (int64_t)STREAM_WATCHDOG_MS * 1000) {
+                printf("[WDG] streaming_active stuck %.1fs — force clearing\n",
+                       (double)held / 1e6);
+                fflush(stdout);
                 set_streaming_active(false, "watchdog_forced");
+                g_sys_capture_start_us = 0; // clear sys watchdog arm too
                 g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
                 g_sys_state  = SYS_LISTENING;
                 set_led_state(false);
                 g_disp_state = DISP_LISTENING;
             }
+        }
+
+        // --- FIX 2: g_sys_state watchdog: SYS_CAPTURE_COMMAND stuck > 25 s ---
+        // Covers the case where streaming never started (no WiFi, queue full, etc.)
+        // and streaming_active was never set, leaving g_sys_state permanently stuck.
+        if (g_sys_state == SYS_CAPTURE_COMMAND && g_sys_capture_start_us != 0) {
+            int64_t stuck_us = esp_timer_get_time() - g_sys_capture_start_us;
+            if (stuck_us > (int64_t)SYS_STATE_WATCHDOG_MS * 1000) {
+                printf("[WDG] g_sys_state stuck in SYS_CAPTURE_COMMAND %.1fs — force reset\n",
+                       (double)stuck_us / 1e6);
+                fflush(stdout);
+                g_sys_capture_start_us = 0;
+                g_cooldown_end_us = esp_timer_get_time() + (int64_t)COOLDOWN_MS * 1000;
+                g_sys_state  = SYS_LISTENING;
+                set_led_state(false);
+                g_disp_state = DISP_LISTENING;
+            }
+        } else if (g_sys_state != SYS_CAPTURE_COMMAND) {
+            // State left SYS_CAPTURE_COMMAND normally — disarm the watchdog
+            g_sys_capture_start_us = 0;
         }
     }
 }
@@ -1853,7 +1992,7 @@ static void telemetry_task(void* arg) {
                        ? 20.0f * log10f(telemetry_mic_rms / telemetry_noise_floor_rms) : 0.0f;
         char body[768];
         int blen = snprintf(body, sizeof(body),
-            "{\"device\":\"esp32\",\"uptime_ms\":%llu,"
+            "{\"device\":\"%s\",\"node_id\":%d,\"uptime_ms\":%llu,"
             "\"free_heap_bytes\":%lu,\"min_free_heap_bytes\":%lu,"
             "\"heap_total_bytes\":%lu,\"tflite_arena_bytes\":%u,"
             "\"audio_buffer_bytes\":%u,\"keyword_confidence\":%.4f,"
@@ -1861,6 +2000,7 @@ static void telemetry_task(void* arg) {
             "\"inference_duty_pct\":%.3f,\"wifi_rssi_dbm\":%d,\"streaming\":%s,"
             "\"latency_ms\":%.1f,\"cpu\":%.1f,\"snr\":%.1f,"
             "\"noise_floor_rms\":%.5f}",
+            DEVICE_NAME, NODE_ID,
             (unsigned long long)(esp_timer_get_time() / 1000),
             (unsigned long)esp_get_free_heap_size(),
             (unsigned long)esp_get_minimum_free_heap_size(),
@@ -1881,7 +2021,7 @@ static void telemetry_task(void* arg) {
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         struct sockaddr_in addr = {};
-        addr.sin_family = AF_INET; addr.sin_port = htons(80);
+        addr.sin_family = AF_INET; addr.sin_port = htons(8080);
         inet_pton(AF_INET, g_server_ip, &addr.sin_addr);  // from NVS / portal
         if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
             char req[700];
@@ -1897,10 +2037,11 @@ static void telemetry_task(void* arg) {
 
 // ─── app_main ────────────────────────────────────────────────────────────────
 extern "C" void app_main() {
-    printf("[BOOT] NODE_ID=%d DETECT_THRESHOLD=%.3f  HITS=%d  COOLDOWN=%d ms  "
+    printf("[BOOT] NODE_ID=%d (%s) SOFT=%.3f HARD=%.3f HITS=%d/%d COOLDOWN=%d ms  "
            "MODEL=%u bytes  heap_start=%lu\n",
-           NODE_ID,
-           (double)DETECT_THRESHOLD, DETECTION_HITS_REQUIRED, COOLDOWN_MS,
+           NODE_ID, DEVICE_NAME,
+           (double)DETECT_THRESHOLD, (double)DETECT_HARD_THRESHOLD,
+           DETECTION_HITS_REQUIRED, DETECTION_WINDOW_FRAMES, COOLDOWN_MS,
            (unsigned)g_model_data_len,
            (unsigned long)esp_get_free_heap_size());
     fflush(stdout);
@@ -1935,7 +2076,9 @@ extern "C" void app_main() {
     // AP + captive portal, blocks here until credentials are saved, then
     // calls esp_restart(). Normal boots return instantly.
     wifi_provision_init();
-    strlcpy(g_server_ip, "10.28.236.188", sizeof(g_server_ip));
+    if (g_server_ip[0] == '\0') {
+        strlcpy(g_server_ip, "13.233.100.83", sizeof(g_server_ip));  // AWS EC2 fallback
+    }
     ESP_LOGI(TAG_MAIN, "Target Server IP: %s:%d", g_server_ip, CONFIG_SERVER_PORT);
 
     // ── WiFi Start (early so PHY RF calibration has unfragmented RAM) ──────

@@ -53,6 +53,13 @@ from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import numpy as np
 
+try:
+    import serial
+    import serial.tools.list_ports
+    _PYSERIAL_AVAILABLE = True
+except ImportError:
+    _PYSERIAL_AVAILABLE = False
+
 # ─── AES-128-CTR Encryption ───────────────────────────────────────────────────
 # All audio (ESP32 → server) and responses (server → ESP32) are encrypted
 # with AES-128-CTR using a pre-shared key.  No licence, no API key.
@@ -151,8 +158,9 @@ WHISPER_NO_SPEECH_THRESHOLD = 0.85
 
 # WHISPER_LOG_PROB_THRESHOLD (negative float):
 #   Segments below this average log-probability are discarded.
-#   Relaxed to -1.5 to prevent dropping valid speech in noisy environments.
-WHISPER_LOG_PROB_THRESHOLD = -1.5
+#   Relaxed to -2.0 to prevent dropping valid speech in noisy/accented/fast speech.
+#   At -1.5 many real commands with slight background noise were being silently dropped.
+WHISPER_LOG_PROB_THRESHOLD = -2.0
 
 # WHISPER_COMPRESSION_RATIO_THRESHOLD:
 #   Segments with gzip compression ratio above this are repetition loops.
@@ -240,6 +248,86 @@ try:
 except Exception:
     pass
 
+# ─── Real-Time Cloud / AWS Server Reachability Monitor ────────────────────────
+_CLOUD_HEALTH = {
+    "target_ip": _WIFI_CONFIG.get("server_ip") if isinstance(_WIFI_CONFIG, dict) else None,
+    "target_port": int(_WIFI_CONFIG.get("server_port", 8080)) if isinstance(_WIFI_CONFIG, dict) else 8080,
+    "is_cloud": False,
+    "is_aws": False,
+    "online": False,
+    "last_check": 0,
+    "latency_ms": None,
+    "error": None,
+}
+_CLOUD_HEALTH_LOCK = threading.Lock()
+
+def _check_cloud_server_now():
+    """Probe the configured AWS/cloud server to verify real-time status."""
+    global _WIFI_CONFIG
+    cfg_ip = _WIFI_CONFIG.get("server_ip") if isinstance(_WIFI_CONFIG, dict) else None
+    cfg_port = int(_WIFI_CONFIG.get("server_port", 8080)) if isinstance(_WIFI_CONFIG, dict) else 8080
+
+    if not cfg_ip or cfg_ip in {"127.0.0.1", "localhost", "0.0.0.0"}:
+        with _CLOUD_HEALTH_LOCK:
+            _CLOUD_HEALTH.update({
+                "target_ip": cfg_ip or "localhost",
+                "target_port": cfg_port,
+                "is_cloud": False,
+                "is_aws": False,
+                "online": True,
+                "last_check": time.time(),
+                "error": None,
+            })
+        return
+
+    is_aws = "13.233." in cfg_ip or "aws" in cfg_ip.lower() or (not cfg_ip.startswith("192.168.") and not cfg_ip.startswith("10.") and not cfg_ip.startswith("172."))
+    
+    online = False
+    lat_ms = None
+    err = None
+    t0 = time.time()
+    
+    ports_to_try = [cfg_port]
+    if 8080 not in ports_to_try:
+        ports_to_try.append(8080)
+    if 80 not in ports_to_try and cfg_port != 80:
+        ports_to_try.append(80)
+
+    for p in ports_to_try:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.2)
+            s.connect((cfg_ip, p))
+            s.close()
+            online = True
+            lat_ms = round((time.time() - t0) * 1000)
+            break
+        except Exception as e:
+            err = str(e)
+
+    with _CLOUD_HEALTH_LOCK:
+        _CLOUD_HEALTH.update({
+            "target_ip": cfg_ip,
+            "target_port": cfg_port,
+            "is_cloud": True,
+            "is_aws": is_aws,
+            "online": online,
+            "latency_ms": lat_ms,
+            "last_check": time.time(),
+            "error": err if not online else None
+        })
+
+def _cloud_health_poller():
+    while True:
+        try:
+            _check_cloud_server_now()
+        except Exception:
+            pass
+        time.sleep(2.0)
+
+threading.Thread(target=_cloud_health_poller, daemon=True).start()
+
+
 # ESP32 wireless log ring buffer (last 500 entries)
 _ESP_LOG_BUFFER: list = []
 _ESP_LOG_LOCK = threading.Lock()
@@ -267,8 +355,8 @@ OLLAMA_URL    = "http://localhost:11434/api/generate"
 
 
 # ─── Configuration ─────────────────────────────────────────────────────────
-DEFAULT_PORT       = 80
-DASHBOARD_API_PORT = 80
+DEFAULT_PORT       = 8080
+DASHBOARD_API_PORT = 8080
 
 AUDIO_DIR = os.path.join(os.path.dirname(__file__), "received_audio")
 LOG_FILE  = os.path.join(os.path.dirname(__file__), "server_log.json")
@@ -335,8 +423,34 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self): self._send_json({})
 
+    def do_DELETE(self):
+        path = self.path.split("?", 1)[0]
+        asr: "ASRServer" = self.server.asr_server
+        if path in {"/api/events", "/api/events/clear"}:
+            with asr._lock:
+                asr.log_entries.clear()
+            self._send_json({"ok": True, "cleared": True})
+        elif path in {"/api/esp-logs", "/api/esp-logs/clear"}:
+            with _ESP_LOG_LOCK:
+                _ESP_LOG_BUFFER.clear()
+            self._send_json({"ok": True, "cleared": True})
+        else:
+            self._send_json({"error": "not found"}, status=404)
+
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        asr: "ASRServer" = self.server.asr_server
+        if path in {"/api/events/clear", "/api/events/delete"}:
+            with asr._lock:
+                asr.log_entries.clear()
+            self._send_json({"ok": True, "cleared": True})
+            return
+        if path in {"/api/esp-logs/clear", "/api/esp-logs/delete"}:
+            with _ESP_LOG_LOCK:
+                _ESP_LOG_BUFFER.clear()
+            self._send_json({"ok": True, "cleared": True})
+            return
+
         if path not in {"/api/telemetry", "/api/wifi-config", "/api/esp-logs"}:
             self._send_json({"error": "not found"}, status=404)
             return
@@ -384,6 +498,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     with open(_WIFI_CONFIG_FILE, "w") as wf:
                         json.dump(_WIFI_CONFIG, wf, indent=2)
                     _esp_log_append("I", "WIFI-CFG", f"New WiFi config saved: SSID={_WIFI_CONFIG.get('ssid', '?')} IP={_WIFI_CONFIG.get('server_ip', '?')}:{_WIFI_CONFIG.get('server_port', '?')}")
+                    threading.Thread(target=_check_cloud_server_now, daemon=True).start()
                     self._send_json({"ok": True, "saved": True})
                 except Exception as e:
                     self._send_json({"error": str(e)}, status=500)
@@ -411,11 +526,25 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             with asr._lock:
                 count = len(asr.log_entries)
+                dev = dict(getattr(asr, "device_info", {"connected": False}))
+
+            with _CLOUD_HEALTH_LOCK:
+                cloud_info = dict(_CLOUD_HEALTH)
+
+            # If an external cloud server is configured (e.g. AWS EC2),
+            # the system server_online status reflects the real-time AWS server connectivity!
+            server_online = cloud_info["online"] if cloud_info.get("is_cloud") else True
+
             resp = {
-                "status":         "running",
-                "uptime_seconds": int(time.time() - asr.start_time),
+                "status":         "running" if server_online else "cloud_offline",
+                "server_online":  server_online,
+                "uptime_seconds": int(time.time() - asr.start_time) if server_online else 0,
                 "session_count":  count,
                 "asr_engine":     f"faster-whisper-{asr.whisper_model}",
+                "device":         dev,
+                "cloud":          cloud_info,
+                "target_server":  cloud_info.get("target_ip"),
+                "is_aws":         cloud_info.get("is_aws", False),
             }
             # Server CPU / RAM via psutil
             if _PSUTIL_AVAILABLE:
@@ -429,9 +558,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             self._send_json(resp)
+        elif path == "/api/device":
+            with asr._lock:
+                dev = dict(getattr(asr, "device_info", {"connected": False}))
+            self._send_json(dev)
         elif path == "/api/telemetry":
             with asr._lock:
-                telemetry = dict(asr.telemetry)
+                telemetry = dict(asr.telemetry) if asr.telemetry else {}
+                dev = getattr(asr, "device_info", {})
+                telemetry["device_connected"] = dev.get("connected", False)
+                telemetry["device_port"] = dev.get("port")
             self._send_json(telemetry)
         elif path == "/api/events":
             with asr._lock:
@@ -504,7 +640,10 @@ class DashboardHTTPServer:
         self.port = port
 
     def start_in_thread(self):
-        httpd = HTTPServer(("0.0.0.0", self.port), _DashboardHandler)
+        # Allow rapid restart without "Address already in use" (TIME_WAIT sockets on EC2)
+        class _ReusableHTTPServer(HTTPServer):
+            allow_reuse_address = True
+        httpd = _ReusableHTTPServer(("0.0.0.0", self.port), _DashboardHandler)
         httpd.asr_server = self.asr_server
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         print(f"  🌐 Dashboard API:    http://localhost:{self.port}/api/health")
@@ -543,7 +682,23 @@ class ASRServer:
         self.start_time     = time.time()
         self._lock          = threading.Lock()
         self.log_entries: list = []
+        if os.path.exists(LOG_FILE):
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8") as f:
+                    _past = json.load(f)
+                    if isinstance(_past, list):
+                        self.log_entries = _past[-50:]
+                        self.session_count = len(_past)
+            except Exception as e:
+                print(f"  ⚠️ Could not load past events: {e}")
         self.telemetry: dict = {}
+        self.device_info: dict = {
+            "connected": False,
+            "port": None,
+            "device": None,
+            "desc": None,
+            "last_seen": 0,
+        }
 
     def start(self):
         self._load_asr()
@@ -577,13 +732,19 @@ class ASRServer:
         print("  Wake word:       custom TFLite Micro model on ESP32 (edge-authoritative)")
         print(f"  Protocol:        HVP1 v1 — 20-byte header, live-stream mode")
         print(f"  Log:             {LOG_FILE}")
-        # Also start a plain HTTP server on port 8080 for Vercel proxy
-        DashboardHTTPServer(self, port=8080).start_in_thread()
-        print(f"  🌐 Vercel proxy API: http://localhost:8080/api/health")
+        # Start a secondary plain HTTP dashboard server on a different port.
+        # IMPORTANT: must NOT bind the same port as the main TCP multiplexer above.
+        # Rule: secondary port = main port + 1  (e.g. main=8080 → dashboard=8081)
+        #       But if main port is 80, use 8080 for dashboard (legacy behaviour).
+        self._start_usb_monitor()
+        if self.port != 8080:
+            DashboardHTTPServer(self, port=8080).start_in_thread()
+        print(f"  🌐 Dashboard HTTP API: http://localhost:{self.port}/api/health")
         print("=" * 62)
         print(f"\n  ⚙️  Configure ESP32 with:")
         print(f"      Server IP   = \"{local_ip}\"  (enter this in HeyVaani-Setup portal)")
         print(f"      Server Port = {self.port}\n")
+        
         print(f"  Waiting for ESP32 connections...\n")
 
         try:
@@ -598,6 +759,230 @@ class ASRServer:
             print("\n\n  🛑 Server shutting down...")
             self._save_log()
             server_socket.close()
+
+
+    # ── USB Serial Device Monitor & Live Bridge ──────────────────────────────
+    def _start_usb_monitor(self):
+        """Continuously monitor USB serial ports to detect ESP32 device connection."""
+        if not _PYSERIAL_AVAILABLE:
+            print("  ⚠️  pyserial not available — USB device monitoring disabled")
+            return
+        t = threading.Thread(target=self._usb_monitor_loop, daemon=True, name="USBMonitor")
+        t.start()
+        print("  🔌 USB Device Monitor: active (detects ESP32 plug/unplug)")
+
+    def _usb_monitor_loop(self):
+        import serial
+        import serial.tools.list_ports
+
+        ESP32_VIDS = {0x10C4, 0x1A86, 0x0403, 0x303A}
+        active_ser = None
+        current_port = None
+
+        while True:
+            try:
+                # 1. Find connected ESP32 port
+                found_port = None
+                found_desc = None
+                for p in serial.tools.list_ports.comports():
+                    if p.vid in ESP32_VIDS:
+                        found_port = p.device
+                        found_desc = p.description or "ESP32 USB Device"
+                        break
+                    desc = (p.description or "").lower()
+                    if any(k in desc for k in ["cp210", "ch340", "esp32", "usb-serial", "uart"]):
+                        found_port = p.device
+                        found_desc = p.description
+                        break
+
+                # Device unplugged
+                if not found_port:
+                    if self.device_info.get("connected"):
+                        print(f"\n  🔌 [USB] ESP32 disconnected from {current_port}")
+                        with self._lock:
+                            self.device_info = {
+                                "connected": False,
+                                "port": None,
+                                "device": None,
+                                "desc": None,
+                                "last_seen": time.time(),
+                            }
+                            if self.telemetry:
+                                self.telemetry["device_connected"] = False
+                                self.telemetry["device_port"] = None
+                        _sse_notify({"type": "device", **self.device_info})
+                    if active_ser:
+                        try: active_ser.close()
+                        except: pass
+                        active_ser = None
+                    current_port = None
+                    time.sleep(1.0)
+                    continue
+
+                # Device newly plugged in or changed
+                if found_port != current_port or not active_ser or not active_ser.is_open:
+                    if active_ser:
+                        try: active_ser.close()
+                        except: pass
+                    current_port = found_port
+                    try:
+                        active_ser = serial.Serial()
+                        active_ser.port = found_port
+                        active_ser.baudrate = 115200
+                        active_ser.timeout = 1.0
+                        active_ser.dtr = False   # Never reset ESP32 on connect
+                        active_ser.rts = False
+                        active_ser.open()
+                        print(f"\n  ⚡ [USB] ESP32 connected on {found_port} ({found_desc})")
+                        with self._lock:
+                            self.device_info = {
+                                "connected": True,
+                                "port": found_port,
+                                "device": "ESP32 DevKit",
+                                "desc": found_desc,
+                                "last_seen": time.time(),
+                            }
+                            if not self.telemetry: self.telemetry = {}
+                            self.telemetry["device_connected"] = True
+                            self.telemetry["device_port"] = found_port
+                            self.telemetry["connection_type"] = "USB Cable"
+                            self.telemetry["received_at"] = datetime.utcnow().isoformat() + "Z"
+                        _sse_notify({"type": "device", **self.device_info})
+                    except Exception as e:
+                        time.sleep(1.5)
+                        continue
+
+                # Device is connected and open — read serial logs for live telemetry!
+                raw = active_ser.readline()
+                if raw:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line:
+                        now_iso = datetime.utcnow().isoformat() + "Z"
+                        _esp_log_append("I", "SERIAL", line)
+
+                        # Print ESP32 logs to console
+                        if any(k in line for k in ["[AUDIO]", "[KWS]", "[TRIGGER-HIT]", "[RESULT]", "[CYCLE]", "KEYWORD"]):
+                            print(f"  📱 [ESP32] {line}", flush=True)
+
+                        # Parse live telemetry from serial
+                        updated = False
+                        with self._lock:
+                            if not self.telemetry: self.telemetry = {}
+                            self.telemetry["device_connected"] = True
+                            self.telemetry["device_port"] = current_port
+                            self.device_info["last_seen"] = time.time()
+
+                            # Parse [AUDIO] mic1_rms=... mic2_rms=... floor=... peak=...
+                            if "[AUDIO]" in line:
+                                m_rms = re.search(r"mic1_rms=([0-9.]+)", line)
+                                m_flr = re.search(r"floor=([0-9.]+)", line)
+                                m_pk  = re.search(r"peak=([0-9]+)", line)
+                                if m_rms:
+                                    self.telemetry["mic_rms"] = float(m_rms.group(1))
+                                    updated = True
+                                if m_flr:
+                                    self.telemetry["noise_floor_rms"] = float(m_flr.group(1))
+                                if m_pk:
+                                    self.telemetry["peak"] = int(m_pk.group(1))
+                                self.telemetry["received_at"] = now_iso
+
+                            # Parse [KWS] conf=... peak=... soft=... infer=... mic=... floor=... cpu=...
+                            if "[KWS]" in line:
+                                m_conf = re.search(r"conf=([0-9.]+)", line)
+                                m_cpu  = re.search(r"cpu=([0-9.]+)%", line)
+                                m_inf  = re.search(r"infer=([0-9.]+)us", line)
+                                if m_conf:
+                                    self.telemetry["keyword_confidence"] = float(m_conf.group(1))
+                                    updated = True
+                                if m_cpu:
+                                    self.telemetry["cpu"] = float(m_cpu.group(1))
+                                if m_inf:
+                                    self.telemetry["latency_ms"] = round(float(m_inf.group(1)) / 1000.0, 1)
+                                self.telemetry["received_at"] = now_iso
+
+                            # Parse node identity if present
+                            m_node_tel = re.search(r"node=([0-9]+)", line)
+                            if m_node_tel:
+                                self.telemetry["node_id"] = int(m_node_tel.group(1))
+                                self.telemetry["device_name"] = f"Hey Vaani Node {m_node_tel.group(1)}"
+
+                            # Parse [TRIGGER-HIT]
+                            if "[TRIGGER-HIT]" in line or "KEYWORD CONFIRMED" in line:
+                                self.telemetry["streaming"] = True
+                                self.telemetry["received_at"] = now_iso
+                                updated = True
+
+                                # Add detection event to log_entries for Dashboard Detection Feed!
+                                self.session_count += 1
+                                sid = self.session_count
+                                m_conf = re.search(r"conf=([0-9.]+)", line)
+                                m_pk   = re.search(r"peak=([0-9.]+)", line)
+                                m_rms  = re.search(r"rms=([0-9.]+)", line)
+                                m_node = re.search(r"node=([0-9]+)", line)
+                                n_id   = int(m_node.group(1)) if m_node else int(self.telemetry.get("node_id") or 2)
+                                k_conf = float(m_conf.group(1)) if m_conf else float(self.telemetry.get("keyword_confidence") or 0.95)
+                                k_rms  = float(m_rms.group(1)) if m_rms else float(self.telemetry.get("mic_rms") or 0.02)
+                                evt = {
+                                    "session_id": sid,
+                                    "timestamp": datetime.now().isoformat(),
+                                    "client_ip": f"Node {n_id} (USB)",
+                                    "node_id": n_id,
+                                    "device": f"Hey Vaani Node {n_id}",
+                                    "status": "wake_word_detected",
+                                    "wake_word": "Hey Vaani",
+                                    "keyword_confidence": k_conf,
+                                    "mic_rms": k_rms,
+                                    "source": "USB",
+                                    "transcript": "[processing speech...]",
+                                    "verified": True,
+                                    "verification_status": "CONFIRMED",
+                                }
+                                self.log_entries.append(evt)
+                                if len(self.log_entries) > 100:
+                                    self.log_entries.pop(0)
+                                self._save_log()
+
+                            # Parse [RESULT]
+                            if "[RESULT]" in line or "[CYCLE]" in line:
+                                self.telemetry["streaming"] = False
+                                self.telemetry["received_at"] = now_iso
+                                updated = True
+
+                                if "[RESULT]" in line and self.log_entries:
+                                    m_reply = re.search(r"reply='([^']+)'", line)
+                                    m_conf_res = re.search(r"confirmed=([0-9]+)", line)
+                                    reply_txt = m_reply.group(1) if m_reply else ""
+                                    is_conf = bool(int(m_conf_res.group(1))) if m_conf_res else True
+
+                                    last_ev = self.log_entries[-1]
+                                    if last_ev.get("status") == "wake_word_detected":
+                                        last_ev["status"] = "complete"
+                                        last_ev["verified"] = is_conf
+                                        last_ev["verification_status"] = "CONFIRMED" if is_conf else "REJECTED"
+                                        if "Command received: '" in reply_txt:
+                                            cmd_txt = reply_txt.split("Command received: '", 1)[1].split("'.", 1)[0]
+                                            last_ev["transcript"] = cmd_txt
+                                        elif reply_txt:
+                                            last_ev["transcript"] = reply_txt
+                                        self._save_log()
+
+                        if updated:
+                            _sse_notify(self.telemetry)
+
+            except Exception as e:
+                if active_ser:
+                    try: active_ser.close()
+                    except: pass
+                    active_ser = None
+                with self._lock:
+                    if self.device_info.get("connected"):
+                        print(f"\n  🔌 [USB] ESP32 disconnected ({e})")
+                    self.device_info = {"connected": False, "port": None, "device": None, "desc": None, "last_seen": time.time()}
+                    if self.telemetry:
+                        self.telemetry["device_connected"] = False
+                _sse_notify({"type": "device", **self.device_info})
+                time.sleep(1.0)
+
 
     def _multiplex_connection(self, client_socket: socket.socket, client_addr: tuple):
         """Peek at first 4 bytes to detect HTTP vs HVP1, then route."""
@@ -1396,16 +1781,19 @@ class ASRServer:
                     f"no_speech={ns_str} logprob={lp_str} "
                     f"compression={cr_str} text={repr(text)}"
                 )
-                # Hallucination filter for near-silent audio
+                # Hallucination filter — only block known hallucination phrases
+                # when audio energy is clearly absent (no_speech > 0.70).
                 HALLUCINATIONS = {
                     "thank you very much", "thank you", "thanks for watching",
                     "bye", "bye bye", "subtitles by", "watching", "you"
                 }
                 clean_seg = text.lower().strip(" .!?,")
-                if no_speech is not None and no_speech > 0.50 and clean_seg in HALLUCINATIONS:
+                if no_speech is not None and no_speech > 0.70 and clean_seg in HALLUCINATIONS:
                     print(f"  🔕 [{session_id}] Filtered Whisper hallucination: {repr(text)} (no_speech={ns_str})")
                     continue
-                if no_speech is not None and no_speech > 0.72:
+                # Only drop segments with VERY high no-speech confidence (>0.90)
+                # — previously 0.72 was discarding real accented/quiet commands.
+                if no_speech is not None and no_speech > 0.90:
                     print(f"  🔕 [{session_id}] Filtered high no-speech segment: {repr(text)} (no_speech={ns_str})")
                     continue
                 if text:
@@ -1547,8 +1935,8 @@ Whisper model tradeoffs (i5 laptop CPU, 2s audio):
                         choices=["tiny", "base", "small", "medium"],
                         help="Whisper model size (default: base, only used with --asr whisper)")
     parser.add_argument("--asr",           type=str, default="whisper",
-                        choices=["whisper", "vosk"],
-                        help="ASR backend: 'whisper' (default, local) or 'vosk' (offline, lighter)")
+                        choices=["whisper", "vosk", "aws"],
+                        help="ASR backend: 'whisper' (default, local), 'vosk' (offline), or 'aws' (Amazon Transcribe)")
     parser.add_argument("--intent",        action="store_true",
                         help="Enable Ollama SLM intent extraction after ASR (requires ollama serve)")
     parser.add_argument("--ollama-model",  type=str, default="qwen2.5:0.5b",

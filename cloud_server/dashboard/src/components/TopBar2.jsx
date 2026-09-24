@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { VaaniLogo, IconSettings } from './Icons.jsx'
+import { VaaniLogo, IconSettings, IconUsb } from './Icons.jsx'
 
 function Clock() {
   const [offset, setOffset] = useState(0)
@@ -74,34 +74,115 @@ function Clock() {
   )
 }
 
-export default function TopBar({ health, up, total, telemetryStale, onSettings }) {
+export default function TopBar({ health, up, total, telemetryStale, onSettings, deviceInfo }) {
   const u = health?.uptime_seconds || 0
   const h = Math.floor(u / 3600), m = Math.floor((u % 3600) / 60), s = u % 60
-  const upStr = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m` : `${s}s`
+  const upStr = !up ? '--' : (h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m` : `${s}s`)
   
-  const espStateText = !up ? 'Offline' : telemetryStale ? 'Disconnected' : 'Connected'
-  const espStateColor = !up ? 'var(--t4)' : telemetryStale ? 'var(--amber)' : 'var(--green)'
+  const isPlugged = Boolean(deviceInfo && deviceInfo.connected)
+  const espStateText = !up
+    ? 'Offline'
+    : isPlugged
+    ? `Online (${deviceInfo.port || 'USB'})`
+    : telemetryStale
+    ? 'Disconnected'
+    : 'Online (Wi-Fi)'
+  const espStateColor = !up ? 'var(--t4)' : (isPlugged || !telemetryStale) ? 'var(--green)' : 'rgba(255,255,255,0.45)'
+
+  const isAws = Boolean(health?.is_aws || (health?.target_server && (health.target_server.includes('13.233') || health.target_server.includes('aws'))))
+  const serverLabel = isAws ? (up ? 'AWS: ONLINE' : 'AWS: OFFLINE') : (up ? 'SERVER ONLINE' : 'SERVER OFFLINE')
 
   return (
     <div className="tb-wrap">
       
       {/* Brand */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{ width: 40, height: 40, borderRadius: '50%', background: 'rgba(0,0,0,0.6)', border: '1px solid rgba(0,229,255,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 16px rgba(0,229,255,0.18)', overflow: 'hidden' }}>
             <VaaniLogo size={40} />
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-            <div style={{ fontFamily: 'var(--title)', fontSize: 15, fontWeight: 900, color: 'var(--t1)', letterSpacing: 2, lineHeight: 1.1 }}>HEY VAANI</div>
-            <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--c1)', letterSpacing: 1.5 }}>ISRO • EDGE AI • SIH 2026</div>
+            <div style={{ fontFamily: 'var(--title)', fontSize: 15, fontWeight: 900, color: 'var(--t1)', letterSpacing: 2, lineHeight: 1.1, whiteSpace: 'nowrap' }}>HEY VAANI</div>
+            <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--c1)', letterSpacing: 1.5, whiteSpace: 'nowrap' }}>ISRO • EDGE AI • SIH 2026</div>
           </div>
         </div>
 
         <div className="hide-on-mobile" style={{ width: 1, height: 24, background: 'rgba(255,255,255,0.08)' }} />
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px', background: up ? 'rgba(0,255,136,0.05)' : 'rgba(255,60,60,0.05)', borderRadius: 20, border: `1px solid ${up ? 'rgba(0,255,136,0.15)' : 'rgba(255,60,60,0.15)'}` }}>
-          <div style={{ width: 6, height: 6, borderRadius: '50%', background: up ? 'var(--green)' : '#ff3c3c', boxShadow: up ? '0 0 8px var(--green)' : 'none' }} />
-          <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: 1.5, color: up ? 'var(--green)' : '#ff3c3c' }}>{up ? 'SYSTEM ONLINE' : 'SYSTEM OFFLINE'}</span>
+        {/* Server Status */}
+        <div
+          title={isAws ? (up ? `AWS Cloud Server Online (${health?.target_server})` : `AWS Cloud Server Offline (${health?.target_server || 'Unreachable'})`) : (up ? 'Server Online' : 'Server Offline')}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 7,
+            height: 30,
+            padding: '0 13px',
+            background: up ? 'rgba(0,255,136,0.06)' : 'rgba(255,75,75,0.08)',
+            borderRadius: 15,
+            border: `1px solid ${up ? 'rgba(0,255,136,0.22)' : 'rgba(255,75,75,0.25)'}`,
+            boxShadow: up ? '0 0 10px rgba(0,255,136,0.12)' : '0 0 8px rgba(255,75,75,0.12)',
+            flexShrink: 0,
+            whiteSpace: 'nowrap',
+            boxSizing: 'border-box'
+          }}
+        >
+          <div style={{
+            width: 6,
+            height: 6,
+            borderRadius: '50%',
+            background: up ? 'var(--green)' : '#ff5252',
+            boxShadow: up ? '0 0 8px var(--green)' : '0 0 6px #ff5252',
+            animation: up ? 'pulse 2s infinite' : 'none',
+            flexShrink: 0
+          }} />
+          <span style={{
+            fontSize: 10,
+            fontWeight: 800,
+            letterSpacing: 1.2,
+            color: up ? 'var(--green)' : '#ff6b6b',
+            whiteSpace: 'nowrap',
+            lineHeight: 1
+          }}>
+            {serverLabel}
+          </span>
+        </div>
+
+        {/* USB Cable Plug Status */}
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 7,
+          height: 30,
+          padding: '0 13px',
+          background: isPlugged ? 'rgba(0,255,136,0.08)' : 'rgba(255,255,255,0.03)',
+          borderRadius: 15,
+          border: `1px solid ${isPlugged ? 'rgba(0,255,136,0.25)' : 'rgba(255,255,255,0.08)'}`,
+          boxShadow: isPlugged ? '0 0 10px rgba(0,255,136,0.18)' : 'none',
+          flexShrink: 0,
+          whiteSpace: 'nowrap',
+          boxSizing: 'border-box',
+          transition: 'all 0.3s'
+        }}>
+          <IconUsb size={13} color={isPlugged ? 'var(--green)' : 'rgba(255,255,255,0.45)'} />
+          <div style={{
+            width: 6,
+            height: 6,
+            borderRadius: '50%',
+            background: isPlugged ? 'var(--green)' : 'rgba(255,255,255,0.25)',
+            boxShadow: isPlugged ? '0 0 6px var(--green)' : 'none',
+            flexShrink: 0
+          }} />
+          <span style={{
+            fontSize: 10,
+            fontWeight: 800,
+            letterSpacing: 1.2,
+            color: isPlugged ? 'var(--green)' : 'rgba(255,255,255,0.45)',
+            whiteSpace: 'nowrap',
+            lineHeight: 1
+          }}>
+            {isPlugged ? `USB: ${deviceInfo?.port || 'CONNECTED'}` : 'USB: UNPLUGGED'}
+          </span>
         </div>
       </div>
 
@@ -111,7 +192,7 @@ export default function TopBar({ health, up, total, telemetryStale, onSettings }
           { l: 'QUERIES',       v: total,                  c: 'var(--c1)' },
           { l: 'SERVER UPTIME', v: up ? upStr : '--',      c: 'var(--c3)', hideM: true },
           { l: 'ESP32',         v: espStateText,           c: espStateColor },
-          { l: 'DATA',          v: !up ? '--' : telemetryStale ? 'STALE' : 'LIVE', c: !up ? 'var(--t4)' : telemetryStale ? 'var(--amber)' : 'var(--c1)', hideM: true },
+          { l: 'DATA',          v: !up ? '--' : isPlugged || !telemetryStale ? 'LIVE' : 'STALE', c: !up ? 'var(--t4)' : isPlugged || !telemetryStale ? 'var(--green)' : 'rgba(255,255,255,0.45)', hideM: true },
         ].map((s, i) => (
           <div key={s.l} className={s.hideM ? "hide-on-mobile" : ""} style={{ display: 'flex', alignItems: 'center' }}>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', justifyContent: 'center' }}>

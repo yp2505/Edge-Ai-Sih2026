@@ -3,7 +3,7 @@ import { IconWaveform, IconSearch } from './Icons.jsx'
 
 const N = 58
 
-export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
+export default function WavePanel({ latestEvent, serverUp, telemetry, stale, deviceConnected }) {
   const ref = useRef(null)
   const animRef = useRef(null)
   const timeRef = useRef(0)
@@ -22,7 +22,12 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
   let statusText = 'Waiting for voice input...'
   let statusColor = 'var(--t4)'
   let isActive = false
-  if (isStreaming) {
+  if (!serverUp) {
+    statusText = 'Server offline...'
+  } else if (!deviceConnected) {
+    statusText = 'Device offline — connect ESP32 to listen'
+    statusColor = 'rgba(255,255,255,0.45)'
+  } else if (isStreaming) {
     statusText = 'Listening for your command...'
     statusColor = 'var(--c1)'
     isActive = true
@@ -37,8 +42,6 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
   } else if (isRejected) {
     statusText = ` "${latestEvent.matched_variant}" rejected (score ${(latestEvent.match_score * 100).toFixed(0)}%)`
     statusColor = 'var(--t4)'
-  } else if (!serverUp) {
-    statusText = 'Server offline...'
   }
 
   const activeRef = useRef(isActive)
@@ -105,46 +108,46 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale }) {
   }, [])
 
   return (
-    <div className="wave-panel-content" style={{ display: 'flex', flexDirection: 'column', height: '100%', padding: '16px 20px 20px' }}>
+    <div className="wave-panel-content" style={{ display: 'flex', flexDirection: 'column', height: '100%', padding: '8px 16px 10px' }}>
 
-      <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 6 }}>
         {[{ l: 'CONFIDENCE', v: conf ? `${conf}%` : '--', c: 'var(--c1)' }, { l: 'SNR', v: snr ? `${snr} dB` : '--', c: 'var(--c3)' }].map(s => (
-          <div key={s.l} style={{ flex: 1, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: 12, padding: '10px 14px' }}>
-            <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 4 }}>{s.l}</div>
-            <div style={{ fontSize: 16, fontWeight: 700, color: isActive ? s.c : 'var(--t4)', fontFamily: 'var(--mono)' }}>{s.v}</div>
+          <div key={s.l} style={{ flex: 1, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: 10, padding: '5px 12px' }}>
+            <div style={{ fontSize: 8, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 2 }}>{s.l}</div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: isActive ? s.c : 'var(--t4)', fontFamily: 'var(--mono)' }}>{s.v}</div>
           </div>
         ))}
       </div>
 
-      <div className="waveform-area" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative', marginBottom: 20 }}>
-        <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 8, paddingLeft: 4 }}>LIVE AUDIO</div>
-        <div style={{ flex: 1, position: 'relative', background: 'rgba(255,255,255,0.015)', borderRadius: 12, border: '1px solid rgba(255,255,255,0.04)', overflow: 'hidden', opacity: isActive ? 1 : 0.25, transition: 'opacity 0.5s' }}>
+      <div className="waveform-area" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative', marginBottom: 6 }}>
+        <div style={{ fontSize: 8, fontWeight: 800, color: 'var(--t4)', letterSpacing: 1.5, marginBottom: 3, paddingLeft: 2 }}>LIVE AUDIO</div>
+        <div style={{ flex: 1, minHeight: '48px', position: 'relative', background: 'rgba(255,255,255,0.015)', borderRadius: 10, border: '1px solid rgba(255,255,255,0.04)', overflow: 'hidden', opacity: isActive ? 1 : 0.25, transition: 'opacity 0.5s' }}>
           <canvas ref={ref} style={{ width: '100%', height: '100%', display: 'block' }} />
           {isActive && (
-            <div style={{ position: 'absolute', top: 10, right: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-              <div style={{ width: 6, height: 6, borderRadius: '50%', background: statusColor, boxShadow: `0 0 8px ${statusColor}`, animation: 'blink 0.8s infinite' }} />
-              <span style={{ fontSize: 9, fontWeight: 700, color: statusColor, letterSpacing: '1.5px', fontFamily: 'var(--mono)' }}>{isStreaming ? 'LISTENING' : 'ACTIVE'}</span>
+            <div style={{ position: 'absolute', top: 6, right: 10, display: 'flex', alignItems: 'center', gap: 5 }}>
+              <div style={{ width: 5, height: 5, borderRadius: '50%', background: statusColor, boxShadow: `0 0 8px ${statusColor}`, animation: 'blink 0.8s infinite' }} />
+              <span style={{ fontSize: 8, fontWeight: 700, color: statusColor, letterSpacing: '1.2px', fontFamily: 'var(--mono)' }}>{isStreaming ? 'LISTENING' : 'ACTIVE'}</span>
             </div>
           )}
         </div>
       </div>
 
       <div className="wave-status-card" style={{
-        padding: 16, borderRadius: 14,
+        padding: '7px 12px', borderRadius: 10,
         background: isActive ? 'rgba(0,229,255,0.06)' : 'rgba(255,255,255,0.03)',
         border: `1px solid ${isActive ? 'rgba(0,229,255,0.2)' : 'rgba(255,255,255,0.05)'}`,
-        boxShadow: isActive ? '0 0 20px rgba(0,229,255,0.05)' : 'none',
+        boxShadow: isActive ? '0 0 16px rgba(0,229,255,0.05)' : 'none',
         display: 'flex', flexDirection: 'column', transition: 'all 0.3s'
       }}>
-        <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--t3)', letterSpacing: 1.5, marginBottom: 8 }}>WAKE WORD / AUDIO STATUS</div>
-        <div style={{ display: 'flex', alignItems: 'center', color: statusColor, fontSize: 13, gap: 8, padding: '4px 0' }}>
+        <div style={{ fontSize: 8, fontWeight: 800, color: 'var(--t3)', letterSpacing: 1.5, marginBottom: 3 }}>WAKE WORD / AUDIO STATUS</div>
+        <div style={{ display: 'flex', alignItems: 'center', color: statusColor, fontSize: 11.5, gap: 6, padding: '1px 0' }}>
           {isStreaming && (
-            <span style={{ fontSize: 14, textShadow: `0 0 8px ${statusColor}` }}>&#9679;</span>
+            <span style={{ fontSize: 12, textShadow: `0 0 8px ${statusColor}` }}>&#9679;</span>
           )}
           {isWake && (
-            <span style={{ fontSize: 14, textShadow: '0 0 8px var(--green)' }}>&#10003;</span>
+            <span style={{ fontSize: 12, textShadow: '0 0 8px var(--green)' }}>&#10003;</span>
           )}
-          {!isActive && <IconSearch size={14} color="var(--t4)" />}
+          {!isActive && <IconSearch size={12} color="var(--t4)" />}
           {statusText}
         </div>
       </div>

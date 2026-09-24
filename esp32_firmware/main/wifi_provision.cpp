@@ -45,14 +45,14 @@ static const char* TAG = "PROV";
 #define NVS_KEY_IP   "server_ip"
 
 // ─── AP ──────────────────────────────────────────────────────────────────────
-#define AP_SSID     "HeyVaani-Setup"
+#define AP_SSID     "HeyVaani-Node2-Setup"
 #define AP_MAX_CONN 4
 #define AP_IP_STR   "192.168.4.1"
 
 // ─── Exported globals ────────────────────────────────────────────────────────
 char g_wifi_ssid[PROV_SSID_MAX] = "Khush's A55";
 char g_wifi_pass[PROV_PASS_MAX] = "khush2073";
-char g_server_ip[PROV_IP_MAX]   = "10.28.236.188";
+char g_server_ip[PROV_IP_MAX]   = "13.233.100.83";
 
 
 // ─── Setup portal HTML ───────────────────────────────────────────────────────
@@ -94,7 +94,7 @@ static const char PORTAL_HTML[] =
         "<input type='password' name='pass'"
             " placeholder='Leave blank for open networks'>"
         "<label>Server IP Address</label>"
-        "<input type='text' name='ip' value='13.233.154.18'"
+        "<input type='text' name='ip' value='13.233.100.83'"
             " placeholder='Server IP Address' required>"
         "<div class='hint'>"
             "IP of the laptop running the Hey Vaani cloud server</div>"
@@ -172,7 +172,7 @@ static bool nvs_load_credentials(void) {
     // Force hardcoded credentials for testing
     strncpy(g_wifi_ssid, "Khush's A55", PROV_SSID_MAX);
     strncpy(g_wifi_pass, "khush2073", PROV_PASS_MAX);
-    strncpy(g_server_ip, "10.28.236.188", PROV_IP_MAX);
+    strncpy(g_server_ip, "13.233.100.83", PROV_IP_MAX);
     return true;
 }
 

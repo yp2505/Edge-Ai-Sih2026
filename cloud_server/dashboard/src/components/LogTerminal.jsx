@@ -27,13 +27,22 @@ export default function LogTerminal() {
     return () => { cancelled = true; clearInterval(timer) }
   }, [])
 
-  useEffect(() => { if (open) endRef.current?.scrollIntoView({ block: 'end' }) }, [entries, open])
+  const handleClear = async () => {
+    clearedAt.current = Date.now()
+    setEntries([])
+    try {
+      await fetch(`${API}/api/esp-logs/clear`, { method: 'POST' })
+    } catch {}
+  }
 
   return (
     <div className="log-terminal">
       <div className="log-terminal-head">
         <button onClick={() => setOpen(value => !value)}>{open ? '[-]' : '[+]'} ESP32 WIRELESS LOG</button>
-        <div><span>{entries.length} LINES</span><button className="log-clear" onClick={() => { clearedAt.current = Date.now(); setEntries([]) }}>CLEAR</button></div>
+        <div>
+          <span>{entries.length} LINES</span>
+          <button className="log-clear" onClick={handleClear} title="Clear terminal logs">CLEAR</button>
+        </div>
       </div>
       {open && <div className="log-terminal-body">
         {entries.length === 0 && <span className="log-muted">[I] TERMINAL: awaiting ESP32 or server events...</span>}

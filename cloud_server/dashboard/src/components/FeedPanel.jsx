@@ -59,7 +59,7 @@ export default function FeedPanel({ events }) {
         const timeStr = `${String(date.getHours()).padStart(2,'0')}:${String(date.getMinutes()).padStart(2,'0')}:${String(date.getSeconds()).padStart(2,'0')}`
 
         return (
-          <div key={e.session_id} style={{ position: 'relative', display: 'flex', flexDirection: 'column', padding: '12px 0 12px 28px', opacity: isNew ? 1 : 0.7, transition: 'all 0.3s' }}>
+          <div key={e.session_id ? `${e.session_id}-${idx}` : idx} style={{ position: 'relative', display: 'flex', flexDirection: 'column', padding: '12px 0 12px 28px', opacity: isNew ? 1 : 0.7, transition: 'all 0.3s' }}>
             <div style={{ position: 'absolute', left: 3, top: 16, width: 8, height: 8, borderRadius: '50%', background: isNew ? 'var(--c1)' : 'var(--t4)', boxShadow: isNew ? '0 0 8px var(--c1)' : 'none', border: '2px solid rgba(2,8,20,1)', zIndex: 2 }} />
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

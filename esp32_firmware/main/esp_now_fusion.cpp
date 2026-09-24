@@ -180,44 +180,54 @@ bool esp_now_fusion_peer_known(void) {
 }
 
 // ─── esp_now_fusion_should_trigger ───────────────────────────────────────────
+// FIX (2026-09-23): Previous logic hard-suppressed any local_conf < 0.82 even
+// though DETECT_THRESHOLD in main.cpp is 0.65. That mismatch silently threw
+// away valid detections in [0.65, 0.82) whenever a peer was known — the main
+// reason the wake word needed many attempts. Peer corroboration is now used
+// only for handoff arbitration between two valid local detections, never as a
+// gate that can block a single-node trigger.
+//
+// Decision rule:
+//   - local < DETECT_THRESHOLD_FLOOR: suppress (caller should not do this)
+//   - local >= FUSION_IMMEDIATE_THRESHOLD: trigger immediately (no wait)
+//   - otherwise: broadcast, wait briefly for peer; if BOTH elevated → handoff
+//     (higher conf wins); if peer silent/unknown → still trigger locally.
 bool esp_now_fusion_should_trigger(float local_conf, float local_rms, uint32_t node_id) {
-    // If no second node has been discovered/paired yet, trigger directly (standalone mode)
-    if (!s_peer_known) {
-        printf("[FUSION] local=%.4f (standalone node) -> TRIGGER\n", (double)local_conf);
-        fflush(stdout);
-        return true;
-    }
+    // Floor: caller already checked DETECT_THRESHOLD in main.cpp; keep a safety net.
+    static const float DETECT_THRESHOLD_FLOOR = 0.65f;
 
-    // ── High-confidence path: trigger IMMEDIATELY, zero peer wait ─────────────
-    // This is the common case for a clear "Hey Vaani" — never add latency here.
-    if (local_conf >= FUSION_IMMEDIATE_THRESHOLD) {
-        // Broadcast our confidence so the peer can make its own handoff decision
-        esp_now_fusion_broadcast(local_conf, local_rms, esp_timer_get_time());
-        printf("[FUSION] local=%.4f peer=N/A decision=TRIGGER reason=high_confidence_immediate\n",
-               (double)local_conf);
-        fflush(stdout);
-        return true;
-    }
-
-    // ── Below DETECT_THRESHOLD: suppress immediately ──────────────────────────
-    // (Caller should not call us below threshold, but guard anyway.)
-    if (local_conf < 0.82f) {
-        printf("[FUSION] local=%.4f peer=N/A decision=SUPPRESS reason=below_threshold\n",
+    if (local_conf < DETECT_THRESHOLD_FLOOR) {
+        printf("[FUSION] local=%.4f decision=SUPPRESS reason=below_detect_floor\n",
                (double)local_conf);
         fflush(stdout);
         return false;
     }
 
-    // ── Borderline path: wait up to FUSION_WAIT_MS for peer corroboration ─────
-    // Broadcast our report first so the peer sees it.
+    // Standalone (no peer discovered yet): always trigger.
+    if (!s_peer_known) {
+        printf("[FUSION] local=%.4f decision=TRIGGER reason=standalone_no_peer\n",
+               (double)local_conf);
+        fflush(stdout);
+        return true;
+    }
+
+    // High-confidence path: zero latency, no peer wait.
+    if (local_conf >= FUSION_IMMEDIATE_THRESHOLD) {
+        esp_now_fusion_broadcast(local_conf, local_rms, esp_timer_get_time());
+        printf("[FUSION] local=%.4f decision=TRIGGER reason=high_confidence_immediate\n",
+               (double)local_conf);
+        fflush(stdout);
+        return true;
+    }
+
+    // Borderline path [0.65, 0.85): broadcast and wait briefly for peer.
     esp_now_fusion_broadcast(local_conf, local_rms, esp_timer_get_time());
 
-    // Wait in 10 ms increments for a fresh peer report
-    float   peer_conf = 0.0f, peer_rms = 0.0f;
-    int64_t peer_age  = 0;
+    float   peer_conf  = 0.0f, peer_rms = 0.0f;
+    int64_t peer_age   = 0;
     bool    peer_valid = false;
+    int     waited_ms  = 0;
 
-    int waited_ms = 0;
     while (waited_ms < FUSION_WAIT_MS) {
         peer_valid = esp_now_fusion_get_peer(&peer_conf, &peer_rms, &peer_age);
         if (peer_valid && peer_age < (int64_t)FUSION_WAIT_MS * 1000) break;
@@ -225,8 +235,8 @@ bool esp_now_fusion_should_trigger(float local_conf, float local_rms, uint32_t n
         waited_ms += 10;
     }
 
-    if (peer_valid && peer_conf >= 0.82f) {
-        // Both nodes elevated — corroborate and trigger
+    // Both nodes saw the keyword → decide which one streams (handoff).
+    if (peer_valid && peer_conf >= DETECT_THRESHOLD_FLOOR) {
         bool winner = esp_now_fusion_is_winner(local_conf, local_rms, node_id);
         printf("[FUSION] local=%.4f peer=%.4f decision=%s reason=corroborated waited_ms=%d\n",
                (double)local_conf, (double)peer_conf,
@@ -234,16 +244,18 @@ bool esp_now_fusion_should_trigger(float local_conf, float local_rms, uint32_t n
                waited_ms);
         fflush(stdout);
         return winner;
-    } else {
-        // Peer not elevated or timed out — suppress as likely false positive
-        printf("[FUSION] local=%.4f peer=%.4f(valid=%d) decision=SUPPRESS reason=no_corroboration waited_ms=%d\n",
-               (double)local_conf,
-               peer_valid ? (double)peer_conf : 0.0,
-               (int)peer_valid,
-               waited_ms);
-        fflush(stdout);
-        return false;
     }
+
+    // Peer silent / stale / below floor → THIS node still triggers.
+    // Local multi-hit debounce in main.cpp already filtered single-frame noise;
+    // peer silence must not erase a valid local detection (fixes missed wakes).
+    printf("[FUSION] local=%.4f peer=%.4f(valid=%d) decision=TRIGGER reason=local_only waited_ms=%d\n",
+           (double)local_conf,
+           peer_valid ? (double)peer_conf : 0.0,
+           (int)peer_valid,
+           waited_ms);
+    fflush(stdout);
+    return true;
 }
 
 // ─── esp_now_fusion_is_winner ─────────────────────────────────────────────────

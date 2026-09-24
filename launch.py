@@ -43,7 +43,7 @@ PROJECT_ROOT    = Path(__file__).parent
 SERVER_DIR      = PROJECT_ROOT / "cloud_server"
 DASHBOARD_DIR   = PROJECT_ROOT / "cloud_server" / "dashboard"
 DASHBOARD_URL   = "http://localhost:5173"
-SERVER_PORT     = 5000
+SERVER_PORT     = 8080
 
 # ESP32 USB identifiers (works for most CP210x and CH340 chips)
 ESP32_USB_VIDS  = {0x10C4, 0x1A86, 0x0403, 0x303A}  # Silabs, CH340, FTDI, Espressif
@@ -254,8 +254,9 @@ def main():
     )
     time.sleep(2)  # give server a moment to bind the port
 
-    # Step 3: Start Serial Monitor AFTER server is up
-    start_serial_monitor(esp32_port)
+    # Step 3: Serial monitor is handled directly by server.py's integrated USB bridge
+    # (which parses [AUDIO], [KWS], and [TRIGGER-HIT] and streams them to the dashboard)
+    # start_serial_monitor(esp32_port)
 
     # Step 4: Check npm deps + start dashboard
     check_npm()

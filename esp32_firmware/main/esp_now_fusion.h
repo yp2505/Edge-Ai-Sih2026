@@ -26,15 +26,20 @@ extern "C" {
 
 // ─── Fusion tuning constants ─────────────────────────────────────────────────
 // FUSION_IMMEDIATE_THRESHOLD: confident triggers skip peer wait entirely.
-// Must be > DETECT_THRESHOLD (0.70).  Raising reduces latency for clear KW.
+// Must be > DETECT_THRESHOLD in main.cpp (0.65). Raising reduces latency for
+// clear KW without affecting borderline single-node sensitivity.
 #define FUSION_IMMEDIATE_THRESHOLD  0.85f
 
-// FUSION_WAIT_MS: max time to wait for peer corroboration on borderline hits.
+// FUSION_WAIT_MS: max time to wait for peer report on borderline hits.
 // Keep short — adds latency only to borderline cases, never to confident ones.
 #define FUSION_WAIT_MS              100
 
 // FUSION_STALE_US: peer report older than this is ignored as stale.
 #define FUSION_STALE_US             (300 * 1000)   // 300 ms in microseconds
+
+// NOTE: Peer corroboration is for HANDOFF only (which of two detecting nodes
+// streams). It must NEVER suppress a valid local detection below 0.85 — that
+// caused the old "need 10–15 attempts" failure mode when a peer was known.
 
 // ─── Packet structure ────────────────────────────────────────────────────────
 // MUST stay ≤ 250 bytes (ESP-NOW payload limit). Currently 20 bytes.

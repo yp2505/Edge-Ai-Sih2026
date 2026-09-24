@@ -179,6 +179,53 @@ export function IconDonut({ size = 16, color = 'currentColor' }) {
   )
 }
 
+/** Authentic USB Type-A Cable Connector Plug */
+export function IconUsb({ size = 16, color = 'currentColor' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      {/* Connector metal sleeve */}
+      <rect x="7" y="2" width="10" height="6.5" rx="1.2" strokeWidth="1.9" />
+      {/* Precision contact pins */}
+      <line x1="10" y1="4.5" x2="10" y2="6.5" strokeWidth="1.8" />
+      <line x1="14" y1="4.5" x2="14" y2="6.5" strokeWidth="1.8" />
+      {/* Molded connector plug body */}
+      <path d="M5.5 8.5h13a1.5 1.5 0 0 1 1.5 1.5v4.5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V10a1.5 1.5 0 0 1 1.5-1.5z" strokeWidth="1.9" />
+      {/* Strain relief collar */}
+      <rect x="9.5" y="16.5" width="5" height="1.8" rx="0.5" fill={color} stroke="none" />
+      {/* Heavy-duty USB wire cord */}
+      <line x1="12" y1="18.3" x2="12" y2="22.5" strokeWidth="2.4" />
+    </svg>
+  )
+}
+
+/** Official USB Trident symbol */
+export function IconUsbTrident({ size = 16, color = 'currentColor' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="19.5" r="1.8" fill={color} stroke="none" />
+      <line x1="12" y1="17.7" x2="12" y2="4.5" strokeWidth="1.9" />
+      <polyline points="8.5 7.5 12 3.5 15.5 7.5" strokeWidth="1.9" />
+      {/* Right branch -> circle */}
+      <path d="M12 11.5h3a2 2 0 0 1 2 2v1.5" strokeWidth="1.9" />
+      <circle cx="17" cy="16.5" r="1.5" fill={color} stroke="none" />
+      {/* Left branch -> square */}
+      <path d="M12 13.5h-3a2 2 0 0 0-2 2V17" strokeWidth="1.9" />
+      <rect x="5.8" y="15.8" width="2.4" height="2.4" rx="0.4" fill={color} stroke="none" />
+    </svg>
+  )
+}
+
+export function IconPlug({ size = 16, color = 'currentColor' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 22v-5" strokeWidth="2.2" />
+      <path d="M9 7V2" strokeWidth="2" />
+      <path d="M15 7V2" strokeWidth="2" />
+      <path d="M6 7h12a2 2 0 0 1 2 2v2.5a5.5 5.5 0 0 1-11 0V9a2 2 0 0 1-2-2z" strokeWidth="1.9" />
+    </svg>
+  )
+}
+
 /** Official Hey Vaani aerospace mission logo */
 export function VaaniLogo({ size = 32, className = '', style = {} }) {
   return (

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-export default function OrbPanel({ latest, up, pings }) {
+export default function OrbPanel({ latest, up, pings, deviceConnected }) {
   const [state, setState] = useState('offline')
   const [label, setLabel] = useState('OFFLINE')
   const [sub, setSub] = useState('Server disconnected')
@@ -23,7 +23,13 @@ export default function OrbPanel({ latest, up, pings }) {
   const prevStatus = useRef(null)
 
   useEffect(() => {
-    if (!up) { clr(); setState('offline'); setLabel('OFFLINE'); setSub('Server disconnected'); return }
+    if (!up) {
+      clr(); setState('offline'); setLabel('OFFLINE'); setSub('Cloud Server disconnected'); return
+    }
+
+    if (!deviceConnected) {
+      clr(); setState('standby'); setLabel('STANDBY'); setSub('Connect ESP32 device to start'); return
+    }
 
     const e = latest
     if (!e || (Date.now() - new Date(e.timestamp).getTime() > 6000)) {
@@ -45,21 +51,28 @@ export default function OrbPanel({ latest, up, pings }) {
        }
     }
     return clr
-  }, [up, latest, state])
+  }, [up, deviceConnected, latest, state])
 
   const off = state === 'offline'
+  const standby = state === 'standby'
   const det = state === 'detect'
   const proc = state === 'process'
 
   const grad = off
     ? 'radial-gradient(circle at 35% 30%, #0d1f30 0%, #060e18 50%, #020609 100%)'
+    : standby
+    ? 'radial-gradient(circle at 35% 30%, #1e2632 0%, #0e141c 50%, #05080c 100%)'
     : det
     ? 'radial-gradient(circle at 35% 30%, #00f0ff 0%, #00b8e0 32%, #003c70 80%, #001830 100%)'
     : proc
     ? 'radial-gradient(circle at 35% 30%, #00d4f0 0%, #0090c0 35%, #002a60 80%, #001020 100%)'
     : 'radial-gradient(circle at 35% 30%, #00d4ff 0%, #0096cc 38%, #003060 80%, #00182e 100%)'
 
-  const glow = off ? '0 0 20px rgba(0,0,0,0.6)' : det
+  const glow = off
+    ? '0 0 20px rgba(0,0,0,0.6)'
+    : standby
+    ? '0 0 24px rgba(0,0,0,0.85), 0 0 8px rgba(255,255,255,0.06)'
+    : det
     ? '0 0 50px rgba(0,229,255,0.65), 0 0 100px rgba(0,229,255,0.25)'
     : '0 0 32px rgba(0,229,255,0.38), 0 0 65px rgba(0,229,255,0.12)'
 
@@ -68,12 +81,12 @@ export default function OrbPanel({ latest, up, pings }) {
       {/* Top Labels */}
       <div style={{ textAlign: 'center', zIndex: 3 }}>
         <div style={{ fontFamily: 'var(--title)', fontSize: 16, fontWeight: 800, color: 'var(--t1)', letterSpacing: 2 }}>VAANI AI</div>
-        <div style={{ fontSize: 11, fontWeight: 800, color: off ? 'var(--t4)' : det ? 'var(--green)' : proc ? 'var(--amber)' : 'var(--c1)', letterSpacing: 2, marginTop: 4 }}>{label}</div>
+        <div style={{ fontSize: 11, fontWeight: 800, color: off ? 'var(--t4)' : standby ? 'rgba(255,255,255,0.5)' : det ? 'var(--green)' : proc ? 'var(--c1)' : 'var(--c1)', letterSpacing: 2, marginTop: 4 }}>{label}</div>
       </div>
 
       <div className="orb-wrap" style={{ flex: 'none', height: 86, margin: '6px 0' }}>
         {/* Sonar rings */}
-        {!off && (
+        {!off && !standby && (
           <div className="orb-ring-wrap">
             {[0,1,2].map(i => (
               <div key={i} className="orb-ring" style={{
@@ -98,13 +111,16 @@ export default function OrbPanel({ latest, up, pings }) {
         ))}
 
         {/* Sphere */}
-        <div className="orb-sphere" style={{ width: 86, height: 86, borderRadius: '50%', background: grad, boxShadow: glow, animation: off ? 'none' : proc ? 'slime-wobble-fast 1s ease-in-out infinite' : 'slime-wobble 3s ease-in-out infinite' }}>
+        <div className="orb-sphere" style={{ width: 86, height: 86, borderRadius: '50%', background: grad, boxShadow: glow, animation: (off || standby) ? 'none' : proc ? 'slime-wobble-fast 1s ease-in-out infinite' : 'slime-wobble 3s ease-in-out infinite' }}>
           <div className="orb-shine" />
           <div className="orb-face">
             <div className="orb-eyes">
               {off ? (
                 <><div style={{ width:10, height:2, background:'rgba(255,255,255,0.15)', borderRadius:4 }}/>
                   <div style={{ width:10, height:2, background:'rgba(255,255,255,0.15)', borderRadius:4 }}/></>
+              ) : standby ? (
+                <><div style={{ width:8, height:2, background:'rgba(255,255,255,0.3)', borderRadius:2 }}/>
+                  <div style={{ width:8, height:2, background:'rgba(255,255,255,0.3)', borderRadius:2 }}/></>
               ) : proc ? (
                 <>{[0,1].map(i => (
                   <div key={i} style={{ width:9, height:9, background:'rgba(0,5,20,0.9)', borderRadius:'50%', position:'relative', animation:'spin 0.9s linear infinite', animationDelay:`${i*0.1}s` }}>
@@ -122,16 +138,16 @@ export default function OrbPanel({ latest, up, pings }) {
 
       {/* Subtext & Indicators */}
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, zIndex: 3, width: '100%' }}>
-        <div style={{ fontSize: 11, color: 'var(--t3)', textAlign: 'center', minHeight: 14 }}>{sub}</div>
+        <div style={{ fontSize: 11, color: standby ? 'rgba(255,255,255,0.45)' : 'var(--t3)', textAlign: 'center', minHeight: 14 }}>{sub}</div>
         
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-start', background: 'rgba(255,255,255,0.03)', padding: '8px 16px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.06)', width: '90%', maxWidth: 200 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 10, fontWeight: 700, color: up ? 'var(--t1)' : 'var(--t4)', letterSpacing: 0.5 }}>
-            <div style={{ width: 6, height: 6, borderRadius: '50%', background: up ? 'var(--green)' : 'var(--t4)', boxShadow: up ? '0 0 6px var(--green)' : 'none' }} />
-            Microphone Ready
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 10, fontWeight: 700, color: (up && deviceConnected) ? 'var(--t1)' : 'var(--t4)', letterSpacing: 0.5 }}>
+            <div style={{ width: 6, height: 6, borderRadius: '50%', background: (up && deviceConnected) ? 'var(--green)' : 'rgba(255,255,255,0.3)', boxShadow: (up && deviceConnected) ? '0 0 6px var(--green)' : 'none' }} />
+            {deviceConnected ? 'Microphone Active' : 'Microphone Offline'}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 10, fontWeight: 700, color: up ? 'var(--t1)' : 'var(--t4)', letterSpacing: 0.5 }}>
             <div style={{ width: 6, height: 6, borderRadius: '50%', background: up ? 'var(--green)' : 'var(--t4)', boxShadow: up ? '0 0 6px var(--green)' : 'none' }} />
-            AI Engine Ready
+            {up ? 'AI Engine Ready' : 'AI Engine Offline'}
           </div>
         </div>
       </div>

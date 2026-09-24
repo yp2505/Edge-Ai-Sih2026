@@ -37,7 +37,11 @@ N_FRAMES        = 49         # Must match training exactly
 CHANNELS        = 1          # Mono audio
 
 KEYWORD         = "Hey Vaani"
-DETECTION_THRESHOLD = 0.50   # Confidence above this = keyword detected
+DETECTION_THRESHOLD     = 0.65   # SOFT tier — multi-hit sliding window (matches main.cpp)
+DETECTION_HARD_THRESHOLD= 0.85   # HARD tier — single confident frame fires
+DETECTION_HITS_REQUIRED = 3      # soft hits needed inside window
+DETECTION_WINDOW_FRAMES = 6      # sliding window length (in inference frames)
+DETECT_COOLDOWN_S       = 1.5    # refractory after a trigger (blocks re-fire)
 COMMAND_DURATION    = 2.0    # ⚡ OPTIMIZED: 2s capture (was 4.0s) → saves ~2s latency
 SLIDE_STEP          = 0.25   # ⚡ OPTIMIZED: infer every 0.25s (4Hz, was 0.5s) → faster detection
 STREAM_CHUNK_SIZE   = 3200   # ⚡ Stream 0.1s chunks in real-time (100ms per chunk)
@@ -399,10 +403,12 @@ class HeyVaaniEdge:
     """Main edge inference controller for Hey Vaani keyword spotting."""
 
     def __init__(self, model_path: str, server_ip: str, server_port: int,
-                 threshold: float = DETECTION_THRESHOLD, device_id=None):
+                 threshold: float = DETECTION_THRESHOLD, device_id=None,
+                 hard_threshold: float = DETECTION_HARD_THRESHOLD):
         self.server_ip   = server_ip
         self.server_port = server_port
         self.threshold   = threshold
+        self.hard_threshold = hard_threshold
         self.device_id   = device_id
         self.session_id  = 0
 
@@ -419,9 +425,13 @@ class HeyVaaniEdge:
         self._total_inference_ms = 0.0
         self._vad_skipped     = 0
 
-        # Inference smoothing (rolling average over 8 frames)
-        self._smooth_window = 8
-        self._smooth_buffer = []
+        # Inference smoothing — sliding-window hit counter (soft + hard tier).
+        # OLD BUG: 8-frame rolling AVERAGE diluted a real 1–2 frame spike below
+        # threshold (needed 10–15 attempts), while a stuck mid-range noise floor
+        # could slowly climb the average and fire "automatically". Replaced with
+        # a window of raw confidences: fire on HARD peak or N soft hits.
+        self._conf_window = collections.deque(maxlen=DETECTION_WINDOW_FRAMES)
+        self._last_detect_time = 0.0
 
     def _audio_callback(self, indata, frames, time_info, status):
         """Called by sounddevice for each audio chunk."""
@@ -442,7 +452,9 @@ class HeyVaaniEdge:
 
     def _run_inference_loop(self):
         """Inference loop — runs every SLIDE_STEP seconds (0.5s = 2Hz)."""
-        print(f"\n  🟢 Listening for '{KEYWORD}'... (threshold={self.threshold})")
+        print(f"\n  🟢 Listening for '{KEYWORD}'... "
+              f"(soft={self.threshold} hard={self.hard_threshold} "
+              f"hits={DETECTION_HITS_REQUIRED}/{DETECTION_WINDOW_FRAMES})")
         print(f"  💡 Inference rate: every {SLIDE_STEP}s | Slide window: {DURATION}s\n")
 
         while self._is_listening:
@@ -457,6 +469,10 @@ class HeyVaaniEdge:
             if not speech_detected:
                 # Silence — skip expensive MFCC + DS-CNN inference
                 self._vad_skipped += 1
+                # Age out stale high confidences so noise cannot accumulate
+                # across long silence into a false "automatic" trigger.
+                if self._conf_window:
+                    self._conf_window.append(0.0)
                 rms_bar = int(min(20, vad_metrics['rms'] / VAD_ENERGY_THRESHOLD * 10))
                 bar     = "░" * 20
                 print(
@@ -482,29 +498,35 @@ class HeyVaaniEdge:
             self._inference_count += 1
             self._total_inference_ms += inference_ms
 
-            # Apply rolling average smoothing over 8 frames
-            # Reset buffer when confidence drops low to prevent carry-over
-            if kw_prob < 0.30:
-                self._smooth_buffer.clear()
-            self._smooth_buffer.append(kw_prob)
-            if len(self._smooth_buffer) > self._smooth_window:
-                self._smooth_buffer.pop(0)
-            kw_prob_smooth = sum(self._smooth_buffer) / len(self._smooth_buffer)
+            # Sliding-window confidence history (raw values — no averaging).
+            self._conf_window.append(kw_prob)
+            soft_hits = sum(1 for p in self._conf_window if p >= self.threshold)
+            conf_peak = max(self._conf_window)
+
+            # HARD tier: one very confident frame fires immediately.
+            # SOFT tier: N hits inside the window (tolerates phoneme dips).
+            hard_trigger = kw_prob >= self.hard_threshold
+            soft_trigger = soft_hits >= DETECTION_HITS_REQUIRED
+            in_cooldown  = (time.time() - self._last_detect_time) < DETECT_COOLDOWN_S
+            detected     = (hard_trigger or soft_trigger) and not in_cooldown
 
             # Display status bar (speech mode)
             bar_len  = 20
-            filled   = int(kw_prob_smooth * bar_len)
+            filled   = int(kw_prob * bar_len)
             bar      = "█" * filled + "░" * (bar_len - filled)
-            marker   = "🔔 DETECTED!" if kw_prob_smooth >= self.threshold else "  "
+            marker   = "🔔 DETECTED!" if detected else "  "
             print(
-                f"\r  [{bar}] {kw_prob_smooth:.2f} | {inference_ms:.1f}ms "
+                f"\r  [{bar}] {kw_prob:.2f} peak={conf_peak:.2f} "
+                f"soft={soft_hits}/{DETECTION_WINDOW_FRAMES} | {inference_ms:.1f}ms "
                 f"rms={vad_metrics['rms']:.4f} {marker}",
                 end="", flush=True
             )
 
             # Keyword detected — start command capture
-            if kw_prob_smooth >= self.threshold and not self._is_capturing:
-                self._on_keyword_detected(kw_prob_smooth)
+            if detected:
+                self._last_detect_time = time.time()
+                self._conf_window.clear()
+                self._on_keyword_detected(kw_prob)
 
             # Adaptive sleep — maintain target inference rate
             elapsed = time.time() - loop_start
@@ -598,7 +620,9 @@ class HeyVaaniEdge:
         print("=" * 60)
         print(f"  Model:     {os.path.basename(self.detector.model_path)}")
         print(f"  Server:    {self.server_ip}:{self.server_port}")
-        print(f"  Threshold: {self.threshold}")
+        print(f"  Threshold: soft={self.threshold} hard={self.hard_threshold} "
+              f"hits={DETECTION_HITS_REQUIRED}/{DETECTION_WINDOW_FRAMES} "
+              f"cooldown={DETECT_COOLDOWN_S}s")
         print(f"  Audio:     {SAMPLE_RATE}Hz mono, {DURATION}s window")
         print("=" * 60)
 
@@ -658,7 +682,9 @@ Examples:
     parser.add_argument("--server-port", type=int,   default=DEFAULT_PORT,
                         help="Cloud ASR server port (default: 5000)")
     parser.add_argument("--threshold",   type=float, default=DETECTION_THRESHOLD,
-                        help=f"Keyword confidence threshold (default: {DETECTION_THRESHOLD})")
+                        help=f"SOFT confidence threshold, multi-hit (default: {DETECTION_THRESHOLD})")
+    parser.add_argument("--hard-threshold", type=float, default=DETECTION_HARD_THRESHOLD,
+                        help=f"HARD threshold, single-frame fire (default: {DETECTION_HARD_THRESHOLD})")
     parser.add_argument("--device",      type=int,   default=None,
                         help="Audio device ID (default: system default)")
     parser.add_argument("--list-devices", action="store_true",
@@ -678,10 +704,11 @@ Examples:
         return
 
     edge = HeyVaaniEdge(
-        model_path  = args.model,
-        server_ip   = args.server_ip,
-        server_port = args.server_port,
-        threshold   = args.threshold,
+        model_path     = args.model,
+        server_ip      = args.server_ip,
+        server_port    = args.server_port,
+        threshold      = args.threshold,
+        hard_threshold = args.hard_threshold,
     )
     edge.start(device_id=args.device)
 
