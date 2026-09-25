@@ -169,9 +169,9 @@ static const uint8_t AES_KEY[16] = {
 // Previous bug: HITS=1 + no window meant one noisy frame ≥0.65 fired the
 // detector (false "automatic" triggers), while fusion hard-suppressed
 // [0.65,0.82) when a peer was known (needed 10–15 attempts).  Both fixed.
-static const float DETECT_THRESHOLD          = 0.80f;   // Reliable speech confidence threshold
-static const float DETECT_HARD_THRESHOLD     = 0.94f;   // HARD tier threshold
-static const int   DETECTION_HITS_REQUIRED   = 2;       // 2 consecutive hits (~60ms sustained match)
+static const float DETECT_THRESHOLD          = 0.93f;   // Reliable speech confidence threshold
+static const float DETECT_HARD_THRESHOLD     = 0.98f;   // HARD tier threshold
+static const int   DETECTION_HITS_REQUIRED   = 3;       // 3 consecutive hits (~90ms sustained match)
 static const int   DETECTION_WINDOW_FRAMES   = 5;       // sliding window (~150 ms at 30 ms/frame)
 static const float MIN_SPEECH_RMS            = 0.010f;  // speech detection floor (above ambient noise ~0.0050)
 static const int   MIN_PEAK_SAMPLE           = 700;     // consonant burst threshold (above ambient noise spikes <550)
