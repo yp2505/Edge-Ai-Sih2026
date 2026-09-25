@@ -90,7 +90,7 @@ export default function TopBar({ health, up, total, telemetryStale, onSettings, 
   const espStateColor = !up ? 'var(--t4)' : (isPlugged || !telemetryStale) ? 'var(--green)' : 'rgba(255,255,255,0.45)'
 
   const isAws = Boolean(health?.is_aws || (health?.target_server && (health.target_server.includes('13.233') || health.target_server.includes('aws'))))
-  const serverLabel = isAws ? (up ? 'AWS: ONLINE' : 'AWS: OFFLINE') : (up ? 'SERVER ONLINE' : 'SERVER OFFLINE')
+  const awsOnline = Boolean(health?.aws_online)
 
   return (
     <div className="tb-wrap">
@@ -109,9 +109,9 @@ export default function TopBar({ health, up, total, telemetryStale, onSettings, 
 
         <div className="hide-on-mobile" style={{ width: 1, height: 24, background: 'rgba(255,255,255,0.08)' }} />
 
-        {/* Server Status */}
+        {/* Server Status (Real-time live ASR backend) */}
         <div
-          title={isAws ? (up ? `AWS Cloud Server Online (${health?.target_server})` : `AWS Cloud Server Offline (${health?.target_server || 'Unreachable'})`) : (up ? 'Server Online' : 'Server Offline')}
+          title={up ? 'ASR Backend Server Online (Port 8080)' : 'ASR Backend Server Offline'}
           style={{
             display: 'flex',
             alignItems: 'center',
@@ -144,9 +144,51 @@ export default function TopBar({ health, up, total, telemetryStale, onSettings, 
             whiteSpace: 'nowrap',
             lineHeight: 1
           }}>
-            {serverLabel}
+            {up ? 'SERVER ONLINE' : 'SERVER OFFLINE'}
           </span>
         </div>
+
+        {/* AWS Cloud Link Status (Real-time live AWS EC2 reachability) */}
+        {isAws && (
+          <div
+            title={`AWS Cloud Target: ${health?.target_server || '13.233.154.18'} (${awsOnline ? 'Connected' : 'Offline / Unreachable'})`}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 7,
+              height: 30,
+              padding: '0 12px',
+              background: awsOnline ? 'rgba(0,255,136,0.06)' : 'rgba(255,255,255,0.03)',
+              borderRadius: 15,
+              border: `1px solid ${awsOnline ? 'rgba(0,255,136,0.22)' : 'rgba(255,255,255,0.08)'}`,
+              boxShadow: awsOnline ? '0 0 10px rgba(0,255,136,0.12)' : 'none',
+              flexShrink: 0,
+              whiteSpace: 'nowrap',
+              boxSizing: 'border-box',
+              transition: 'all 0.3s'
+            }}
+          >
+            <div style={{
+              width: 6,
+              height: 6,
+              borderRadius: '50%',
+              background: awsOnline ? 'var(--green)' : 'rgba(255,255,255,0.25)',
+              boxShadow: awsOnline ? '0 0 8px var(--green)' : 'none',
+              animation: awsOnline ? 'pulse 2s infinite' : 'none',
+              flexShrink: 0
+            }} />
+            <span style={{
+              fontSize: 10,
+              fontWeight: 800,
+              letterSpacing: 1.2,
+              color: awsOnline ? 'var(--green)' : 'rgba(255,255,255,0.45)',
+              whiteSpace: 'nowrap',
+              lineHeight: 1
+            }}>
+              {awsOnline ? 'AWS: ONLINE' : 'AWS: OFFLINE'}
+            </span>
+          </div>
+        )}
 
         {/* USB Cable Plug Status */}
         <div style={{

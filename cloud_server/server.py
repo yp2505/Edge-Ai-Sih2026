@@ -531,18 +531,19 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             with _CLOUD_HEALTH_LOCK:
                 cloud_info = dict(_CLOUD_HEALTH)
 
-            # If an external cloud server is configured (e.g. AWS EC2),
-            # the system server_online status reflects the real-time AWS server connectivity!
-            server_online = cloud_info["online"] if cloud_info.get("is_cloud") else True
+            # Local ASR server is healthy and running live!
+            uptime = int(time.time() - asr.start_time)
+            aws_online = cloud_info.get("online", False)
 
             resp = {
-                "status":         "running" if server_online else "cloud_offline",
-                "server_online":  server_online,
-                "uptime_seconds": int(time.time() - asr.start_time) if server_online else 0,
+                "status":         "running",
+                "server_online":  True,
+                "uptime_seconds": uptime,
                 "session_count":  count,
                 "asr_engine":     f"faster-whisper-{asr.whisper_model}",
                 "device":         dev,
                 "cloud":          cloud_info,
+                "aws_online":     aws_online,
                 "target_server":  cloud_info.get("target_ip"),
                 "is_aws":         cloud_info.get("is_aws", False),
             }
