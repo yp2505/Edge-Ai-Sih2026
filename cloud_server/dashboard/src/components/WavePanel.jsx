@@ -85,8 +85,11 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale, dev
         const x = pad + i * sp + sp * 0.25
         const r = Math.min(bw / 2, hh / 2, 4)
         const f = n
-        const R = Math.round(0), G = Math.round(210 - f * 20), B = Math.round(255 - f * 60)
-        const a = on ? 0.45 + inten * 0.55 : 0.1 + inten * 0.3
+        const isLight = document.body.classList.contains('theme-light')
+        const R = isLight ? 2 : Math.round(0)
+        const G = isLight ? Math.round(132 - f * 30) : Math.round(210 - f * 20)
+        const B = isLight ? 199 : Math.round(255 - f * 60)
+        const a = on ? 0.45 + inten * 0.55 : (isLight ? 0.08 + inten * 0.3 : 0.1 + inten * 0.3)
         ctx.fillStyle = `rgba(${R},${G},${B},${a})`
         ctx.beginPath(); ctx.roundRect(x, cy - hh, bw, hh, [r, r, 0, 0]); ctx.fill()
         ctx.beginPath(); ctx.roundRect(x, cy, bw, hh, [0, 0, r, r]); ctx.fill()
@@ -98,7 +101,10 @@ export default function WavePanel({ latestEvent, serverUp, telemetry, stale, dev
           ctx.shadowBlur = 0
         }
       }
-      ctx.strokeStyle = on ? 'rgba(0,229,255,0.14)' : 'rgba(255,255,255,0.04)'
+      const isLight = document.body.classList.contains('theme-light')
+      ctx.strokeStyle = on 
+        ? (isLight ? 'rgba(2, 132, 199, 0.3)' : 'rgba(0,229,255,0.14)')
+        : (isLight ? 'rgba(0, 0, 0, 0.1)' : 'rgba(255,255,255,0.04)')
       ctx.lineWidth = 1; ctx.setLineDash([4, 9])
       ctx.beginPath(); ctx.moveTo(pad, cy); ctx.lineTo(w - pad, cy); ctx.stroke(); ctx.setLineDash([])
       timeRef.current += 0.04; animRef.current = requestAnimationFrame(draw)

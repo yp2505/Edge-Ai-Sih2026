@@ -78,22 +78,16 @@ export default function SettingsModal({ onClose, telemetry, serverUp, health }) 
     setMode('BALANCED')
   }
 
-  const S = {
-    label: { fontSize: 9, fontWeight: 700, letterSpacing: 1.5, textTransform: 'uppercase', color: '#7F91A3', marginBottom: 6, display: 'block', fontFamily: 'var(--mono)' },
-    input: { width: '100%', padding: '9px 14px', background: 'rgba(0,0,0,0.2)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: 10, color: '#E8F1F7', fontSize: 13, outline: 'none', fontFamily: 'var(--mono)' },
-    slider: { width: '100%', accentColor: '#00D9FF', cursor: 'pointer', marginTop: 3 },
-    row: { marginBottom: 20 },
-    divider: { height: 1, background: 'rgba(255,255,255,0.06)', margin: '18px 0' },
-    modeBtn: a => ({ flex: 1, padding: '10px 0', background: a ? 'rgba(0,217,255,0.1)' : 'rgba(0,0,0,0.2)', border: `1px solid ${a ? 'rgba(0,217,255,0.3)' : 'rgba(255,255,255,0.05)'}`, borderRadius: 8, color: a ? '#00D9FF' : '#7F91A3', fontSize: 10, fontWeight: 700, letterSpacing: 1, cursor: 'pointer', transition: 'all 0.2s', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, boxShadow: a ? '0 0 10px rgba(0,217,255,0.05)' : 'none' }),
-    save: { width: '100%', padding: '12px 0', background: isModified ? 'rgba(0,217,255,0.15)' : 'rgba(0,0,0,0.2)', border: `1px solid ${isModified ? 'rgba(0,217,255,0.4)' : 'rgba(255,255,255,0.05)'}`, borderRadius: 12, color: isModified ? '#E8F1F7' : '#00D9FF', fontSize: 13, fontWeight: 700, cursor: 'pointer', letterSpacing: 0.5, transition: 'all 0.2s', boxShadow: isModified ? '0 0 20px rgba(0,217,255,0.1)' : 'none' },
-    closeBtn: { width: 32, height: 32, borderRadius: 8, border: '1px solid rgba(255,255,255,0.05)', background: 'rgba(0,0,0,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#7F91A3', transition: 'all 0.2s' },
-    card: { flex: 1, padding: '12px', background: 'rgba(0,0,0,0.2)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: 10 }
+    const S = {
+    label: { fontSize: 8.5, fontWeight: 700, letterSpacing: 1.2, textTransform: 'uppercase', marginBottom: 5, display: 'block', fontFamily: 'var(--mono)' },
+    row: { marginBottom: 12 },
+    divider: { height: 1, margin: '12px 0' },
   }
 
   const modeDescriptions = {
-    PERFORMANCE: 'Lowest processing latency',
-    BALANCED: 'Recommended default',
-    ACCURACY: 'Maximum recognition confidence'
+    PERFORMANCE: 'Fast',
+    BALANCED: 'Default',
+    ACCURACY: 'Max Acc'
   }
 
   const saveControls = (
@@ -103,120 +97,99 @@ export default function SettingsModal({ onClose, telemetry, serverUp, health }) 
       )}
       {saveStatus && (
         <div className={`settings-save-status ${saveStatus === 'success' ? 'success' : 'error'}`}>
-          {saveStatus === 'success' ? 'CONFIGURATION SAVED' : saveStatus.toUpperCase()}
+          {saveStatus === 'success' ? '✓ SAVED' : saveStatus.toUpperCase()}
         </div>
       )}
-      <button className="settings-save-button" style={S.save} onClick={handleSave} disabled={saving}>
+      <button className={`settings-save-button ${isModified ? 'modified' : ''}`} onClick={handleSave} disabled={saving}>
         {saving ? 'SAVING...' : (isModified ? 'SAVE CHANGES' : 'SAVE CONFIGURATION')}
       </button>
-      <button onClick={handleReset} className="settings-reset">Reset to Defaults</button>
+      <button onClick={handleReset} className="settings-reset">Reset Defaults</button>
     </div>
   )
 
   return (
     <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-      <div className="modal-box glass settings-modal" style={S.modalBox}>
+      <div className="modal-box glass settings-modal">
+        
         {/* Header */}
-          <div className="settings-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div style={{ width: 38, height: 38, borderRadius: 11, background: 'rgba(0,217,255,0.1)', border: '1px solid rgba(0,217,255,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <IconSettings size={18} color="#00D9FF" />
+        <div className="settings-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div className="settings-icon-box">
+              <IconSettings size={16} />
             </div>
             <div>
-              <div style={{ fontSize: 15, fontWeight: 700, color: '#E8F1F7', letterSpacing: 0.3 }}>SYSTEM SETTINGS</div>
-              <div style={{ fontSize: 10, color: '#7F91A3', marginTop: 2 }}>Hardware profiles & audio parameters</div>
+              <div className="settings-title">SYSTEM SETTINGS</div>
+              <div className="settings-subtitle">Hardware & Network config</div>
             </div>
           </div>
-          <button style={S.closeBtn} onClick={onClose}><IconX size={14} color="#7F91A3" /></button>
+          <button className="settings-close-btn" onClick={onClose} aria-label="Close settings"><IconX size={12} /></button>
         </div>
 
-        <div style={S.divider} />
+        <div className="settings-divider" style={S.divider} />
 
-        <div className="modal-body">
-          {/* Mode */}
-          <div className="settings-section" style={S.row}>
-            <label style={S.label}>VOICE DETECTION MODE</label>
-            <div style={{ display: 'flex', gap: 6 }}>
-              {['PERFORMANCE', 'BALANCED', 'ACCURACY'].map(m => (
-                <button key={m} style={S.modeBtn(mode === m)} onClick={() => setMode(m)}>
-                  {m}
-                  {mode === m && <span style={{ fontSize: 8, color: '#00D9FF', opacity: 0.8, textTransform: 'none', fontWeight: 500, letterSpacing: 0 }}>{modeDescriptions[m]}</span>}
-                </button>
-              ))}
+        {/* 2-Column Grid */}
+        <div className="modal-body settings-grid-body">
+          
+          {/* COLUMN 1: Performance */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div className="settings-section">
+              <div style={S.row}>
+                <label className="settings-lbl" style={S.label}>DETECTION MODE</label>
+                <div className="settings-mode-group">
+                  {['PERFORMANCE', 'BALANCED', 'ACCURACY'].map(m => (
+                    <button key={m} type="button" className={`settings-mode-btn ${mode === m ? 'active' : ''}`} onClick={() => setMode(m)}>
+                      <span className="mode-btn-title">{m}</span>
+                      <span className="mode-btn-desc">{modeDescriptions[m]}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div style={S.row}>
+                <label className="settings-lbl" style={S.label}>CONFIDENCE <span className="settings-val" style={{ float: 'right', fontSize: 10 }}>{conf}%</span></label>
+                <input type="range" min="50" max="99" value={conf} onChange={e => setConf(+e.target.value)} className="settings-slider" />
+              </div>
+
+              <div style={{ marginBottom: 0 }}>
+                <label className="settings-lbl" style={S.label}>MIC GAIN <span className="settings-val" style={{ float: 'right', fontSize: 10 }}>{gain}%</span></label>
+                <input type="range" min="0" max="100" value={gain} onChange={e => setGain(+e.target.value)} className="settings-slider" />
+              </div>
             </div>
+
+            {saveControls}
           </div>
 
-          {/* Confidence */}
-          <div className="settings-section" style={S.row}>
-            <label style={S.label}>CONFIDENCE THRESHOLD <span style={{ float: 'right', color: '#00D9FF', fontSize: 11 }}>{conf}%</span></label>
-            <input type="range" min="50" max="99" value={conf} onChange={e => setConf(+e.target.value)} style={S.slider} />
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#7F91A3', fontFamily: 'var(--mono)', marginTop: 4 }}>
-              <span>50% (sensitive)</span><span>99% (precise)</span>
+          {/* COLUMN 2: Network & Status */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div className="settings-section">
+              <label className="settings-lbl" style={S.label}>NETWORK CONFIG</label>
+              <div className="settings-network-grid">
+                <label className="settings-field"><span className="settings-lbl" style={S.label}>SSID</span><input className="settings-input" value={network.ssid} placeholder="Network Name" onChange={e => updateNetwork('ssid', e.target.value)} /></label>
+                <label className="settings-field"><span className="settings-lbl" style={S.label}>Password</span><input className="settings-input" type="password" value={network.password} placeholder="Keep existing" onChange={e => updateNetwork('password', e.target.value)} /></label>
+                <label className="settings-field"><span className="settings-lbl" style={S.label}>Server IP</span><input className="settings-input" value={network.server_ip} placeholder="192.168.x.x" onChange={e => updateNetwork('server_ip', e.target.value)} /></label>
+                <label className="settings-field"><span className="settings-lbl" style={S.label}>Port</span><input className="settings-input" type="number" value={network.server_port} placeholder="5000" onChange={e => updateNetwork('server_port', e.target.value)} /></label>
+              </div>
+              {networkStatus && <div className={`settings-net-status ${networkStatus === 'success' ? 'ok' : 'err'}`}>{networkStatus === 'success' ? '✓ QUEUED FOR ESP32' : networkStatus}</div>}
+              <button type="button" className="settings-push-btn" onClick={pushNetwork} disabled={pushingNetwork}>{pushingNetwork ? 'PUSHING...' : 'PUSH TO ESP32'}</button>
             </div>
-          </div>
 
-          {/* Gain */}
-          <div className="settings-section" style={S.row}>
-            <label style={S.label}>MICROPHONE GAIN <span style={{ float: 'right', color: '#00D9FF', fontSize: 11 }}>{gain}%</span></label>
-            <input type="range" min="0" max="100" value={gain} onChange={e => setGain(+e.target.value)} style={S.slider} />
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#7F91A3', fontFamily: 'var(--mono)', marginTop: 4 }}>
-              <span>0% (mute)</span><span>100% (max)</span>
+            {/* Status Cards Condensed */}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <div className="settings-status-card">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4 }}><IconCpu size={11} className="settings-icon" /><span className="settings-lbl-bright">ESP32</span></div>
+                <div className="settings-status-text">{telemetry ? 'ONLINE' : 'OFFLINE'}</div>
+              </div>
+              <div className="settings-status-card">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4 }}><IconReport size={11} className="settings-icon" /><span className="settings-lbl-bright">ASR ENGINE</span></div>
+                <div className="settings-status-text">{serverUp ? 'READY' : 'OFFLINE'}</div>
+              </div>
             </div>
-          </div>
 
-          <div className="settings-section settings-audio" style={{ display: 'flex', gap: 12, marginBottom: 20 }}>
-            {/* Audio Info */}
-            <div style={S.card}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}><IconWaveform size={12} color="#00D9FF" /><IconFlash size={12} color="#00D9FF" style={{marginLeft: -4}} /><span style={{...S.label, margin: 0, color: '#E8F1F7'}}>AUDIO CONFIG</span></div>
-              <div style={{ fontSize: 10, color: '#7F91A3', fontFamily: 'var(--mono)' }}>SOURCE <span style={{ color: '#E8F1F7', float: 'right' }}>ESP32 Microphone</span></div>
-              <div style={{ fontSize: 10, color: '#7F91A3', fontFamily: 'var(--mono)', marginTop: 4 }}>SAMPLE RATE <span style={{ color: '#E8F1F7', float: 'right' }}>16 kHz</span></div>
-              <div style={{ fontSize: 10, color: '#7F91A3', fontFamily: 'var(--mono)', marginTop: 4 }}>CHANNELS <span style={{ color: '#E8F1F7', float: 'right' }}>Mono</span></div>
-            </div>
-          </div>
-
-          <div style={S.divider} />
-
-          {/* Device Info */}
-          <div className="settings-section settings-devices" style={{ display: 'flex', gap: 12, marginBottom: 12 }}>
-            <div style={S.card}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}><IconCpu size={12} color="#00D9FF" /><span style={{...S.label, margin: 0, color: '#E8F1F7'}}>DEVICE</span></div>
-              <div style={{ fontSize: 11, fontWeight: 600, color: '#E8F1F7', fontFamily: 'var(--mono)', marginBottom: 6 }}>ESP32-WROOM-32</div>
-              <div style={{ fontSize: 9, color: '#7F91A3', fontFamily: 'var(--mono)', marginBottom: 2 }}>STATUS <span style={{ color: telemetry ? '#00D37F' : '#FF453A', float: 'right' }}>● {telemetry ? 'ONLINE' : 'OFFLINE'}</span></div>
-              {telemetry && <div style={{ fontSize: 9, color: '#7F91A3', fontFamily: 'var(--mono)' }}>DEVICE ID <span style={{ color: '#E8F1F7', float: 'right' }}>{telemetry.device_id || 'UNKNOWN'}</span></div>}
-            </div>
-            
-            <div style={S.card}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}><IconReport size={12} color="#00D9FF" /><span style={{...S.label, margin: 0, color: '#E8F1F7'}}>ASR ENGINE</span></div>
-              <div style={{ fontSize: 11, fontWeight: 600, color: '#E8F1F7', fontFamily: 'var(--mono)', marginBottom: 6 }}>Vosk</div>
-              <div style={{ fontSize: 9, color: '#7F91A3', fontFamily: 'var(--mono)', marginBottom: 2 }}>STATUS <span style={{ color: serverUp ? '#00D37F' : '#FF453A', float: 'right' }}>● {serverUp ? 'READY' : 'OFFLINE'}</span></div>
-              {health && <div style={{ fontSize: 9, color: '#7F91A3', fontFamily: 'var(--mono)' }}>MODEL <span style={{ color: '#E8F1F7', float: 'right' }}>{health.asr_engine || 'tiny'}</span></div>}
-            </div>
-          </div>
-
-          <div className="settings-status" style={{ fontSize: 10, color: '#7F91A3', fontFamily: 'var(--mono)', padding: '8px 12px', background: 'rgba(0,0,0,0.2)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: 8, marginBottom: 20, display: 'flex', justifyContent: 'space-between' }}>
-            <span>ESP32 <span style={{ color: telemetry ? '#00D37F' : '#FF453A' }}>● {telemetry ? 'ONLINE' : 'OFFLINE'}</span></span>
-            <span>Wi-Fi <span style={{ color: telemetry ? '#00D37F' : '#FF453A' }}>● {telemetry ? 'CONNECTED' : 'DISCONNECTED'}</span></span>
-            <span>SERVER <span style={{ color: serverUp ? '#00D37F' : '#FF453A' }}>● {serverUp ? 'ONLINE' : 'OFFLINE'}</span></span>
-          </div>
-
-          {saveControls}
-
-          <div style={S.divider} />
-          <div className="settings-section" style={S.row}>
-            <label style={S.label}>NETWORK CONFIG</label>
-            <div style={{ fontSize: 10, color: '#7F91A3', marginBottom: 12 }}>Changes are picked up by the ESP32 on its next wireless configuration poll.</div>
-            <div className="settings-network-grid">
-              <label className="settings-field"><span>WiFi SSID</span><input aria-label="WiFi SSID" style={S.input} value={network.ssid} placeholder="Network name" onChange={e => updateNetwork('ssid', e.target.value)} /></label>
-              <label className="settings-field"><span>WiFi Password</span><input aria-label="WiFi Password" type="password" style={S.input} value={network.password} placeholder="Blank = keep existing" onChange={e => updateNetwork('password', e.target.value)} /></label>
-              <label className="settings-field"><span>Server IP</span><input aria-label="Server IP" style={S.input} value={network.server_ip} placeholder="Cloud server address" onChange={e => updateNetwork('server_ip', e.target.value)} /></label>
-              <label className="settings-field"><span>Server Port</span><input aria-label="Server Port" type="number" min="1" max="65535" style={S.input} value={network.server_port} placeholder="5000" onChange={e => updateNetwork('server_port', e.target.value)} /></label>
-            </div>
-            {networkStatus && <div style={{ color: networkStatus === 'success' ? '#00D37F' : '#FF453A', fontSize: 10, fontFamily: 'var(--mono)', marginTop: 10 }}>{networkStatus === 'success' ? 'NETWORK CONFIG QUEUED FOR ESP32' : networkStatus}</div>}
-            <button style={{ ...S.save, marginTop: 12, background: 'rgba(0,217,255,0.15)', borderColor: 'rgba(0,217,255,0.4)' }} onClick={pushNetwork} disabled={pushingNetwork}>{pushingNetwork ? 'PUSHING...' : 'PUSH TO ESP32'}</button>
           </div>
         </div>
-
       </div>
     </div>
   )
 }
+
+

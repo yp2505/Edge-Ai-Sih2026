@@ -74,7 +74,7 @@ function Clock() {
   )
 }
 
-export default function TopBar({ health, up, total, telemetryStale, onSettings, deviceInfo }) {
+export default function TopBar({ health, up, total, telemetryStale, onSettings, deviceInfo, theme, onToggleTheme }) {
   const u = health?.uptime_seconds || 0
   const h = Math.floor(u / 3600), m = Math.floor((u % 3600) / 60), s = u % 60
   const upStr = !up ? '--' : (h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m` : `${s}s`)
@@ -98,7 +98,7 @@ export default function TopBar({ health, up, total, telemetryStale, onSettings, 
       {/* Brand */}
       <div className="tb-brand-container" style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', justifyContent: 'center' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div style={{ width: 40, height: 40, borderRadius: '50%', background: 'rgba(0,0,0,0.6)', border: '1px solid rgba(0,229,255,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 16px rgba(0,229,255,0.18)', overflow: 'hidden' }}>
+          <div className="tb-logo" style={{ width: 40, height: 40, borderRadius: '50%', background: 'rgba(0,0,0,0.6)', border: '1px solid rgba(0,229,255,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 16px rgba(0,229,255,0.18)', overflow: 'hidden' }}>
             <VaaniLogo size={40} />
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
@@ -249,7 +249,10 @@ export default function TopBar({ health, up, total, telemetryStale, onSettings, 
       {/* Right */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
         <div className="hide-on-mobile"><Clock /></div>
-        <button aria-label="Open settings" onClick={onSettings} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12, color: 'var(--t2)', fontSize: 11, fontWeight: 700, letterSpacing: 1, transition: 'all 0.2s' }}>
+        <button aria-label="Toggle Theme" onClick={onToggleTheme} className="tb-action-btn" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12, color: 'var(--t2)', fontSize: 11, fontWeight: 700, letterSpacing: 1, transition: 'all 0.2s' }}>
+          <span className="hide-on-mobile">{theme === 'space' ? 'LIGHT THEME' : 'SPACE THEME'}</span>
+        </button>
+        <button aria-label="Open settings" onClick={onSettings} className="tb-action-btn" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12, color: 'var(--t2)', fontSize: 11, fontWeight: 700, letterSpacing: 1, transition: 'all 0.2s' }}>
           <IconSettings size={14} color="var(--c1)" /> <span className="hide-on-mobile">SETTINGS</span>
         </button>
       </div>

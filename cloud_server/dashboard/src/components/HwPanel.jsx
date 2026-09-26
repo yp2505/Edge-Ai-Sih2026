@@ -11,7 +11,7 @@ function Gauge({ label, value, color, unit = '%' }) {
     <div className="hw-g" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 5 }}>
       <div style={{ position: 'relative', width: 62, height: 62 }}>
         <svg width="62" height="62" viewBox="0 0 64 64" style={{ transform: 'rotate(-90deg)' }}>
-          <circle cx="32" cy="32" r={r} fill="none" stroke="rgba(255,255,255,0.03)" strokeWidth="4" />
+          <circle className="hw-g-track" cx="32" cy="32" r={r} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="4" />
           <circle cx="32" cy="32" r={r} fill="none" stroke={strokeColor} strokeWidth="4" strokeLinecap="round"
             strokeDasharray={`${dash} ${circ - dash}`}
             style={{ transition: 'stroke-dasharray 0.6s ease', filter: ok ? `drop-shadow(0 0 5px ${color})` : 'none' }} />

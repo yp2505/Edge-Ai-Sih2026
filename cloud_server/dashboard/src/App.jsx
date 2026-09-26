@@ -21,6 +21,7 @@ export default function App() {
   const [serverUp, setServerUp] = useState(false)
   const [settings, setSettings] = useState(false)
   const [bottomView, setBottomView] = useState('pipeline')
+  const [theme, setTheme] = useState('space')
 
   const get = useCallback(async (path, setter, transform) => {
     try {
@@ -57,6 +58,14 @@ export default function App() {
       }
     } catch {}
   }, [])
+
+  useEffect(() => {
+    if (theme === 'light') {
+      document.body.classList.add('theme-light')
+    } else {
+      document.body.classList.remove('theme-light')
+    }
+  }, [theme])
 
   useEffect(() => {
     fetchHealth()
@@ -112,14 +121,14 @@ export default function App() {
 
   return (
     <>
-      <LiveBackground />
+      {theme === 'space' && <LiveBackground />}
 
       {settings && <SettingsModal telemetry={telemetry} serverUp={serverUp} health={health} onClose={() => setSettings(false)} />}
 
       <div className="dash">
 
         {/* ── Top Bar ── */}
-        <div className="a-bar glass"><TopBar health={health} up={serverUp} total={events.length} telemetryStale={telemetryStale} onSettings={() => setSettings(true)} deviceInfo={deviceInfo} /></div>
+        <div className="a-bar glass"><TopBar health={health} up={serverUp} total={events.length} telemetryStale={telemetryStale} onSettings={() => setSettings(true)} deviceInfo={deviceInfo} theme={theme} onToggleTheme={() => setTheme(t => t === 'space' ? 'light' : 'space')} /></div>
 
         {/* ── AI Companion (Top Left) ── */}
         <div className="a-ai glass ai-panel">
