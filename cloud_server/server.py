@@ -792,7 +792,7 @@ class ASRServer:
                         found_desc = p.description or "ESP32 USB Device"
                         break
                     desc = (p.description or "").lower()
-                    if any(k in desc for k in ["cp210", "ch340", "esp32", "usb-serial", "uart"]):
+                    if any(k in desc for k in ["cp210", "ch340", "esp32", "usb-serial", "usb serial", "uart"]):
                         found_port = p.device
                         found_desc = p.description
                         break
@@ -851,6 +851,7 @@ class ASRServer:
                             self.telemetry["received_at"] = datetime.utcnow().isoformat() + "Z"
                         _sse_notify({"type": "device", **self.device_info})
                     except Exception as e:
+                        print(f"\n  ⚠️  [USB] Error opening {found_port}: {e}", flush=True)
                         time.sleep(1.5)
                         continue
 
@@ -863,7 +864,7 @@ class ASRServer:
                         _esp_log_append("I", "SERIAL", line)
 
                         # Print ESP32 logs to console
-                        if any(k in line for k in ["[AUDIO]", "[KWS]", "[TRIGGER-HIT]", "[RESULT]", "[CYCLE]", "KEYWORD"]):
+                        if any(k in line for k in ["[AUDIO]", "[KWS]", "[TRIGGER-HIT]", "[RESULT]", "[CYCLE]", "KEYWORD", "[FUSION]", "[FUSION-RECV]", "[ESP-NOW]"]):
                             print(f"  📱 [ESP32] {line}", flush=True)
 
                         # Parse live telemetry from serial
@@ -873,6 +874,37 @@ class ASRServer:
                             self.telemetry["device_connected"] = True
                             self.telemetry["device_port"] = current_port
                             self.device_info["last_seen"] = time.time()
+
+                            # Parse [FUSION] local=0.9961 peer=0.0000(valid=0) decision=TRIGGER reason=local_only waited_ms=100
+                            if "[FUSION]" in line:
+                                m_dec = re.search(r"decision=([A-Z_]+)", line)
+                                m_loc = re.search(r"local=([0-9.]+)", line)
+                                m_peer = re.search(r"peer=([0-9.]+)", line)
+                                m_rsn = re.search(r"reason=([a-z_]+)", line)
+                                if m_dec:
+                                    self.telemetry["fusion_decision"] = m_dec.group(1)
+                                    updated = True
+                                if m_loc:
+                                    self.telemetry["keyword_confidence"] = float(m_loc.group(1))
+                                    updated = True
+                                if m_peer:
+                                    self.telemetry["peer_confidence"] = float(m_peer.group(1))
+                                if m_rsn:
+                                    self.telemetry["fusion_reason"] = m_rsn.group(1)
+                                self.telemetry["received_at"] = now_iso
+
+                            if "[FUSION-RECV]" in line:
+                                m_pnode = re.search(r"node=([0-9]+)", line)
+                                m_pconf = re.search(r"conf=([0-9.]+)", line)
+                                m_prms = re.search(r"rms=([0-9.]+)", line)
+                                if m_pnode:
+                                    self.telemetry["peer_node_id"] = int(m_pnode.group(1))
+                                    updated = True
+                                if m_pconf:
+                                    self.telemetry["peer_confidence"] = float(m_pconf.group(1))
+                                if m_prms:
+                                    self.telemetry["peer_rms"] = float(m_prms.group(1))
+                                self.telemetry["received_at"] = now_iso
 
                             # Parse [AUDIO] mic1_rms=... mic2_rms=... floor=... peak=...
                             if "[AUDIO]" in line:
