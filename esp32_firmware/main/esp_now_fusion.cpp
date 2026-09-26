@@ -135,6 +135,8 @@ static void on_data_recv(const uint8_t* src_mac,
         s_peer_timestamp = pkt.timestamp_us;
         s_peer_recv_time = esp_timer_get_time();
         s_peer_node_id   = pkt.node_id;  // refresh
+        ESP_EARLY_LOGI(TAG, "[FUSION-RECV] From node_%lu: conf=%.4f rms=%.4f",
+                       (unsigned long)pkt.node_id, (double)pkt.confidence, (double)pkt.rms);
     }
 
     xSemaphoreGive(s_peer_mutex);
@@ -217,13 +219,17 @@ void esp_now_fusion_broadcast(float confidence, float rms, int64_t timestamp_us)
     pkt.timestamp_us = timestamp_us;
 
     uint8_t dest[6];
-    bool peer_known_now = false;
-    if (s_peer_mutex && xSemaphoreTake(s_peer_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        peer_known_now = s_peer_known;
-        if (peer_known_now) memcpy(dest, s_peer_mac, 6);
+    bool use_unicast = false;
+    
+    // Always broadcast discovery packets. Only unicast real confidence data.
+    // If we unicast discovery, a rebooted peer can't decrypt it because it hasn't registered us yet!
+    if (confidence != DISCOVERY_CONFIDENCE && s_peer_mutex && xSemaphoreTake(s_peer_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        use_unicast = s_peer_known;
+        if (use_unicast) memcpy(dest, s_peer_mac, 6);
         xSemaphoreGive(s_peer_mutex);
     }
-    if (!peer_known_now) {
+    
+    if (!use_unicast) {
         static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
         memcpy(dest, bcast, 6);
     }
@@ -290,7 +296,7 @@ bool esp_now_fusion_should_trigger(float local_conf, float local_rms, uint32_t n
     // [FIX-2] Use thread-safe accessor instead of bare s_peer_known read.
     bool peer_known_now = esp_now_fusion_peer_known();
 
-    // Standalone (no peer discovered yet): always trigger.
+    // Standalone (no peer discovered yet): always trigger immediately.
     if (!peer_known_now) {
         printf("[FUSION] local=%.4f decision=TRIGGER reason=standalone_no_peer\n",
                (double)local_conf);
@@ -299,19 +305,10 @@ bool esp_now_fusion_should_trigger(float local_conf, float local_rms, uint32_t n
         return true;
     }
 
-    // High-confidence path: zero latency, no peer wait.
-    if (local_conf >= FUSION_IMMEDIATE_THRESHOLD) {
-        esp_now_fusion_broadcast(local_conf, local_rms, esp_timer_get_time());
-        printf("[FUSION] local=%.4f decision=TRIGGER reason=high_confidence_immediate\n",
-               (double)local_conf);
-        fflush(stdout);
-        if (out_latency_path) *out_latency_path = ESP_NOW_FUSION_LATENCY_CONFIDENT;
-        return true;
-    }
-
-    // Borderline path [0.65, 0.85): broadcast and wait briefly for peer.
+    // Always broadcast detection to peer
     esp_now_fusion_broadcast(local_conf, local_rms, esp_timer_get_time());
 
+    // Wait briefly (up to FUSION_WAIT_MS) for peer packet to arrive over ESP-NOW
     float   peer_conf  = 0.0f, peer_rms = 0.0f;
     int64_t peer_age   = 0;
     bool    peer_valid = false;
@@ -324,7 +321,7 @@ bool esp_now_fusion_should_trigger(float local_conf, float local_rms, uint32_t n
         waited_ms += 10;
     }
 
-    // Both nodes saw the keyword → decide which one streams (handoff).
+    // Both nodes saw the keyword → perform spatial & confidence arbitration (winner streams, loser yields)
     if (peer_valid && peer_conf >= DETECT_THRESHOLD_FLOOR) {
         bool winner = esp_now_fusion_is_winner(local_conf, local_rms, node_id);
         printf("[FUSION] local=%.4f peer=%.4f decision=%s reason=corroborated waited_ms=%d\n",
@@ -332,20 +329,18 @@ bool esp_now_fusion_should_trigger(float local_conf, float local_rms, uint32_t n
                winner ? "TRIGGER" : "HANDOFF_SUPPRESS",
                waited_ms);
         fflush(stdout);
-        if (out_latency_path) *out_latency_path = ESP_NOW_FUSION_LATENCY_BORDERLINE;
+        if (out_latency_path) *out_latency_path = (local_conf >= FUSION_IMMEDIATE_THRESHOLD) ? ESP_NOW_FUSION_LATENCY_CONFIDENT : ESP_NOW_FUSION_LATENCY_BORDERLINE;
         return winner;
     }
 
-    // Peer silent / stale / below floor → THIS node still triggers.
-    // Local multi-hit debounce in main.cpp already filtered single-frame noise;
-    // peer silence must not erase a valid local detection (fixes missed wakes).
+    // Peer silent / stale / below floor → THIS node triggers.
     printf("[FUSION] local=%.4f peer=%.4f(valid=%d) decision=TRIGGER reason=local_only waited_ms=%d\n",
            (double)local_conf,
            peer_valid ? (double)peer_conf : 0.0,
            (int)peer_valid,
            waited_ms);
     fflush(stdout);
-    if (out_latency_path) *out_latency_path = ESP_NOW_FUSION_LATENCY_BORDERLINE;
+    if (out_latency_path) *out_latency_path = (local_conf >= FUSION_IMMEDIATE_THRESHOLD) ? ESP_NOW_FUSION_LATENCY_CONFIDENT : ESP_NOW_FUSION_LATENCY_BORDERLINE;
     return true;
 }
 
@@ -423,7 +418,7 @@ bool esp_now_fusion_is_winner(float local_conf, float local_rms, uint32_t node_i
 // [FIX-3] Was calling broadcast every tick because s_last_discovery_us was
 // never updated. Now properly gated by FUSION_DISCOVERY_INTERVAL_MS elapsed.
 void esp_now_fusion_discovery_tick(void) {
-    if (esp_now_fusion_peer_known()) return;  // already found, stop
+    // Removed: if (esp_now_fusion_peer_known()) return; // Keep broadcasting 1Hz heartbeat
 
     int64_t now = esp_timer_get_time();
     if ((now - s_last_discovery_us) < (int64_t)FUSION_DISCOVERY_INTERVAL_MS * 1000) {
@@ -431,7 +426,11 @@ void esp_now_fusion_discovery_tick(void) {
     }
     s_last_discovery_us = now;  // [FIX-3] actually update the timestamp
     esp_now_fusion_broadcast(DISCOVERY_CONFIDENCE, 0.0f, now);
-    ESP_LOGI(TAG, "[FUSION] Discovery hello sent (no peer yet)");
+    if (!s_peer_known) {
+        ESP_LOGI(TAG, "[FUSION] Discovery hello sent (no peer yet)");
+    } else {
+        ESP_LOGD(TAG, "[FUSION] Heartbeat sent (peer connected)");
+    }
 }
 
 // ─── esp_now_fusion_get_source_zone ──────────────────────────────────────────
