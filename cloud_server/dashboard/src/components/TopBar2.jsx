@@ -96,7 +96,7 @@ export default function TopBar({ health, up, total, telemetryStale, onSettings, 
     <div className="tb-wrap">
       
       {/* Brand */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexShrink: 0 }}>
+      <div className="tb-brand-container" style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', justifyContent: 'center' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{ width: 40, height: 40, borderRadius: '50%', background: 'rgba(0,0,0,0.6)', border: '1px solid rgba(0,229,255,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 16px rgba(0,229,255,0.18)', overflow: 'hidden' }}>
             <VaaniLogo size={40} />

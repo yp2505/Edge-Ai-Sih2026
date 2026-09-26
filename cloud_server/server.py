@@ -470,9 +470,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 snr_db     = data.get("snr", 0)
                 heap       = data.get("free_heap_bytes", 0)
                 inf_count  = data.get("inference_count", 0)
+                source_zone = data.get("source_zone", "UNKNOWN")
                 print(f"  📱 [ESP32] cpu={cpu_pct:.1f}% latency={latency_ms:.0f}ms "
                       f"mic={mic_rms:.4f} conf={conf:.4f} snr={snr_db:.1f}dB "
-                      f"heap={heap} inf={inf_count}")
+                      f"zone={source_zone} heap={heap} inf={inf_count}")
                 _sse_notify(data)  # push to dashboard SSE subscribers
                 self._send_json({"ok": True})
             elif path == "/api/wifi-config":
@@ -899,6 +900,20 @@ class ASRServer:
                                     self.telemetry["cpu"] = float(m_cpu.group(1))
                                 if m_inf:
                                     self.telemetry["latency_ms"] = round(float(m_inf.group(1)) / 1000.0, 1)
+                                self.telemetry["received_at"] = now_iso
+
+                            # Parse non-blocking two-node source-zone telemetry.
+                            if "[SOURCE-ZONE]" in line:
+                                m_zone = re.search(r"zone=([A-Z0-9_]+)", line)
+                                m_delta = re.search(r"delta_db=(-?[0-9.]+)", line)
+                                m_age = re.search(r"peer_age_ms=([0-9]+)", line)
+                                if m_zone:
+                                    self.telemetry["source_zone"] = m_zone.group(1)
+                                    updated = True
+                                if m_delta:
+                                    self.telemetry["source_delta_db"] = float(m_delta.group(1))
+                                if m_age:
+                                    self.telemetry["source_peer_age_ms"] = int(m_age.group(1))
                                 self.telemetry["received_at"] = now_iso
 
                             # Parse node identity if present

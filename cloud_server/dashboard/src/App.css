@@ -207,7 +207,9 @@ button { font-family: inherit; cursor: pointer; border: none; background: none; 
   }
   
   /* Order: Header(1) -> AI(2) -> Voice(3) -> HW(4) -> Pipe(5) -> Feed(6) */
-  .a-bar { order: -1; min-height: 60px; }
+  .a-bar { order: -1; min-height: auto; height: auto; padding: 10px 0; }
+  .tb-wrap { flex-wrap: wrap; justify-content: center; gap: 10px; height: auto; }
+  .tb-wrap > div:first-child { flex-wrap: wrap; justify-content: center; }
   .a-ai { order: 2; min-height: 420px !important; margin-bottom: 6px; }
   .a-hw { order: 4; min-height: 295px !important; margin-top: 4px; }
   .ai-panel .orb-panel-content { justify-content: space-between !important; gap: 8px; }

@@ -71,6 +71,7 @@
 #include "driver/gpio.h"
 // ledc header removed — no buzzer hardware connected
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -110,12 +111,7 @@
 // Response nonce = audio_nonce with last byte XOR 0xFF (derived, not transmitted).
 //
 // mbedTLS AES-CTR context is initialised fresh per session — no global state.
-static const uint8_t AES_KEY[16] = {
-    // Hex: 48657956616e6e69534948323032362a  = "HeyVaaniSIH2026*"
-    // MUST match _HV_AES_KEY_HEX in server.py
-    0x48, 0x65, 0x79, 0x56, 0x61, 0x6E, 0x6E, 0x69,
-    0x53, 0x49, 0x48, 0x32, 0x30, 0x32, 0x36, 0x2A
-};
+// AES key is loaded from NVS via wifi_provision (g_aes_key) so it is not hardcoded in flash.
 
 // ─── User Config ─────────────────────────────────────────────────────────────
 // WiFi SSID, password and server IP are now stored in NVS (non-volatile flash)
@@ -130,7 +126,7 @@ static const uint8_t AES_KEY[16] = {
 #endif
 
 #ifndef ENABLE_AES
-#define ENABLE_AES             0    // Set to 1 when ESP32↔server AES CTR is verified
+#define ENABLE_AES             1    // AES-128-CTR encryption for ESP32↔server audio stream
 #endif
 
 // ─── I2S / INMP441 ───────────────────────────────────────────────────────────
@@ -169,11 +165,11 @@ static const uint8_t AES_KEY[16] = {
 // Previous bug: HITS=1 + no window meant one noisy frame ≥0.65 fired the
 // detector (false "automatic" triggers), while fusion hard-suppressed
 // [0.65,0.82) when a peer was known (needed 10–15 attempts).  Both fixed.
-static const float DETECT_THRESHOLD          = 0.93f;   // Reliable speech confidence threshold
+static const float DETECT_THRESHOLD          = 0.95f;   // Reliable speech confidence threshold
 static const float DETECT_HARD_THRESHOLD     = 0.98f;   // HARD tier threshold
-static const int   DETECTION_HITS_REQUIRED   = 3;       // 3 consecutive hits (~90ms sustained match)
+static const int   DETECTION_HITS_REQUIRED   = 2;       // 2 consecutive hits (~60ms sustained match)
 static const int   DETECTION_WINDOW_FRAMES   = 5;       // sliding window (~150 ms at 30 ms/frame)
-static const float MIN_SPEECH_RMS            = 0.010f;  // speech detection floor (above ambient noise ~0.0050)
+static const float MIN_SPEECH_RMS            = 0.008f;  // speech detection floor (above ambient noise ~0.0040)
 static const int   MIN_PEAK_SAMPLE           = 700;     // consonant burst threshold (above ambient noise spikes <550)
 static const float NOISE_FLOOR_MULTIPLIER    = 1.60f;   // adaptive speech threshold multiplier (~4 dB SNR)
 static const int   NOISE_CALIBRATION_FRAMES  = 30;
@@ -244,7 +240,7 @@ static const char* TAG_FUSE  = "FUSION";
 // ─── Node Identity ───────────────────────────────────────────────────────────
 // NODE_ID: 1 or 2 — identifies this node in ESP-NOW fusion logs and handoff.
 #ifndef NODE_ID
-#define NODE_ID 2
+#error "NODE_ID must be set via build_flags"
 #endif
 
 #ifndef DEVICE_NAME
@@ -266,6 +262,9 @@ static volatile float    telemetry_keyword_confidence = 0.0f;
 static volatile float    telemetry_mic_rms            = 0.0f;
 static volatile float    telemetry_noise_floor_rms    = 0.0f;
 static volatile float    telemetry_last_infer_ms      = 0.0f;
+static volatile esp_now_fusion_source_zone_t telemetry_source_zone = ESP_NOW_FUSION_SOURCE_UNKNOWN;
+static volatile float    telemetry_source_delta_db    = 0.0f;
+static volatile uint32_t telemetry_source_peer_age_ms = 0;
 
 static int16_t           audio_ring[AUDIO_BUFFER_SAMPLES];
 static int16_t*          audio_window = nullptr;
@@ -283,6 +282,10 @@ static void flush_audio_ring() {
 }
 
 static QueueHandle_t     detect_queue;
+typedef struct {
+    int64_t keyword_end_us;
+    esp_now_fusion_latency_path_t latency_path;
+} detect_event_t;
 static volatile uint32_t session_id = 0;
 static volatile int      g_stream_start_pos = 0;  // ring pos saved at detection time
 // Cycle start timestamp — written by inference_task at trigger, read by streaming_task for [CYCLE] log
@@ -754,12 +757,19 @@ static void oled_show_status(disp_state_t state, const char* text) {
         case DISP_PROMPT:       label = "I'm listening"; break;
         default:                label = "Unknown";   break;
     }
-    int lbl_w = (int)strlen(label) * 12;   // scale=2 → 12px/char
+    // State label — scale=2 (12px/char) for short labels, scale=1 for long ones.
+    // 128px wide: scale=2 fits max 10 chars (128/12=10), scale=1 fits 21 chars.
+    // Labels > 10 chars: "Setup WiFi"(10 ok), "I'm listening"(13 → must be scale=1)
+    uint8_t lbl_scale = 2;
+    int lbl_w = (int)strlen(label) * 12;
+    if (lbl_w > OLED_WIDTH) {
+        lbl_scale = 1;
+        lbl_w = (int)strlen(label) * 6;
+    }
     int lbl_x = (OLED_WIDTH - lbl_w) / 2;
     if (lbl_x < 0) lbl_x = 0;
 
-    // Draw state label in clean white text (no solid white background block)
-    ssd_draw_str(lbl_x, 12, label, true, 2);
+    ssd_draw_str(lbl_x, 12, label, true, lbl_scale);
 
     // Second divider
     ssd_hline(0, OLED_WIDTH - 1, 30, true);
@@ -833,8 +843,14 @@ static void oled_show_status(disp_state_t state, const char* text) {
             for (int y = 46; y <= 49; y++) ssd_pixel(x, y, true);
         }
 
-        // Helper hint at bottom
-        ssd_draw_str(2, 55, "Say 'Hey Vaani'...", true, 1);
+        // Bottom row (y=55..62): two zones separated by '|'
+        // Left  (x=0..75):  "Hey Vaani!" hint   — 12 chars × 6px = 72px
+        // Right (x=79..127): peer badge          — 7 chars × 6px = 42px → fits at x=79
+        // Total used: 72 + 1(gap) + 42 = 115px < 128 → safe on 128×64 screen
+        bool peer_ok = esp_now_fusion_peer_known();
+        ssd_draw_str(0,  55, "Hey Vaani!", true, 1);           // 10 chars = 60px
+        // Peer badge right-aligned: "PEER:OK" or "PEER:--" at x=79
+        ssd_draw_str(79, 55, peer_ok ? "PEER:OK" : "PEER:--", true, 1);  // 7 chars = 42px
     }
 
     // Push framebuffer to display
@@ -1480,7 +1496,36 @@ static void inference_task(void* arg) {
             g_cycle_start_us = kw_end;
 
             // ── ESP-NOW Fusion gate (handoff only — never blocks local-only) ──
-            bool should_stream = esp_now_fusion_should_trigger(final_conf, rms, NODE_ID);
+            esp_now_fusion_latency_path_t latency_path;
+            bool should_stream = esp_now_fusion_should_trigger(final_conf, rms, NODE_ID,
+                                                                &latency_path);
+            float source_delta_db = 0.0f;
+            uint32_t source_peer_age_ms = 0;
+            esp_now_fusion_source_zone_t source_zone = esp_now_fusion_get_source_zone(
+                rms, NODE_ID, &source_delta_db, &source_peer_age_ms);
+            telemetry_source_zone = source_zone;
+            telemetry_source_delta_db = source_delta_db;
+            telemetry_source_peer_age_ms = source_peer_age_ms;
+            printf("[SOURCE-ZONE] node=%d zone=%s delta_db=%.2f peer_age_ms=%lu\n",
+                   NODE_ID, esp_now_fusion_source_zone_name(source_zone),
+                   (double)source_delta_db, (unsigned long)source_peer_age_ms);
+            fflush(stdout);
+
+            const char* source_zone_oled = "UNKNOWN";
+            switch (source_zone) {
+                case ESP_NOW_FUSION_SOURCE_NODE_1_SIDE: source_zone_oled = "N1 SIDE"; break;
+                case ESP_NOW_FUSION_SOURCE_CENTER:      source_zone_oled = "CENTER";  break;
+                case ESP_NOW_FUSION_SOURCE_NODE_2_SIDE: source_zone_oled = "N2 SIDE"; break;
+                default: break;
+            }
+            // Build OLED sub-text: "c=0.87 Zone:N1 SIDE" — shows both confidence and zone
+            char source_detail[32];
+            snprintf(source_detail, sizeof(source_detail), "c=%.2f %s",
+                     (double)final_conf, source_zone_oled);
+            if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                strlcpy(g_disp_text, source_detail, sizeof(g_disp_text));
+                xSemaphoreGive(disp_mutex);
+            }
 
             // Reset window and consecutive hit counter BEFORE state changes
             consecutive_hits = 0;
@@ -1495,9 +1540,13 @@ static void inference_task(void* arg) {
                 g_sys_capture_start_us = esp_timer_get_time(); // arm sys_state watchdog
                 set_led_state(true);
                 g_disp_state = DISP_DETECTED;
-                oled_show_status(DISP_DETECTED, "Hey Vaani!");
+                oled_show_status(DISP_DETECTED, source_detail);
                 g_stream_start_pos = (int)ring_write_pos;
-                xQueueSend(detect_queue, &kw_end, 0);
+                detect_event_t event = {
+                    .keyword_end_us = kw_end,
+                    .latency_path = latency_path,
+                };
+                xQueueSend(detect_queue, &event, 0);
             } else if (should_stream && streaming_active) {
                 // Overlapping trigger while stream already running — discard cleanly.
                 printf("[TRIGGER-SKIP] node=%d trigger while streaming active — resetting state\n", NODE_ID);
@@ -1531,9 +1580,10 @@ static void inference_task(void* arg) {
 // ============================================================================
 static void streaming_task(void* arg) {
     ESP_LOGI(TAG_STR, "Streaming task started (core %d)", xPortGetCoreID());
-    int64_t keyword_end_us;
+    detect_event_t event;
     while (true) {
-        xQueueReceive(detect_queue, &keyword_end_us, portMAX_DELAY);
+        xQueueReceive(detect_queue, &event, portMAX_DELAY);
+        int64_t keyword_end_us = event.keyword_end_us;
         session_id = session_id + 1;
         uint32_t sid = session_id;
         ESP_LOGI(TAG_STR, "[%lu] Keyword confirmed — streaming command to server", (unsigned long)sid);
@@ -1587,6 +1637,13 @@ static void streaming_task(void* arg) {
                     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &rw_tv, sizeof(rw_tv));
                     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rw_tv, sizeof(rw_tv));
                     kw_ms = (uint32_t)((esp_timer_get_time() - keyword_end_us) / 1000);
+                    if (event.latency_path == ESP_NOW_FUSION_LATENCY_CONFIDENT) {
+                        printf("[LATENCY-CONFIDENT] delta_ms=%lu\n", (unsigned long)kw_ms);
+                    } else {
+                        printf("[LATENCY-BORDERLINE] wait_ms=%lu decision=TRIGGER\n",
+                               (unsigned long)kw_ms);
+                    }
+                    fflush(stdout);
                     printf("[STREAM] Connected OK (kw_to_connect=%lums)\n", (unsigned long)kw_ms); fflush(stdout);
                     break;
                 }
@@ -1610,7 +1667,7 @@ static void streaming_task(void* arg) {
         g_disp_state = DISP_STREAMING;
         oled_show_status(DISP_STREAMING, "Listening...");
 
-        // ── Step 3: Send HVP1 header + zero nonce ─────────────────────────────
+        // ── Step 3: Send HVP1 header + AES nonce ────────────────────────────────
         const int CHUNK = 480; int16_t pcm[CHUNK];
         hvp1_header_t hdr = { .magic = MAGIC_NUMBER, .sample_rate = I2S_SAMPLE_RATE,
                                .channels = 1, .bits = 16,
@@ -1619,10 +1676,31 @@ static void streaming_task(void* arg) {
             uint8_t* hp = (uint8_t*)&hdr; size_t hl = sizeof(hdr);
             while (hl > 0) { ssize_t n = send(sock, hp, hl, 0); if (n < 0) break; hp += n; hl -= (size_t)n; }
         }
-        {
-            uint8_t zero_nonce[16] = {0};
-            send(sock, zero_nonce, sizeof(zero_nonce), 0);
-        }
+
+        // Generate a fresh random nonce for this session.
+        // ENABLE_AES==1: send real nonce → server enables AES-128-CTR decryption.
+        // ENABLE_AES==0: send all-zeros → server stays in plaintext mode.
+        uint8_t session_nonce[16] = {0};
+        uint8_t orig_nonce[16] = {0};
+#if ENABLE_AES
+        esp_fill_random(session_nonce, sizeof(session_nonce));
+        // Ensure nonce is never accidentally all-zero (would signal plaintext to server).
+        if (session_nonce[0] == 0) session_nonce[0] = 0x01;
+        memcpy(orig_nonce, session_nonce, 16);
+#endif
+        send(sock, session_nonce, sizeof(session_nonce), 0);
+
+        // Initialise AES-CTR context for this session (fresh per session, no global state).
+        esp_aes_context aes_ctx;
+        uint8_t         aes_nc_off[16] = {0};   // nonce counter offset (CTR position)
+        uint8_t         aes_stream[16] = {0};   // CTR keystream block
+#if ENABLE_AES
+        esp_aes_init(&aes_ctx);
+        esp_aes_setkey(&aes_ctx, g_aes_key, 128);
+        printf("[AES] Session AES-128-CTR ready nonce=%02x%02x%02x%02x...\n",
+               session_nonce[0], session_nonce[1], session_nonce[2], session_nonce[3]);
+        fflush(stdout);
+#endif
 
         // ── Step 4: Stream command audio — silence-aware adaptive duration ────
         printf("[STREAM] Streaming command audio...\n"); fflush(stdout);
@@ -1664,6 +1742,14 @@ static void streaming_task(void* arg) {
 
             uint8_t* send_ptr = (uint8_t*)pcm; size_t send_len = CHUNK * sizeof(int16_t);
             bool send_err = false;
+#if ENABLE_AES
+            // Encrypt chunk in-place with AES-128-CTR before sending.
+            uint8_t enc_buf[CHUNK * sizeof(int16_t)];
+            esp_aes_crypt_ctr(&aes_ctx, send_len, (size_t*)aes_nc_off,
+                              session_nonce, aes_stream,
+                              send_ptr, enc_buf);
+            send_ptr = enc_buf;
+#endif
             while (send_len > 0) {
                 ssize_t n = send(sock, send_ptr, send_len, 0);
                 if (n < 0) { printf("[SEND-ERROR] errno=%d\n", errno); fflush(stdout); send_err = true; break; }
@@ -1681,6 +1767,9 @@ static void streaming_task(void* arg) {
             }
         }
         printf("[STREAM] Done: sent %d samples (%d ms)\n", total_sent, streamed_ms); fflush(stdout);
+#if ENABLE_AES
+        esp_aes_free(&aes_ctx);   // release AES context after stream ends
+#endif
 
         // Send EOS sentinel
         static const char EOS_MARKER[] = "EOS!";
@@ -1699,6 +1788,31 @@ static void streaming_task(void* arg) {
         while ((r = recv(sock, resp + rlen, sizeof(resp) - rlen - 1, 0)) > 0) rlen += r;
         close(sock);
         resp[rlen] = '\0';
+        
+#if ENABLE_AES
+        if (rlen > 0) {
+            // Derive response nonce: orig_nonce ^ 0xFF on the last byte
+            uint8_t resp_nonce[16];
+            memcpy(resp_nonce, orig_nonce, 16);
+            resp_nonce[15] ^= 0xFF;
+            
+            esp_aes_context resp_aes_ctx;
+            esp_aes_init(&resp_aes_ctx);
+            esp_aes_setkey(&resp_aes_ctx, g_aes_key, 128);
+            
+            size_t resp_nc_off = 0;
+            uint8_t resp_stream_block[16] = {0};
+            uint8_t dec_buf[1024] = {0};
+            
+            esp_aes_crypt_ctr(&resp_aes_ctx, (size_t)rlen, &resp_nc_off,
+                              resp_nonce, resp_stream_block,
+                              (uint8_t*)resp, dec_buf);
+            
+            memcpy(resp, dec_buf, rlen);
+            esp_aes_free(&resp_aes_ctx);
+        }
+#endif
+
         printf("[STREAM] Response (%d bytes): %.*s\n", rlen, rlen > 300 ? 300 : rlen, resp); fflush(stdout);
 
         // ── Step 7: Parse transcript + vaani_response + display on OLED ─────
@@ -1834,7 +1948,7 @@ static void wifi_config_poll_task(void* arg) {
                                 ESP_LOGI(TAG_MAIN, "[OTA-CFG] WiFi credentials updated: SSID %s -> %s",
                                          g_wifi_ssid, ssid->valuestring);
                                 // Save with CURRENT server IP — never overwrite it
-                                if (wifi_provision_save(ssid->valuestring, pass->valuestring, g_server_ip)) {
+                                if (wifi_provision_save(ssid->valuestring, pass->valuestring, g_server_ip, NULL, NULL, NULL)) {
                                     ESP_LOGI(TAG_MAIN, "[OTA-CFG] NVS updated. Restarting ESP32...");
                                     vTaskDelay(pdMS_TO_TICKS(1000));
                                     esp_restart();
@@ -1861,6 +1975,9 @@ static void wifi_config_poll_task(void* arg) {
 static void watchdog_task(void* arg) {
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // Existing 1 Hz task drives discovery; no extra task or polling loop.
+        esp_now_fusion_discovery_tick();
 
         // --- Existing watchdog: streaming_active stuck > STREAM_WATCHDOG_MS ---
         if (streaming_active && streaming_active_set_us != 0) {
@@ -1933,7 +2050,7 @@ static void display_task(void* arg) {
         disp_state_t cur = g_disp_state;
 
         // CHECKPOINT 5: always read g_disp_text under mutex
-        if (cur == DISP_TRANSCRIBED || cur == DISP_PROMPT) {
+        if (cur == DISP_TRANSCRIBED || cur == DISP_PROMPT || cur == DISP_DETECTED) {
             if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 strlcpy(local_txt, g_disp_text, sizeof(local_txt));
                 xSemaphoreGive(disp_mutex);
@@ -1952,7 +2069,7 @@ static void display_task(void* arg) {
             }
             if (cur != last_state) {
                 local_txt[0] = '\0';
-                if (cur == DISP_TRANSCRIBED || cur == DISP_PROMPT) {
+                if (cur == DISP_TRANSCRIBED || cur == DISP_PROMPT || cur == DISP_DETECTED) {
                     if (xSemaphoreTake(disp_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                         strlcpy(local_txt, g_disp_text, sizeof(local_txt));
                         xSemaphoreGive(disp_mutex);
@@ -1980,8 +2097,28 @@ static void stack_monitor_task(void* arg) {
 // ─── Telemetry Task — UNCHANGED from rev6 ────────────────────────────────────
 static void telemetry_task(void* arg) {
     ESP_LOGI(TAG_STR, "Telemetry task started (core %d)", xPortGetCoreID());
+    bool ram_reported = false;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1500));
+        uint32_t heap_total = heap_caps_get_total_size(MALLOC_CAP_8BIT);
+        uint32_t heap_free  = esp_get_free_heap_size();
+        uint32_t heap_used  = heap_total > heap_free ? heap_total - heap_free : 0;
+        const uint32_t known_static_buffers = sizeof(tflite_arena) +
+                                              sizeof(audio_ring) + sizeof(g_oled_fb);
+        if (!ram_reported) {
+            ESP_LOGI(TAG_MAIN,
+                     "[RAM] heap_total=%lu heap_used=%lu heap_free=%lu min_free=%lu "
+                     "known_static_buffers=%lu tflite_arena=%u audio_buffers=%u "
+                     "fusion_packet=%u",
+                     (unsigned long)heap_total, (unsigned long)heap_used,
+                     (unsigned long)heap_free,
+                     (unsigned long)esp_get_minimum_free_heap_size(),
+                     (unsigned long)known_static_buffers,
+                     (unsigned)sizeof(tflite_arena),
+                     (unsigned)(sizeof(audio_ring) + AUDIO_BUFFER_SAMPLES * sizeof(int16_t)),
+                     (unsigned)sizeof(fusion_packet_t));
+            ram_reported = true;
+        }
         if (!wifi_connected || streaming_active) continue;
         wifi_ap_record_t ap = {};
         int rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
@@ -1994,26 +2131,33 @@ static void telemetry_task(void* arg) {
         int blen = snprintf(body, sizeof(body),
             "{\"device\":\"%s\",\"node_id\":%d,\"uptime_ms\":%llu,"
             "\"free_heap_bytes\":%lu,\"min_free_heap_bytes\":%lu,"
-            "\"heap_total_bytes\":%lu,\"tflite_arena_bytes\":%u,"
+            "\"heap_total_bytes\":%lu,\"heap_used_bytes\":%lu,"
+            "\"known_static_buffer_bytes\":%lu,\"tflite_arena_bytes\":%u,"
             "\"audio_buffer_bytes\":%u,\"keyword_confidence\":%.4f,"
             "\"mic_rms\":%.5f,\"inference_count\":%lu,"
             "\"inference_duty_pct\":%.3f,\"wifi_rssi_dbm\":%d,\"streaming\":%s,"
             "\"latency_ms\":%.1f,\"cpu\":%.1f,\"snr\":%.1f,"
-            "\"noise_floor_rms\":%.5f}",
+            "\"noise_floor_rms\":%.5f,\"source_zone\":\"%s\","
+            "\"source_delta_db\":%.2f,\"source_peer_age_ms\":%lu}",
             DEVICE_NAME, NODE_ID,
             (unsigned long long)(esp_timer_get_time() / 1000),
-            (unsigned long)esp_get_free_heap_size(),
+            (unsigned long)heap_free,
             (unsigned long)esp_get_minimum_free_heap_size(),
-            (unsigned long)heap_caps_get_total_size(MALLOC_CAP_8BIT),
+            (unsigned long)heap_total,
+            (unsigned long)heap_used,
+            (unsigned long)known_static_buffers,
             (unsigned)TENSOR_ARENA_SIZE,
-            (unsigned)(sizeof(audio_ring) + sizeof(audio_window)),
+            (unsigned)(sizeof(audio_ring) + AUDIO_BUFFER_SAMPLES * sizeof(int16_t)),
             telemetry_keyword_confidence, telemetry_mic_rms,
             (unsigned long)telemetry_inference_count,
             cpu_cum_pct, rssi, streaming_active ? "true" : "false",
             (double)telemetry_last_infer_ms,
             (double)cpu_cum_pct,
             (double)snr_db,
-            (double)telemetry_noise_floor_rms);
+            (double)telemetry_noise_floor_rms,
+            esp_now_fusion_source_zone_name(telemetry_source_zone),
+            (double)telemetry_source_delta_db,
+            (unsigned long)telemetry_source_peer_age_ms);
         if (blen <= 0 || blen >= (int)sizeof(body)) continue;
         int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
         if (sock < 0) continue;
@@ -2024,7 +2168,7 @@ static void telemetry_task(void* arg) {
         addr.sin_family = AF_INET; addr.sin_port = htons(8080);
         inet_pton(AF_INET, g_server_ip, &addr.sin_addr);  // from NVS / portal
         if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            char req[700];
+            char req[1024];
             int rlen = snprintf(req, sizeof(req),
                 "POST /api/telemetry HTTP/1.1\r\nHost: esp32\r\n"
                 "Content-Type: application/json\r\nContent-Length: %d\r\n"
@@ -2037,9 +2181,15 @@ static void telemetry_task(void* arg) {
 
 // ─── app_main ────────────────────────────────────────────────────────────────
 extern "C" void app_main() {
-    printf("[BOOT] NODE_ID=%d (%s) SOFT=%.3f HARD=%.3f HITS=%d/%d COOLDOWN=%d ms  "
+    uint8_t sta_mac[6] = {};
+    char sta_mac_str[18] = "unknown";
+    if (esp_read_mac(sta_mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        snprintf(sta_mac_str, sizeof(sta_mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
+    }
+    printf("[BOOT] NODE_ID=%d MAC=%s\n", NODE_ID, sta_mac_str);
+    printf("[BOOT] SOFT=%.3f HARD=%.3f HITS=%d/%d COOLDOWN=%d ms  "
            "MODEL=%u bytes  heap_start=%lu\n",
-           NODE_ID, DEVICE_NAME,
            (double)DETECT_THRESHOLD, (double)DETECT_HARD_THRESHOLD,
            DETECTION_HITS_REQUIRED, DETECTION_WINDOW_FRAMES, COOLDOWN_MS,
            (unsigned)g_model_data_len,
@@ -2052,7 +2202,7 @@ extern "C" void app_main() {
 
     ring_mutex   = xSemaphoreCreateMutex();
     disp_mutex   = xSemaphoreCreateMutex();   // guards g_disp_text (issue #3 fix)
-    detect_queue = xQueueCreate(4, sizeof(int64_t));
+    detect_queue = xQueueCreate(4, sizeof(detect_event_t));
 
     // ── LEDs: output with 3-blink hardware self-test ────────────────────────
     gpio_reset_pin(LED_PIN);
@@ -2083,7 +2233,13 @@ extern "C" void app_main() {
 
     // ── WiFi Start (early so PHY RF calibration has unfragmented RAM) ──────
     wifi_start();
+    uint32_t heap_before_espnow = esp_get_free_heap_size();
+    ESP_LOGI(TAG_MAIN, "[ESPNOW] heap_before_init=%lu", (unsigned long)heap_before_espnow);
     esp_err_t fusion_err = esp_now_fusion_init(NODE_ID, NULL /* auto-discovery */);
+    uint32_t heap_after_espnow = esp_get_free_heap_size();
+    ESP_LOGI(TAG_MAIN, "[ESPNOW] heap_after_init=%lu delta=%ld",
+             (unsigned long)heap_after_espnow,
+             (long)heap_after_espnow - (long)heap_before_espnow);
     if (fusion_err != ESP_OK) {
         ESP_LOGW(TAG_MAIN, "ESP-NOW fusion init failed (%s) — single-node mode",
                  esp_err_to_name(fusion_err));
@@ -2129,4 +2285,3 @@ extern "C" void app_main() {
     g_disp_state = DISP_LISTENING;
     ESP_LOGI(TAG_MAIN, "All tasks started. Listening for 'Hey Vaani'...");
 }
-

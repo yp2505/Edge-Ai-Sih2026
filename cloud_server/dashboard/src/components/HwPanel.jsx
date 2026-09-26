@@ -42,6 +42,8 @@ export default function HwPanel({ telemetry, stale, serverUp, health, deviceInfo
   const isKwHigh = kwConf >= 0.70
   
   const ram = serverUp && health?.server_ram_pct != null ? health.server_ram_pct : NaN
+  const sourceZone = conn && telemetry?.source_zone ? telemetry.source_zone.replaceAll('_', ' ') : 'UNKNOWN'
+  const sourceKnown = sourceZone !== 'UNKNOWN'
 
   return (
     <div className="hw-panel-content" style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', justifyContent: 'space-between', padding: '10px 14px' }}>
@@ -163,6 +165,21 @@ export default function HwPanel({ telemetry, stale, serverUp, health, deviceInfo
           <span style={{ fontSize: 8, fontWeight: 800, color: 'var(--t4)', letterSpacing: 0.8 }}>WIFI RSSI</span>
           <span style={{ fontSize: 11, fontWeight: 700, color: conn && telemetry?.wifi_rssi_dbm != null ? 'var(--green)' : 'rgba(255,255,255,0.4)', fontFamily: 'var(--mono)' }}>
             {rssi}
+          </span>
+        </div>
+
+        <div style={{
+          padding: '6px 10px',
+          background: sourceKnown ? 'rgba(0, 229, 255, 0.05)' : 'rgba(255,255,255,0.02)',
+          border: `1px solid ${sourceKnown ? 'rgba(0, 229, 255, 0.20)' : 'rgba(255,255,255,0.06)'}`,
+          borderRadius: 6,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 2
+        }}>
+          <span style={{ fontSize: 8, fontWeight: 800, color: 'var(--t4)', letterSpacing: 0.8 }}>SOURCE ZONE</span>
+          <span style={{ fontSize: 11, fontWeight: 700, color: sourceKnown ? 'var(--c1)' : 'rgba(255,255,255,0.4)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {sourceZone}
           </span>
         </div>
       </div>

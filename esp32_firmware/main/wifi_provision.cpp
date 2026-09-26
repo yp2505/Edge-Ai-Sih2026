@@ -43,6 +43,9 @@ static const char* TAG = "PROV";
 #define NVS_KEY_SSID "ssid"
 #define NVS_KEY_PASS "pass"
 #define NVS_KEY_IP   "server_ip"
+#define NVS_KEY_AES  "aes_key"
+#define NVS_KEY_PMK  "pmk"
+#define NVS_KEY_LMK  "lmk"
 
 // ─── AP ──────────────────────────────────────────────────────────────────────
 #define AP_SSID     "HeyVaani-Node2-Setup"
@@ -52,7 +55,21 @@ static const char* TAG = "PROV";
 // ─── Exported globals ────────────────────────────────────────────────────────
 char g_wifi_ssid[PROV_SSID_MAX] = "Khush's A55";
 char g_wifi_pass[PROV_PASS_MAX] = "khush2073";
-char g_server_ip[PROV_IP_MAX]   = "13.233.100.83";
+char g_server_ip[PROV_IP_MAX]   = "16.4.36.78";
+
+// Defaults for keys. Can be overridden via captive portal.
+uint8_t g_aes_key[16] = {
+    0x48, 0x65, 0x79, 0x56, 0x61, 0x6E, 0x6E, 0x69,
+    0x53, 0x49, 0x48, 0x32, 0x30, 0x32, 0x36, 0x2A
+};
+uint8_t g_espnow_pmk[16] = {
+    0x48,0x56,0x46,0x75,0x73,0x69,0x6F,0x6E,
+    0x50,0x4D,0x4B,0x32,0x30,0x32,0x36,0x00
+};
+uint8_t g_espnow_lmk[16] = {
+    0x48,0x56,0x46,0x75,0x73,0x69,0x6F,0x6E,
+    0x4C,0x4D,0x4B,0x32,0x30,0x32,0x36,0x00
+};
 
 
 // ─── Setup portal HTML ───────────────────────────────────────────────────────
@@ -94,10 +111,16 @@ static const char PORTAL_HTML[] =
         "<input type='password' name='pass'"
             " placeholder='Leave blank for open networks'>"
         "<label>Server IP Address</label>"
-        "<input type='text' name='ip' value='13.233.100.83'"
+        "<input type='text' name='ip' value='16.4.36.78'"
             " placeholder='Server IP Address' required>"
         "<div class='hint'>"
             "IP of the laptop running the Hey Vaani cloud server</div>"
+        "<label>AES Key (16-byte hex)</label>"
+        "<input type='text' name='aes' value='48657956616e6e69534948323032362a' required>"
+        "<label>ESP-NOW PMK (16-byte hex)</label>"
+        "<input type='text' name='pmk' value='4856467573696f6e504d4b3230323600' required>"
+        "<label>ESP-NOW LMK (16-byte hex)</label>"
+        "<input type='text' name='lmk' value='4856467573696f6e4c4d4b3230323600' required>"
         "<button type='submit'>&#128190;&nbsp;Save &amp; Connect</button>"
     "</form>"
     "</div></body></html>";
@@ -164,28 +187,68 @@ static void parse_field(const char* body, const char* key,
 }
 
 // ─── NVS helpers ─────────────────────────────────────────────────────────────
+static uint8_t hex_char_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+static void hex_to_bytes(const char* hex, uint8_t* out, size_t out_len) {
+    for (size_t i = 0; i < out_len; i++) {
+        out[i] = (hex_char_val(hex[2*i]) << 4) | hex_char_val(hex[2*i+1]);
+    }
+}
+
 /**
  * Load SSID / password / server IP from NVS into the global arrays.
  * Returns true only if SSID is non-empty (i.e. credentials were stored).
  */
 static bool nvs_load_credentials(void) {
-    // Force hardcoded credentials for testing
-    strncpy(g_wifi_ssid, "Khush's A55", PROV_SSID_MAX);
-    strncpy(g_wifi_pass, "khush2073", PROV_PASS_MAX);
-    strncpy(g_server_ip, "13.233.100.83", PROV_IP_MAX);
-    return true;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+
+    size_t len_ssid = PROV_SSID_MAX;
+    size_t len_pass = PROV_PASS_MAX;
+    size_t len_ip = PROV_IP_MAX;
+
+    esp_err_t err_ssid = nvs_get_str(h, NVS_KEY_SSID, g_wifi_ssid, &len_ssid);
+    esp_err_t err_pass = nvs_get_str(h, NVS_KEY_PASS, g_wifi_pass, &len_pass);
+    esp_err_t err_ip   = nvs_get_str(h, NVS_KEY_IP,   g_server_ip, &len_ip);
+
+    char hex_buf[33]; size_t len_hex;
+    len_hex = sizeof(hex_buf);
+    if (nvs_get_str(h, NVS_KEY_AES, hex_buf, &len_hex) == ESP_OK) hex_to_bytes(hex_buf, g_aes_key, 16);
+    len_hex = sizeof(hex_buf);
+    if (nvs_get_str(h, NVS_KEY_PMK, hex_buf, &len_hex) == ESP_OK) hex_to_bytes(hex_buf, g_espnow_pmk, 16);
+    len_hex = sizeof(hex_buf);
+    if (nvs_get_str(h, NVS_KEY_LMK, hex_buf, &len_hex) == ESP_OK) hex_to_bytes(hex_buf, g_espnow_lmk, 16);
+
+    nvs_close(h);
+
+    if (err_ssid == ESP_OK && strlen(g_wifi_ssid) > 0) {
+        if (err_pass != ESP_OK) g_wifi_pass[0] = '\0';
+        if (err_ip != ESP_OK) g_server_ip[0] = '\0';
+        return true;
+    }
+    return false;
 }
 
-/** Save SSID / password / server IP to NVS. Returns true on success. */
-bool wifi_provision_save(const char* ssid, const char* pass,
-                                  const char* ip) {
+/** Save SSID / password / server IP and encryption keys to NVS. Returns true on success. */
+bool wifi_provision_save(const char* ssid, const char* pass, const char* ip,
+                         const char* aes_hex, const char* pmk_hex, const char* lmk_hex) {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
 
     bool ok = (nvs_set_str(h, NVS_KEY_SSID, ssid) == ESP_OK) &&
               (nvs_set_str(h, NVS_KEY_PASS, pass) == ESP_OK) &&
-              (nvs_set_str(h, NVS_KEY_IP,   ip)   == ESP_OK) &&
-              (nvs_commit(h) == ESP_OK);
+              (nvs_set_str(h, NVS_KEY_IP,   ip)   == ESP_OK);
+              
+    if (aes_hex) ok = ok && (nvs_set_str(h, NVS_KEY_AES, aes_hex) == ESP_OK);
+    if (pmk_hex) ok = ok && (nvs_set_str(h, NVS_KEY_PMK, pmk_hex) == ESP_OK);
+    if (lmk_hex) ok = ok && (nvs_set_str(h, NVS_KEY_LMK, lmk_hex) == ESP_OK);
+    
+    ok = ok && (nvs_commit(h) == ESP_OK);
     nvs_close(h);
     return ok;
 }
@@ -300,18 +363,22 @@ static esp_err_t handle_save(httpd_req_t* req) {
     ESP_LOGI(TAG, "POST /save: %s", body);
 
     char ssid[PROV_SSID_MAX] = {}, pass[PROV_PASS_MAX] = {}, ip[PROV_IP_MAX] = {};
+    char aes[33] = {}, pmk[33] = {}, lmk[33] = {};
     parse_field(body, "ssid", ssid, sizeof(ssid));
     parse_field(body, "pass", pass, sizeof(pass));
     parse_field(body, "ip",   ip,   sizeof(ip));
+    parse_field(body, "aes",  aes,  sizeof(aes));
+    parse_field(body, "pmk",  pmk,  sizeof(pmk));
+    parse_field(body, "lmk",  lmk,  sizeof(lmk));
 
-    if (!ssid[0] || !ip[0]) {
+    if (!ssid[0] || !ip[0] || strlen(aes) != 32 || strlen(pmk) != 32 || strlen(lmk) != 32) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "SSID and Server IP are required");
+                            "SSID, Server IP, and 32-character Hex keys are required");
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Saving -> SSID:'%s' PASS:'%s' IP:'%s'", ssid, pass, ip);
-    if (!wifi_provision_save(ssid, pass, ip)) {
+    ESP_LOGI(TAG, "Saving -> SSID:'%s' IP:'%s'", ssid, ip);
+    if (!wifi_provision_save(ssid, pass, ip, aes, pmk, lmk)) {
         ESP_LOGE(TAG, "NVS save failed");
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "NVS write failed");
@@ -428,7 +495,10 @@ static void prov_start_portal(void) {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 void wifi_provision_init(void) {
-    // Always save hardcoded credentials to NVS
-    wifi_provision_save(g_wifi_ssid, g_wifi_pass, g_server_ip);
-    ESP_LOGI(TAG, "NVS OK: SSID='%s'  server=%s", g_wifi_ssid, g_server_ip);
+    if (!nvs_load_credentials()) {
+        ESP_LOGW(TAG, "No valid SSID in NVS. Starting captive portal...");
+        prov_start_portal();
+    } else {
+        ESP_LOGI(TAG, "NVS loaded: SSID='%s'  server=%s", g_wifi_ssid, g_server_ip);
+    }
 }

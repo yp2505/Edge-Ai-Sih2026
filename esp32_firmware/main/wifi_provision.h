@@ -20,6 +20,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,6 +37,11 @@ extern "C" {
 extern char g_wifi_ssid[PROV_SSID_MAX];
 extern char g_wifi_pass[PROV_PASS_MAX];
 extern char g_server_ip[PROV_IP_MAX];
+
+// Encryption keys loaded from NVS
+extern uint8_t g_aes_key[16];
+extern uint8_t g_espnow_pmk[16];
+extern uint8_t g_espnow_lmk[16];
 
 // ─── API ──────────────────────────────────────────────────────────────────────
 
@@ -54,8 +60,9 @@ extern char g_server_ip[PROV_IP_MAX];
  */
 void wifi_provision_init(void);
 
-/** Save SSID / password / server IP to NVS. Returns true on success. */
-bool wifi_provision_save(const char* ssid, const char* pass, const char* ip);
+/** Save SSID / password / server IP and encryption keys to NVS. Returns true on success. */
+bool wifi_provision_save(const char* ssid, const char* pass, const char* ip,
+                         const char* aes_hex, const char* pmk_hex, const char* lmk_hex);
 
 /**
  * Erase all stored credentials from NVS.

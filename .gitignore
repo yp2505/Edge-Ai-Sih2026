@@ -49,3 +49,9 @@ new_dataset/
 # Additional virtual envs
 .venv/
 cloud_server/.venv/
+
+# Secrets and Backups
+*.pem
+*.bak
+Heyvaani_EC2_Key/
+

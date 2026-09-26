@@ -171,6 +171,76 @@ Open your browser and go to: **http://localhost:3000**
 
 ---
 
+## 🧭 Novel feature: cooperative voice-zone estimation
+
+With two fixed ESP32 nodes, the firmware now estimates the coarse location of
+the person who said **"Hey Vaani"** without training another model or sending
+raw audio between devices.
+
+```text
+Node 1 side  ←──  centre  ──→  Node 2 side
+```
+
+At a confirmed wake word, each node already has a KWS confidence and mic RMS.
+The existing ESP-NOW packet carries these values.  The firmware compares the
+fresh peer RMS with local RMS and reports one of:
+
+| Result | Meaning |
+|:---|:---|
+| `NODE_1_SIDE` | Node 1 heard the utterance materially louder. |
+| `CENTER` | The calibrated levels are within ±3 dB. |
+| `NODE_2_SIDE` | Node 2 heard the utterance materially louder. |
+| `UNKNOWN` | Peer evidence is absent, silent, busy, or older than 100 ms. No location is guessed. |
+
+Example serial output:
+
+```text
+[SOURCE-ZONE] node=2 zone=NODE_2_SIDE delta_db=5.42 peer_age_ms=18
+```
+
+The current source zone, calibrated RMS difference, and peer age are posted in
+the normal telemetry JSON and shown in the dashboard's **SOURCE ZONE** tile.
+This is a coarse zone estimate, not an exact position or angle-of-arrival
+system.
+
+Both nodes find each other automatically: the existing watchdog task sends one
+20-byte ESP-NOW discovery request per second until the sibling MAC is
+registered. No raw audio is sent and no extra FreeRTOS task is created. The
+OLED briefly shows `Zone: N1 SIDE`, `Zone: CENTER`, `Zone: N2 SIDE`, or
+`Zone: UNKNOWN` after a wake word.
+
+### Calibration
+
+Mount the two nodes in their final fixed positions. Speak the wake word from
+the centre several times and find the average `delta_db`. If Node 1 has a
+fixed gain mismatch, set `FUSION_NODE1_RMS_CAL_DB` in
+`esp32_firmware/main/esp_now_fusion.h` to the correction in dB, then flash
+both nodes. Leave it at `0.0f` when the centre readings are already balanced.
+
+### PS constraints and resource impact
+
+- **RAM:** The ESP-NOW packet remains **20 bytes**. The feature adds three
+  small telemetry values (about 12 bytes of RAM); it allocates no heap and
+  creates no task. Verify the actual target using `[ESPNOW] heap_before_init`,
+  `[ESPNOW] heap_after_init`, and `free_heap_bytes` in telemetry. Do not claim
+  the `<255 KB` RAM constraint is met until this is measured on the flashed
+  board.
+- **Idle CPU:** The calculation is performed only at a confirmed wake event;
+  it adds no polling loop. Idle CPU should therefore be unchanged. Confirm the
+  `<10%` requirement with the existing `[CPU]` log on hardware.
+- **Latency:** The helper takes its mutex with a zero-tick timeout and never
+  waits for a peer. It does not alter the confident path or the existing 100 ms
+  borderline wait. It adds no intentional delay to keyword-end → socket-open.
+  The overall `<200 ms` result still depends on Wi-Fi/TCP/server conditions and
+  must be verified from `[LATENCY-CONFIDENT]` or `[LATENCY-BORDERLINE]` logs.
+
+After all tasks start, serial prints a one-time `[RAM]` line. `heap_used` is
+the measured dynamic heap use; `known_static_buffers` separately reports the
+TFLite arena, audio ring, and OLED framebuffer. The PlatformIO linker-size
+report plus this runtime line is the required evidence for total RAM usage.
+
+---
+
 ## 📁 Project Structure
 
 ```
